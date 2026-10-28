@@ -335,7 +335,7 @@ export default async function climb(pi: ExtensionAPI) {
 		// worker's edits and its benchmarks, and only kept results move the climb anyway.
 		const h = (await head(root)) ?? "";
 		const note = !g.card ? "no scorecard yet" : g.open ? `${g.open.id} open` : !idle ? "worker busy" : undefined;
-		const progress = L.keptSinceBeat(g);
+		const progress = L.progressSinceBeat(g);
 		// An independent verdict restarts the count, so the judge runs once per stall, not every beat.
 		const stale = progress ? 0 : (L.judgedSinceBeat(g) ? 0 : (g.lastBeat?.stale ?? 0)) + 1;
 		append(root, { ts: L.now(), kind: "beat", goal: g.id, head: h, progress, stale, note });
@@ -592,6 +592,37 @@ export default async function climb(pi: ExtensionAPI) {
 				].join("\n"),
 			);
 		}),
+	});
+
+	pi.registerTool({
+		name: "climb_probe",
+		label: "Climb: probe",
+		description:
+			"Research item: register one candidate metric. The extension runs the command once and records the number, so research is itemized, measured, and counted as progress before a scorecard exists. Probe several candidates, then pick the 1-3 that matter for climb_scorecard.",
+		parameters: S.obj({
+			goal: S.opt(S.str("Goal id; optional when one goal is active")),
+			name: S.str("snake_case candidate metric name"),
+			cmd: S.str("Shell command printing the value as its last number"),
+			note: S.opt(S.str("Why it might matter, direction, what it measures")),
+		}),
+		loadMode: "essential",
+		execute: (_id, p: ProbeParams, signal, _u, ctx) =>
+			exclusive(async () => {
+				worker(ctx);
+				const root = await needRoot(ctx);
+				holder(root, ctx);
+				const g = pick(load(root), p.goal);
+				if (!/^[a-z][a-z0-9_]*$/.test(p.name)) throw new Error(`Probe names must be snake_case: "${p.name}".`);
+				// Research may run on an uncommitted tree, so nothing is restored afterwards.
+				const r = await sh(root, p.cmd, 120_000, signal);
+				if (signal?.aborted) throw new Error("Probe interrupted; nothing recorded.");
+				const n = r.code === 0 ? X.parseNumber(r.stdout) : undefined;
+				const error = r.code !== 0 ? `exit ${r.code}: ${tail(r.stderr || r.stdout)}` : n === undefined ? `no number in output: ${tail(r.stdout) || "(empty)"}` : undefined;
+				append(root, { ts: L.now(), kind: "probe", goal: g.id, name: p.name, cmd: p.cmd, value: n, error, note: p.note });
+				refresh(ctx, root);
+				const count = load(root).goals.get(g.id)!.probes.filter(x => x.value !== undefined).length;
+				return ok(error ? `Probe ${p.name} failed: ${error}` : `Probe ${p.name} = ${n} (research item ${count}).`);
+			}),
 	});
 
 	pi.registerTool({
@@ -890,6 +921,11 @@ interface ScorecardParams extends GoalParam {
 	frozen?: string[];
 	parked?: string[];
 	axioms?: string[];
+}
+interface ProbeParams extends GoalParam {
+	name: string;
+	cmd: string;
+	note?: string;
 }
 interface ExperimentParams extends GoalParam {
 	lever: string;

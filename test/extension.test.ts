@@ -125,7 +125,16 @@ describe("climb extension", () => {
 	test("stop is blocked while the goal is open", async () => {
 		const r = await x.emit("session_stop");
 		expect(r?.decision).toBe("block");
-		expect(r?.reason).toContain("No scorecard");
+		expect(r?.reason).toContain("Researching");
+	});
+
+	test("research is itemized: probes are run by the extension and listed", async () => {
+		expect(await x.tool("climb_probe", { name: "work_units", cmd: "cat work.txt", note: "the thing to shrink" })).toContain("work_units = 100 (research item 1)");
+		expect(await x.tool("climb_probe", { name: "broken", cmd: "exit 3" })).toContain("failed");
+		const g = state().goals.get("g-shrink-the-work-number")!;
+		expect(g.probes.map(p => [p.name, p.value])).toEqual([["work_units", 100], ["broken", undefined]]);
+		expect(L.progressSinceBeat(g)).toBe(true);
+		expect(await x.tool("climb_status", {})).toContain("work_units = 100");
 	});
 
 	test("scorecard: extension measures the baseline; rejects dirty trees, broken commands, met targets", async () => {

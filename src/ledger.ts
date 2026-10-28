@@ -54,12 +54,14 @@ export interface ResultE extends Base {
 }
 export interface BeatE extends Base { kind: "beat"; head: string; values?: Values; progress: boolean; stale: number; note?: string }
 export interface StallE extends Base { kind: "stall"; stale: number }
+/** A research item: a candidate metric the extension ran during research. */
+export interface ProbeE extends Base { kind: "probe"; name: string; cmd: string; value?: number; error?: string; note?: string }
 export interface JudgeE extends Base { kind: "judge"; by: "judge" | "worker" | "human" | "fallback"; verdict: Verdict; diagnosis: string; next: string }
 export interface DoneE extends Base { kind: "done"; result: "achieved" | "abandoned"; values: Values }
 export interface PauseE extends Base { kind: "pause" | "resume" }
 export interface RollupE extends Base { kind: "rollup"; cd: number; n: number; from: string; to: string; progress: number; stale: number; values?: Values }
 
-export type Entry = GoalE | CardE | ExpE | ResultE | BeatE | StallE | JudgeE | DoneE | PauseE | RollupE;
+export type Entry = GoalE | CardE | ExpE | ResultE | BeatE | StallE | ProbeE | JudgeE | DoneE | PauseE | RollupE;
 
 export interface Point {
 	t: number;
@@ -92,6 +94,9 @@ export interface Goal {
 	lastKeptSeq: number;
 	lastProgress?: string;
 	progressSeq: number;
+	/** Itemized research: every candidate metric probed, measured by the extension. */
+	probes: ProbeE[];
+	lastProbeSeq: number;
 	seq: number;
 	done?: DoneE;
 	series: Map<string, Point[]>;
@@ -154,6 +159,8 @@ function newGoal(e: GoalE): Goal {
 		judgeSeq: -1,
 		lastKeptSeq: -1,
 		progressSeq: -1,
+		probes: [],
+		lastProbeSeq: -1,
 		seq: -1,
 		series: new Map(),
 		nextExp: 1,
@@ -240,6 +247,10 @@ export function fold(entries: Entry[]): State {
 			case "stall":
 				g.stallPending = true;
 				break;
+			case "probe":
+				g.probes.push(e);
+				if (e.value !== undefined) g.lastProbeSeq = seq;
+				break;
 			case "judge":
 				g.diagnosis = e;
 				g.stallPending = false;
@@ -266,6 +277,8 @@ export const stuck = (g: Goal) => g.judge?.verdict === "stuck" && g.progressSeq 
 
 /** Since the last heartbeat (or goal start): was anything kept, did a judge speak? */
 export const keptSinceBeat = (g: Goal) => g.lastKeptSeq > (g.lastBeat?.seq ?? g.seq);
+/** Progress for the heartbeat: kept results; before a scorecard exists, measured research items count. */
+export const progressSinceBeat = (g: Goal) => keptSinceBeat(g) || (!g.card && g.lastProbeSeq > (g.lastBeat?.seq ?? g.seq));
 export const judgedSinceBeat = (g: Goal) => g.judgeSeq > (g.lastBeat?.seq ?? g.seq);
 
 // ---------------------------------------------------------------------------

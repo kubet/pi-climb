@@ -92,7 +92,7 @@ export function statusLine(st: State, nowMs = clock.ms()): string | undefined {
 	const goals = active(st);
 	if (!goals.length) return undefined;
 	const parts = goals.map(g => {
-		if (!g.card) return `${g.id}: researching`;
+		if (!g.card) return `${g.id}: researching (${g.probes.filter(p => p.value !== undefined).length} probes)`;
 		const pct = Math.min(...g.card.metrics.map(m => progressPct(m, g.best[m.name])));
 		const due = g.lastBeat ? Math.max(0, g.cfg.beat_s - (nowMs - epoch(g.lastBeat.ts)) / 1000) : g.cfg.beat_s;
 		const flag = stuck(g) ? " STUCK" : g.stallPending ? " STALL" : "";
@@ -110,7 +110,8 @@ export function report(st: State, nowMs = clock.ms()): string {
 		const state = g.done ? `DONE (${g.done.result})` : stuck(g) ? "STUCK — needs you" : g.stallPending ? "STALLED — judge pending" : "climbing";
 		out.push(`## ${g.id} — ${state}`, `"${g.intent}"`);
 		if (!g.card) {
-			out.push("no scorecard yet (researching)");
+			out.push(`researching: ${g.probes.length} research items probed`);
+			for (const p of g.probes.slice(-8)) out.push(`  · ${p.name} = ${p.value ?? `failed (${p.error})`}${p.note ? ` — ${p.note}` : ""}`);
 			continue;
 		}
 		for (const m of g.card.metrics) {
@@ -148,8 +149,10 @@ export function cardSummary(g: Goal): string {
 
 /** The single next obligation the worker must meet for this goal. */
 export function nextAction(g: Goal): string {
-	if (!g.card)
-		return `[climb ${g.id}] No scorecard yet for "${g.intent}". Research measurable metrics (run them), then call climb_scorecard with 1-${MAX_METRICS} metrics, each with a shell command that prints a number, a direction, and an ambitious target.`;
+	if (!g.card) {
+		const n = g.probes.filter(p => p.value !== undefined).length;
+		return `[climb ${g.id}] Researching "${g.intent}" (${n} candidate metrics probed). Itemize the research: register each candidate metric with climb_probe (the extension runs it). Then call climb_scorecard with the 1-${MAX_METRICS} that matter, each with a direction and an ambitious target.`;
+	}
 	if (g.open)
 		return `[climb ${g.id}] Experiment ${g.open.id} is open (lever "${g.open.lever}": ${g.open.hypothesis}). Finish it: implement, commit, then call climb_measure. State: ${cardSummary(g)}.`;
 	if (g.stallPending)
@@ -230,6 +233,8 @@ export function describe(e: Entry): string {
 			return `${g} heartbeat: ${e.progress ? "progress" : `no progress (stale ${e.stale})`}${e.note ? ` · ${e.note}` : ""}`;
 		case "stall":
 			return `${g} STALL after ${e.stale} heartbeats without progress; judge called`;
+		case "probe":
+			return `${g} research: ${e.name} = ${e.value ?? `failed (${e.error})`}`;
 		case "judge":
 			return `${g} judge (${e.by}): ${e.verdict.toUpperCase()} — ${e.diagnosis} → ${e.next}`;
 		case "done":
@@ -245,7 +250,7 @@ export function describe(e: Entry): string {
 export function researchBrief(g: Goal): string {
 	return [
 		`[climb] New goal ${g.id}: "${g.intent}". You are the worker; the climb extension owns the ledger and does all measuring.`,
-		"1. Research in parallel if you can (subagents): (a) what measurable quantities express this goal — find or write a command for each that prints one number, and run it; (b) which code changes (levers) could move them, ranked by expected gain/effort.",
+		"1. Research in parallel if you can (subagents): (a) what measurable quantities express this goal: find or write a command for each that prints one number, and register each one with climb_probe (that is the itemized research; the extension runs it and the heartbeat counts it as progress); (b) which code changes (levers) could move them, ranked by expected gain/effort.",
 		`2. Call climb_scorecard with 1-${MAX_METRICS} metrics (focus: the few that matter, park the rest), an ambitious target each, and a guard command (tests) that must keep passing. The extension measures the baselines itself.`,
 		"3. Loop: climb_experiment (pre-register lever + prediction) → implement → commit → climb_measure. The extension decides kept/dropped against noise and reverts dropped experiments.",
 		"Do not stop while the goal is open; the extension will hold you to it. A heartbeat audits progress and a judge intervenes if you stall.",
