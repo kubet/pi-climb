@@ -67,7 +67,8 @@ export function sparkline(vs: number[]): string {
 /** Least-squares slope in units/hour over points from the last 24h. */
 export function velocity(pts: { t: number; v: number }[], nowMs: number): number | undefined {
 	const p = pts.filter(x => nowMs - x.t <= 86_400_000);
-	if (p.length < 2) return undefined;
+	// Too few points or too short a window extrapolates noise into a rate.
+	if (p.length < 3 || p[p.length - 1].t - p[0].t < 600_000) return undefined;
 	const mt = p.reduce((s, x) => s + x.t, 0) / p.length;
 	const mv = p.reduce((s, x) => s + x.v, 0) / p.length;
 	let num = 0;
@@ -78,6 +79,8 @@ export function velocity(pts: { t: number; v: number }[], nowMs: number): number
 	}
 	return den ? (num / den) * 3_600_000 : undefined;
 }
+
+const num = (v: number) => (Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 1 ? v.toFixed(1) : v.toPrecision(2));
 
 const ago = (ts: string | undefined, nowMs: number) => {
 	if (!ts) return "never";
@@ -121,7 +124,7 @@ export function report(st: State, nowMs = clock.ms()): string {
 			}
 			const u = m.unit ? ` ${m.unit}` : "";
 			out.push(
-				`  ${met(m, best) ? "✓" : "·"} ${m.name}: ${m.baseline} → ${best}${u} (target ${m.target}, ${progressPct(m, best)}%) ${sparkline(pts.slice(-20).map(p => p.v))}${vel !== undefined ? ` · ${vel >= 0 ? "+" : ""}${vel.toPrecision(3)}/h` : ""}${eta}`,
+				`  ${met(m, best) ? "✓" : "·"} ${m.name}: ${m.baseline} → ${best}${u} (target ${m.target}, ${progressPct(m, best)}%) ${sparkline(pts.slice(-20).map(p => p.v))}${vel !== undefined ? ` · ${vel >= 0 ? "+" : ""}${num(vel)}/h` : ""}${eta}`,
 			);
 		}
 		const kept = g.results.filter(r => r.verdict === "kept").length;
