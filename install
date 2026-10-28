@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Install /goal skill globally for Claude Code.
+# Usage: ./install [--global|--project]
+#   --global:  symlink to ~/.claude/skills/goal/ (default)
+#   --project: symlink to .claude/skills/goal/ in current directory
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SKILL_SRC="$SCRIPT_DIR/.claude/skills/goal"
+MODE="${1:---global}"
+
+case "$MODE" in
+  --global)
+    TARGET="$HOME/.claude/skills/goal"
+    mkdir -p "$HOME/.claude/skills"
+    ;;
+  --project)
+    TARGET="$(pwd)/.claude/skills/goal"
+    mkdir -p "$(pwd)/.claude/skills"
+    ;;
+  *)
+    echo "usage: install [--global|--project]" >&2
+    exit 1
+    ;;
+esac
+
+if [[ -L "$TARGET" ]]; then
+  EXISTING=$(readlink "$TARGET")
+  if [[ "$EXISTING" == "$SKILL_SRC" ]]; then
+    echo "already installed: $TARGET -> $SKILL_SRC"
+    exit 0
+  fi
+  echo "updating symlink: $TARGET"
+  echo "  was: $EXISTING"
+  echo "  now: $SKILL_SRC"
+  rm "$TARGET"
+elif [[ -d "$TARGET" ]]; then
+  echo "error: $TARGET exists and is not a symlink. Remove it first." >&2
+  exit 1
+fi
+
+ln -s "$SKILL_SRC" "$TARGET"
+echo "installed: $TARGET -> $SKILL_SRC"
+
+# Also make lib/compact available on PATH if not already
+if ! command -v goal-compact &>/dev/null; then
+  echo ""
+  echo "optional: add lib/compact to your PATH:"
+  echo "  ln -s $SCRIPT_DIR/lib/compact ~/.local/bin/goal-compact"
+fi

@@ -214,11 +214,14 @@ Last decision: x003 "index hot queries" — kept (+15% p50)
 
 ### N-level compaction
 
-| Depth | Period | Trigger age |
-|---|---|---|
-| D0 (raw) -> D1 (hourly) | entries older than 24h | default |
-| D1 -> D2 (daily) | D1 entries older than 7d | when D1 count > 200 |
-| D2 -> D3 (weekly) | D2 entries older than 30d | when D2 count > 100 |
+| Depth | Period | Trigger age | Key function |
+|---|---|---|---|
+| D0 (raw) -> D1 (hourly) | entries older than 24h | default | `goal_id + ts[:13]` |
+| D1 -> D2 (daily) | D1 entries older than 7d | automatic | `goal_id + ts[:10]` |
+| D2 -> D3 (weekly) | D2 entries older than 30d | automatic | `goal_id + ts[:7]` |
+
+`lib/compact` runs all levels in one invocation (multi-pass until stable, max 5 passes).
+At 500k entries: 2.7s, 10x compression ratio.
 
 ### Rules
 

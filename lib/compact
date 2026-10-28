@@ -9,7 +9,12 @@ PROTECTED = frozenset(("goal_created", "goal_done", "stall", "investigation"))
 def main():
     oracle = sys.argv[1] if len(sys.argv) > 1 else "oracle.jsonl"
     dry_run = "--dry-run" in sys.argv
+    stats_only = "--stats" in sys.argv
     max_passes = 5
+
+    if stats_only:
+        _print_stats(oracle)
+        return
 
     for pass_num in range(1, max_passes + 1):
         with open(oracle) as f:
@@ -53,7 +58,11 @@ def _compact_once(entries):
     tail = entries[-tail_n:]
     head = entries[:-tail_n] if tail_n < n else []
 
-    keep, d0_old, d0_fresh, d1_old, d1_fresh, higher = [], [], [], [], [], []
+    keep = []
+    d0_old, d0_fresh = [], []
+    d1_old, d1_fresh = [], []
+    d2_old, d2_fresh = [], []
+    higher = []
 
     for e in head:
         if e["kind"] in PROTECTED:
@@ -65,15 +74,65 @@ def _compact_once(entries):
             (d0_old if age > 86400 else d0_fresh).append(e)
         elif cd == 1:
             (d1_old if age > 604800 else d1_fresh).append(e)
+        elif cd == 2:
+            (d2_old if age > 2592000 else d2_fresh).append(e)
         else:
             higher.append(e)
 
     d1_new = _compact_groups(d0_old, lambda e: e["goal_id"] + "|" + e["ts"][:13], 1)
-    d2_new = _compact_d1_groups(d1_old, lambda e: e["goal_id"] + "|" + e["ts"][:10])
+    d2_new = _roll_up_groups(d1_old, lambda e: e["goal_id"] + "|" + e["ts"][:10], 2)
+    d3_new = _roll_up_groups(d2_old, lambda e: e["goal_id"] + "|" + e["ts"][:7], 3)
 
-    result = keep + higher + d2_new + d1_fresh + d1_new + d0_fresh + tail
+    result = keep + higher + d3_new + d2_fresh + d2_new + d1_fresh + d1_new + d0_fresh + tail
     result.sort(key=lambda e: e["ts"])
     return result
+
+def _print_stats(oracle):
+    """Print oracle statistics without modifying the file."""
+    with open(oracle) as f:
+        entries = [json.loads(l) for l in f]
+
+    n = len(entries)
+    now = time.time()
+
+    by_kind = defaultdict(int)
+    by_goal = defaultdict(lambda: {"entries": 0, "kinds": defaultdict(int)})
+    by_depth = defaultdict(int)
+    oldest = newest = None
+
+    for e in entries:
+        by_kind[e["kind"]] += 1
+        g = by_goal[e.get("goal_id", "?")]
+        g["entries"] += 1
+        g["kinds"][e["kind"]] += 1
+        by_depth[e.get("cd", 0)] += 1
+        if oldest is None or e["ts"] < oldest: oldest = e["ts"]
+        if newest is None or e["ts"] > newest: newest = e["ts"]
+
+    print(f"oracle: {oracle}")
+    print(f"  entries: {n}")
+    print(f"  span: {oldest} .. {newest}")
+    print(f"  size: {os.path.getsize(oracle)} bytes")
+    print()
+
+    print("by depth:")
+    for d in sorted(by_depth):
+        label = {0: "D0 raw", 1: "D1 hourly", 2: "D2 daily", 3: "D3 weekly"}.get(d, f"D{d}")
+        print(f"  {label}: {by_depth[d]}")
+    print()
+
+    print("by kind:")
+    for k in sorted(by_kind, key=by_kind.get, reverse=True):
+        print(f"  {k}: {by_kind[k]}")
+    print()
+
+    print("by goal:")
+    created = {e["goal_id"] for e in entries if e["kind"] == "goal_created"}
+    done = {e["goal_id"] for e in entries if e["kind"] == "goal_done"}
+    for gid in sorted(by_goal):
+        g = by_goal[gid]
+        status = "done" if gid in done else "active" if gid in created else "?"
+        print(f"  {gid} [{status}]: {g['entries']} entries")
 
 def _epoch(ts):
     return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
@@ -106,7 +165,8 @@ def _compact_groups(entries, key_fn, cd):
         })
     return out
 
-def _compact_d1_groups(entries, key_fn):
+def _roll_up_groups(entries, key_fn, cd):
+    """Roll up higher-depth compaction entries into the next level."""
     groups = defaultdict(list)
     for e in entries:
         groups[key_fn(e)].append(e)
@@ -119,7 +179,7 @@ def _compact_d1_groups(entries, key_fn):
             if v is not None: snap = v
         out.append({
             "ts": group[0]["ts"], "kind": "compaction",
-            "goal_id": group[0]["goal_id"], "cd": 2,
+            "goal_id": group[0]["goal_id"], "cd": cd,
             "n": sum(e.get("n", 1) for e in group),
             "window": [group[0]["ts"], group[-1]["ts"]],
             "summary": {"heartbeats": s("heartbeats"), "progress": s("progress"),
