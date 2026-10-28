@@ -774,8 +774,10 @@ export default async function climb(pi: ExtensionAPI) {
 			}
 			if (sub === "judge" && words.length <= 2) {
 				const g = one(words[1]);
-				if (g) void judge(ctx, root, g.id);
-				return;
+				if (!g) return;
+				ctx.ui.notify(`climb: judging ${g.id}…`, "info");
+				await judge(ctx, root, g.id);
+				return started(ctx);
 			}
 			if (words.length === 1 && (sub === "pause" || sub === "stop")) {
 				append(root, { ts: L.now(), kind: "pause", goal: "*" });
