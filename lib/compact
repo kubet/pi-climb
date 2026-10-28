@@ -1,98 +1,119 @@
-#!/usr/bin/env bash
-set -euo pipefail
-# compact — n-level oracle.jsonl compaction
-# D0 (raw) older than 24h -> D1 (hourly summaries)
-# D1 older than 7d -> D2 (daily summaries)
-# Protected entries never compact. Last 50 raw always kept.
-# Usage: compact [oracle.jsonl] [--dry-run]
+#!/usr/bin/env python3
+"""compact — n-level oracle.jsonl compaction (Python, no deps)."""
+import json, sys, os, time
+from collections import defaultdict
+from datetime import datetime, timezone
 
-ORACLE="${1:-oracle.jsonl}"
-DRY_RUN=false
-[[ "${2:-}" == "--dry-run" ]] && DRY_RUN=true
+PROTECTED = frozenset(("goal_created", "goal_done", "stall", "investigation"))
 
-[[ -f "$ORACLE" ]] || { echo "not found: $ORACLE" >&2; exit 1; }
-command -v jq &>/dev/null || { echo "jq required" >&2; exit 1; }
+def main():
+    oracle = sys.argv[1] if len(sys.argv) > 1 else "oracle.jsonl"
+    dry_run = "--dry-run" in sys.argv
 
-BEFORE=$(wc -l < "$ORACLE" | tr -d ' ')
-SIZE=$(stat -f%z "$ORACLE" 2>/dev/null || stat -c%s "$ORACLE" 2>/dev/null)
+    with open(oracle) as f:
+        lines = f.readlines()
 
-if [[ "$BEFORE" -lt 100 ]]; then
-  echo "only $BEFORE lines, skipping"
-  exit 0
-fi
+    n = len(lines)
+    if n < 100:
+        print(f"only {n} lines, skipping")
+        return
 
-echo "oracle: $BEFORE lines, $SIZE bytes"
+    print(f"oracle: {n} lines, {sum(len(l) for l in lines)} bytes")
 
-NOW=$(date -u +%s)
+    entries = [json.loads(l) for l in lines]
+    now = time.time()
 
-jq -sc --argjson now "$NOW" '
-  def epoch: fromdateiso8601;
-  def prot: .kind == "goal_created" or .kind == "goal_done"
-    or .kind == "stall" or .kind == "investigation";
+    tail_n = min(50, n)
+    tail = entries[-tail_n:]
+    head = entries[:-tail_n] if tail_n < n else []
 
-  length as $n |
-  [.[-([50,$n]|min):][]] as $tail |
-  [.[:-([50,$n]|min)][]] as $head |
+    keep, d0_old, d0_fresh, d1_old, d1_fresh, higher = [], [], [], [], [], []
 
-  # Partition head
-  [$head[] | select(prot)] as $keep |
-  [$head[] | select(prot|not) | select((.cd//0)==0)
-    | select(($now - (.ts|epoch)) > 86400)] as $d0_old |
-  [$head[] | select(prot|not) | select((.cd//0)==0)
-    | select(($now - (.ts|epoch)) <= 86400)] as $d0_fresh |
-  [$head[] | select(prot|not) | select((.cd//0)==1)
-    | select(($now - (.ts|epoch)) > 604800)] as $d1_old |
-  [$head[] | select(prot|not) | select((.cd//0)==1)
-    | select(($now - (.ts|epoch)) <= 604800)] as $d1_fresh |
-  [$head[] | select(prot|not) | select((.cd//0)>=2)] as $higher |
+    for e in head:
+        if e["kind"] in PROTECTED:
+            keep.append(e)
+            continue
+        cd = e.get("cd", 0)
+        age = now - _epoch(e["ts"])
+        if cd == 0:
+            (d0_old if age > 86400 else d0_fresh).append(e)
+        elif cd == 1:
+            (d1_old if age > 604800 else d1_fresh).append(e)
+        else:
+            higher.append(e)
 
-  # D0 -> D1: group by goal_id + hour
-  [$d0_old | group_by(.goal_id+"|"+.ts[0:13])[] | {
-    ts: .[0].ts,
-    kind: "compaction",
-    goal_id: .[0].goal_id,
-    cd: 1,
-    n: length,
-    window: [.[0].ts, .[-1].ts],
-    summary: {
-      heartbeats: [.[] | select(.kind=="heartbeat")] | length,
-      progress: [.[] | select(.kind=="heartbeat" and .progress==true)] | length,
-      experiments: [.[] | select(.kind=="experiment")] | length,
-      kept: [.[] | select(.kind=="decision" and .verdict=="kept")] | length,
-      dropped: [.[] | select(.kind=="decision" and .verdict=="dropped")] | length,
-      snapshot: ([.[] | select(.kind=="heartbeat" and .snapshot!=null)] | last // {}).snapshot
-    }
-  }] as $d1_new |
+    d1_new = _compact_groups(d0_old, lambda e: e["goal_id"] + "|" + e["ts"][:13], 1)
+    d2_new = _compact_d1_groups(d1_old, lambda e: e["goal_id"] + "|" + e["ts"][:10])
 
-  # D1 -> D2: group by goal_id + day
-  [$d1_old | group_by(.goal_id+"|"+.ts[0:10])[] | {
-    ts: .[0].ts,
-    kind: "compaction",
-    goal_id: .[0].goal_id,
-    cd: 2,
-    n: ([.[] | .n // 1] | add),
-    window: [.[0].ts, .[-1].ts],
-    summary: {
-      heartbeats: ([.[] | .summary.heartbeats // 0] | add),
-      progress: ([.[] | .summary.progress // 0] | add),
-      experiments: ([.[] | .summary.experiments // 0] | add),
-      kept: ([.[] | .summary.kept // 0] | add),
-      dropped: ([.[] | .summary.dropped // 0] | add),
-      snapshot: ([.[] | select(.summary.snapshot != null)] | last // {}).summary.snapshot
-    }
-  }] as $d2_new |
+    result = keep + higher + d2_new + d1_fresh + d1_new + d0_fresh + tail
+    result.sort(key=lambda e: e["ts"])
 
-  # Recombine, sort by timestamp
-  ($keep + $higher + $d2_new + $d1_fresh + $d1_new + $d0_fresh + $tail)
-  | sort_by(.ts) | .[]
-' "$ORACLE" > "${ORACLE}.tmp"
+    tmp = oracle + ".tmp"
+    with open(tmp, "w") as f:
+        for e in result:
+            f.write(json.dumps(e, separators=(",", ":")))
+            f.write("\n")
 
-AFTER=$(wc -l < "${ORACLE}.tmp" | tr -d ' ')
+    after = len(result)
+    if dry_run:
+        print(f"dry run: {n} -> {after} lines")
+        os.remove(tmp)
+    else:
+        os.rename(tmp, oracle)
+        print(f"compacted: {n} -> {after} lines")
 
-if $DRY_RUN; then
-  echo "dry run: $BEFORE -> $AFTER lines"
-  rm "${ORACLE}.tmp"
-else
-  mv "${ORACLE}.tmp" "$ORACLE"
-  echo "compacted: $BEFORE -> $AFTER lines"
-fi
+def _epoch(ts):
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+
+def _compact_groups(entries, key_fn, cd):
+    groups = defaultdict(list)
+    for e in entries:
+        groups[key_fn(e)].append(e)
+    out = []
+    for group in groups.values():
+        hb = pr = ex = ke = dr = 0
+        snap = None
+        for e in group:
+            k = e["kind"]
+            if k == "heartbeat":
+                hb += 1
+                if e.get("progress"): pr += 1
+                if e.get("snapshot") is not None: snap = e["snapshot"]
+            elif k == "experiment": ex += 1
+            elif k == "decision":
+                v = e.get("verdict")
+                if v == "kept": ke += 1
+                elif v == "dropped": dr += 1
+        out.append({
+            "ts": group[0]["ts"], "kind": "compaction",
+            "goal_id": group[0]["goal_id"], "cd": cd,
+            "n": len(group), "window": [group[0]["ts"], group[-1]["ts"]],
+            "summary": {"heartbeats": hb, "progress": pr, "experiments": ex,
+                        "kept": ke, "dropped": dr, "snapshot": snap}
+        })
+    return out
+
+def _compact_d1_groups(entries, key_fn):
+    groups = defaultdict(list)
+    for e in entries:
+        groups[key_fn(e)].append(e)
+    out = []
+    for group in groups.values():
+        s = lambda f: sum(e.get("summary", {}).get(f, 0) for e in group)
+        snap = None
+        for e in group:
+            v = e.get("summary", {}).get("snapshot")
+            if v is not None: snap = v
+        out.append({
+            "ts": group[0]["ts"], "kind": "compaction",
+            "goal_id": group[0]["goal_id"], "cd": 2,
+            "n": sum(e.get("n", 1) for e in group),
+            "window": [group[0]["ts"], group[-1]["ts"]],
+            "summary": {"heartbeats": s("heartbeats"), "progress": s("progress"),
+                        "experiments": s("experiments"), "kept": s("kept"),
+                        "dropped": s("dropped"), "snapshot": snap}
+        })
+    return out
+
+if __name__ == "__main__":
+    main()
