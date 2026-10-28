@@ -37,16 +37,35 @@ export function regressions(metrics: Metric[], ref: Values, values: Values): Met
 	return metrics.filter(m => ref[m.name] !== undefined && values[m.name] !== undefined && gain(m, ref[m.name], values[m.name]) < -m.noise);
 }
 
-export function verdict(metrics: Metric[], ref: Values, values: Values): { kept: boolean; reason: string } {
+export function verdict(metrics: Metric[], ref: Values, values: Values): { kept: boolean; regressed: boolean; reason: string } {
 	const fmt = (m: Metric) => {
 		const g = gain(m, ref[m.name], values[m.name]);
 		return `${m.name} ${ref[m.name]}→${values[m.name]} (${g >= 0 ? "+" : ""}${(g * 100).toFixed(1)}%)`;
 	};
 	const regressed = regressions(metrics, ref, values);
-	if (regressed.length) return { kept: false, reason: `regressed: ${regressed.map(fmt).join(", ")}` };
-	const improved = metrics.filter(m => gain(m, ref[m.name], values[m.name]) > m.noise);
-	if (!improved.length) return { kept: false, reason: `no metric beat noise: ${metrics.map(fmt).join(", ")}` };
-	return { kept: true, reason: improved.map(fmt).join(", ") };
+	if (regressed.length) return { kept: false, regressed: true, reason: `regressed: ${regressed.map(fmt).join(", ")}` };
+	// A hold metric is a constraint: bouncing back from an unlucky control is not a gain.
+	const improved = metrics.filter(m => !m.hold && gain(m, ref[m.name], values[m.name]) > m.noise);
+	if (!improved.length) return { kept: false, regressed: false, reason: `no metric beat noise: ${metrics.map(fmt).join(", ")}` };
+	return { kept: true, regressed: false, reason: improved.map(fmt).join(", ") };
+}
+
+/** Relative noise of one keep/drop decision: about two standard errors of the difference
+ *  between two medians of `samples` runs, with the per-run spread estimated from A/A runs.
+ *  More samples shrink it by √samples, so samples is the lever for a noisy metric. */
+export function noiseOf(xs: number[], baseline: number, samples: number): number {
+	const n = xs.length;
+	if (n < 2) return 0;
+	const mean = xs.reduce((s, x) => s + x, 0) / n;
+	const sd = Math.sqrt(xs.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1));
+	const se = (samples >= 3 ? 1.2533 : 1) / Math.sqrt(samples); // a median is ~1.25x noisier than a mean
+	return (2 * Math.SQRT2 * se * sd) / (Math.abs(baseline) || 1);
+}
+
+/** Fewest samples (≤ 9) that bring a metric's noise under `need`. */
+export function samplesFor(xs: number[], baseline: number, need: number): number | undefined {
+	for (let s = 1; s <= 9; s++) if (noiseOf(xs, baseline, s) < need) return s;
+	return undefined;
 }
 
 export function progressPct(m: Metric, best: number | undefined): number {
@@ -131,7 +150,10 @@ export function report(st: State, nowMs = clock.ms()): string {
 			);
 		}
 		const kept = g.results.filter(r => r.verdict === "kept").length;
-		out.push(`  experiments: ${g.results.length} (${kept} kept, ${g.results.length - kept} dropped)${g.open ? ` · open ${g.open.id} "${g.open.lever}"` : ""}`);
+		const proved = g.results.filter(r => r.proof).length;
+		out.push(
+			`  experiments: ${g.results.length} (${kept} kept${proved ? `, ${proved} of them by proof` : ""}, ${g.results.length - kept} dropped)${g.open ? ` · open ${g.open.id} "${g.open.lever}"` : ""}`,
+		);
 		const levers = [...g.levers.entries()].map(([k, l]) => `${k} ${l.kept}/${l.tried}`);
 		if (levers.length) out.push(`  levers (kept/tried): ${levers.join(", ")}`);
 		out.push(`  last progress ${ago(g.lastProgress, nowMs)} · stale ${g.lastBeat?.stale ?? 0}/${g.cfg.poke_max} · beat every ${Math.round(g.cfg.beat_s / 60)}m, last ${ago(g.lastBeat?.ts, nowMs)}`);
@@ -195,31 +217,51 @@ export function touchedFrozen(changed: string[], frozen: string[] | undefined): 
 
 const RUNNERS = /^(python[\d.]*|node|bun|deno|bash|sh|zsh|ruby|perl|php|pytest|jest|vitest|go|cargo|npx|uv|tsx)$/;
 
+/** Tokens a command executes: arguments after an interpreter or test runner, or ./path.
+ *  `first` marks the script position itself (right after the runner), as opposed to
+ *  later arguments, which may be inline code. */
+function executed(cmd: string): { tok: string; first: boolean }[] {
+	const out: { tok: string; first: boolean }[] = [];
+	for (const seg of cmd.split(/&&|\|\||[;|\n]/)) {
+		const toks = seg.trim().split(/[\s"'`()]+/).filter(t => t && !/^\w+=/.test(t) && !["time", "env", "exec", "nice"].includes(t));
+		const runner = toks.findIndex(t => RUNNERS.test(t)); // `env -u X python3 t.py` still counts
+		for (const [i, tok] of toks.entries())
+			if (!tok.startsWith("-") && ((runner >= 0 && i > runner) || (i === 0 && tok.startsWith("./")))) out.push({ tok, first: i === runner + 1 || i === 0 });
+	}
+	return out;
+}
+
 /** Tracked files a command executes (scripts after an interpreter or test runner,
  *  or invoked as ./path): the instrument, frozen automatically. Plain data reads
  *  like `cat out.txt` or `wc -l < src.py` are the thing being optimized, not frozen. */
 export function instrumentFiles(cmd: string, tracked: Set<string>): string[] {
 	const out = new Set<string>();
-	for (const seg of cmd.split(/&&|\|\||[;|\n]/)) {
-		const toks = seg.trim().split(/[\s"'`()]+/).filter(t => t && !/^\w+=/.test(t) && !["time", "env", "exec", "nice"].includes(t));
-		const runner = toks.findIndex(t => RUNNERS.test(t)); // `env -u X python3 t.py` still counts
-		for (const [i, tok] of toks.entries()) {
-			const executed = (runner >= 0 && i > runner) || (i === 0 && tok.startsWith("./"));
-			if (tok.startsWith("-") || !executed) continue;
-			const t = tok.replace(/^\.\//, "").replace(/\/+$/, "");
-			if (tracked.has(t)) out.add(t);
-			// Directories only when written as paths: `bun test` / `go test` are subcommands.
-			else if (tok.includes("/") && [...tracked].some(f => f.startsWith(`${t}/`))) out.add(`${t}/`);
-		}
+	for (const { tok } of executed(cmd)) {
+		const t = tok.replace(/^\.\//, "").replace(/\/+$/, "");
+		if (tracked.has(t)) out.add(t);
+		// Directories only when written as paths: `bun test` / `go test` are subcommands.
+		else if (tok.includes("/") && [...tracked].some(f => f.startsWith(`${t}/`))) out.add(`${t}/`);
 	}
 	return [...out];
 }
 
-/** Some metric moved by more than noise but less than 2x noise either way. */
+/** Executed tokens that name a script file, existing or not: a relative path with an
+ *  extension, in script position or written with a directory (not `console.log` in inline code). */
+export const scriptPaths = (cmd: string) =>
+	executed(cmd)
+		.filter(({ tok, first }) => /\.[A-Za-z]\w{0,4}$/.test(tok) && !tok.startsWith("/") && (first || tok.includes("/")))
+		.map(({ tok }) => tok.replace(/^\.\//, ""));
+
+/** Absolute paths a command mentions (`/x`, `--flag=/x`): candidates for an instrument outside the repo. */
+export const absolutePaths = (cmd: string) => [...new Set(cmd.split(/[\s"'`()=,;|&<>]+/).filter(t => /^\/[^/]/.test(t)))];
+
+/** Some metric moved by more than noise but less than 2x noise: measure again before deciding.
+ *  A hold metric only matters when it fell. */
 export function borderline(metrics: Metric[], ref: Values, values: Values): boolean {
 	return metrics.some(m => {
-		const g = Math.abs(gain(m, ref[m.name], values[m.name]));
-		return g > m.noise && g < 2 * m.noise;
+		const g = gain(m, ref[m.name], values[m.name]);
+		if (m.hold && g > 0) return false;
+		return Math.abs(g) > m.noise && Math.abs(g) < 2 * m.noise;
 	});
 }
 
@@ -232,9 +274,9 @@ export function describe(e: Entry): string {
 		case "card":
 			return `${g} scorecard: ${e.metrics.map(m => `${m.name} ${m.baseline}→${m.hold ? "hold" : m.target}${m.unit ? ` ${m.unit}` : ""} (±${(m.noise * 100).toFixed(1)}%)`).join(", ")}`;
 		case "exp":
-			return `${g} ${e.id} registered: ${e.lever}, predicts ${e.prediction}`;
+			return `${g} ${e.id} registered: ${e.lever}, predicts ${e.prediction}${e.proof ? ` · proof: ${e.proof.cmd}` : ""}`;
 		case "result":
-			return `${g} ${e.verdict.toUpperCase()} ${e.exp}: ${e.reason}`;
+			return `${g} ${e.verdict.toUpperCase()}${e.proof ? " (by proof)" : ""} ${e.exp}: ${e.reason}`;
 		case "beat":
 			return `${g} heartbeat: ${e.progress ? "progress" : `no progress (stale ${e.stale})`}${e.note ? ` · ${e.note}` : ""}`;
 		case "stall":
@@ -258,7 +300,7 @@ export function researchBrief(g: Goal): string {
 		`[climb] New goal ${g.id}: "${g.intent}". You are the worker; the climb extension owns the ledger and does all measuring.`,
 		"1. Research in parallel if you can (subagents): (a) what measurable quantities express this goal: find or write a command for each that prints one number, and register each one with climb_probe (that is the itemized research; the extension runs it and the heartbeat counts it as progress); (b) which code changes (levers) could move them, ranked by expected gain/effort.",
 		`2. Call climb_scorecard with 1-${MAX_METRICS} metrics (focus: the few that matter, park the rest), an ambitious target each, and a guard command (tests) that must keep passing. The extension measures the baselines itself.`,
-		"3. Loop: climb_experiment (pre-register lever + prediction) → implement → commit → climb_measure. The extension decides kept/dropped against noise and reverts dropped experiments.",
+		"3. Loop: climb_experiment (pre-register lever + prediction) → implement → commit → climb_measure. The extension decides kept/dropped against noise and reverts dropped experiments. A defect fix the scorecard is too coarse to see gets a proof: a fast check that fails now and passes once fixed.",
 		"Do not stop while the goal is open; the extension will hold you to it. A heartbeat audits progress and a judge intervenes if you stall.",
 	].join("\n");
 }

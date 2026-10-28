@@ -44,7 +44,13 @@ export interface CardE extends Base {
 	parked?: string[];
 	axioms?: string[];
 }
-export interface ExpE extends Base { kind: "exp"; id: string; lever: string; hypothesis: string; prediction: string; base: string; ref: Values }
+/** A check that failed at the base and must pass once the change works, with the
+ *  content hashes of the scripts it runs (edited scripts void it). */
+export interface Proof {
+	cmd: string;
+	files: Record<string, string>;
+}
+export interface ExpE extends Base { kind: "exp"; id: string; lever: string; hypothesis: string; prediction: string; base: string; ref: Values; proof?: Proof }
 export interface ResultE extends Base {
 	kind: "result";
 	exp: string;
@@ -53,6 +59,8 @@ export interface ResultE extends Base {
 	verdict: "kept" | "dropped";
 	reason: string;
 	reverted?: string;
+	/** Kept on its proof: a verified fix with no regression, not a measured gain. */
+	proof?: boolean;
 }
 export interface BeatE extends Base { kind: "beat"; head: string; values?: Values; progress: boolean; stale: number; note?: string }
 export interface StallE extends Base { kind: "stall"; stale: number }
@@ -227,10 +235,14 @@ export function fold(entries: Entry[]): State {
 				l.tried++;
 				if (e.verdict === "kept") {
 					l.kept++;
-					record(g, e.ts, e.values, true);
-					g.lastProgress = e.ts;
-					g.progressSeq = g.lastKeptSeq = seq;
 					g.streak = 0;
+					// A proven fix is kept, but values within noise neither ratchet `best` nor count
+					// as progress: if the scorecard never moves, the heartbeat still calls the judge.
+					record(g, e.ts, e.values, !e.proof);
+					if (!e.proof) {
+						g.lastProgress = e.ts;
+						g.progressSeq = g.lastKeptSeq = seq;
+					}
 				} else {
 					l.dropped++;
 					g.streak++;

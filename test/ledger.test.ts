@@ -35,6 +35,32 @@ describe("logic", () => {
 		expect(mixed.reason).toContain("regressed");
 	});
 
+	test("a hold metric guards but never keeps: bouncing back from an unlucky control is not a gain", () => {
+		const work = metric({ name: "work" });
+		const ms = metric({ hold: true, noise: 0.05 });
+		const v = X.verdict([work, ms], { work: 100, ms: 120 }, { work: 100, ms: 100 }); // unlucky slow control
+		expect(v).toMatchObject({ kept: false, regressed: false });
+		expect(X.verdict([work, ms], { work: 100, ms: 50 }, { work: 100, ms: 70 }).regressed).toBe(true);
+		expect(X.borderline([ms], { ms: 100 }, { ms: 93 })).toBe(false); // improved: nothing to re-check
+		expect(X.borderline([ms], { ms: 100 }, { ms: 107 })).toBe(true); // fell within 2x noise: re-check
+	});
+
+	test("noise is the decision's, not one run's: it shrinks with samples, and says how many are needed", () => {
+		expect(X.noiseOf([100, 100, 100], 100, 1)).toBe(0);
+		const one = X.noiseOf([90, 100, 110], 100, 1);
+		expect(one).toBeCloseTo(2 * Math.SQRT2 * 0.1, 5); // sd 10 on 100
+		expect(X.noiseOf([90, 100, 110], 100, 9)).toBeLessThan(one / 2);
+		expect(X.samplesFor([90, 100, 110], 100, 0.2)).toBe(4);
+		expect(X.samplesFor([4000, 700, 1200], 1200, 0.5)).toBeUndefined(); // a sentinel-bimodal metric: no sample count saves it
+	});
+
+	test("proof and outside-instrument path detection", () => {
+		expect(X.scriptPaths("bash checks/fixed.sh && python3 ./tests/t_x.py -q && python3 check.py")).toEqual(["checks/fixed.sh", "tests/t_x.py", "check.py"]);
+		expect(X.scriptPaths(`bun -e 'console.log(1); import x from "./src/a"'`)).toEqual([]);
+		expect(X.scriptPaths("test \"$(cat fixed.txt)\" = yes")).toEqual([]);
+		expect(X.absolutePaths("bun bench/isolated.ts --backend=/tmp/a/b --env-file=/tmp/c.env | tail -1")).toEqual(["/tmp/a/b", "/tmp/c.env"]);
+	});
+
 	test("progress is directional and can go negative", () => {
 		expect(X.progressPct(metric(), 55)).toBe(50);
 		expect(X.progressPct(metric(), 10)).toBe(100);

@@ -20,6 +20,10 @@ const TICK_MS = 15_000;
 const LEDGER_GUARD = "The climb ledger (.climb/) is append-only and owned by the climb extension. Read it with climb_status.";
 
 type Ctx = ExtensionContext;
+type Progress = (text: string) => void;
+type Update = (partial: { content: { type: "text"; text: string }[] }) => void;
+// Instruments outside the repo worth warning about; system tools are not instruments.
+const SYSTEM = /^\/(dev|usr|bin|sbin|etc|opt|nix|proc|System|Library|Applications)(\/|$)/;
 
 export default async function climb(pi: ExtensionAPI) {
 	const S = await schemas(pi);
@@ -41,7 +45,7 @@ export default async function climb(pi: ExtensionAPI) {
 	const sh = (root: string, cmd: string, timeoutMs: number, signal?: AbortSignal) =>
 		pi.exec("bash", ["-c", cmd], { cwd: root, timeout: timeoutMs, signal });
 	const git = (root: string, ...args: string[]) => pi.exec("git", args, { cwd: root, timeout: 60_000 });
-	const tail = (s: string) => s.trim().slice(-400);
+	const tail = (s: string) => s.replace(/[ \t]{2,}/g, " ").replace(/\n\s*\n/g, "\n").trim().slice(-400);
 
 	async function repoRoot(cwd: string): Promise<string | undefined> {
 		const hit = roots.get(cwd);
@@ -60,6 +64,11 @@ export default async function climb(pi: ExtensionAPI) {
 
 	async function head(root: string): Promise<string | undefined> {
 		const r = await git(root, "rev-parse", "HEAD");
+		return r.code === 0 ? r.stdout.trim() : undefined;
+	}
+
+	async function tree(root: string, rev = "HEAD"): Promise<string | undefined> {
+		const r = await git(root, "rev-parse", `${rev}^{tree}`);
 		return r.code === 0 ? r.stdout.trim() : undefined;
 	}
 
@@ -101,8 +110,9 @@ export default async function climb(pi: ExtensionAPI) {
 		fs.appendFileSync(file, `${text && !text.endsWith("\n") ? "\n" : ""}${L.DIR}/\n`);
 	}
 
-	/** Runs every metric `samples` times (plus any prior samples, merged) and takes medians. */
-	async function measure(root: string, metrics: L.Metric[], signal?: AbortSignal, prior: Record<string, number[]> = {}) {
+	/** Runs every metric `samples` times (plus any prior samples, merged) and takes medians.
+	 *  A failed run is retried once: one flaky run must not void a long measurement. */
+	async function measure(root: string, metrics: L.Metric[], signal?: AbortSignal, prior: Record<string, number[]> = {}, progress?: Progress) {
 		const values: L.Values = {};
 		const samples: Record<string, number[]> = {};
 		const errors: string[] = [];
@@ -110,7 +120,12 @@ export default async function climb(pi: ExtensionAPI) {
 		for (const m of metrics) {
 			const xs: number[] = [];
 			for (let i = 0; i < m.samples; i++) {
-				const r = await sh(root, m.cmd, m.timeout_s * 1000, signal);
+				progress?.(`${m.name} run ${i + 1}/${m.samples}`);
+				let r = await sh(root, m.cmd, m.timeout_s * 1000, signal);
+				if (r.code !== 0 && !r.killed && !signal?.aborted) {
+					await restore(root);
+					r = await sh(root, m.cmd, m.timeout_s * 1000, signal);
+				}
 				// An operator interrupt is not a verdict: nothing is decided or reverted.
 				if (signal?.aborted) throw new Error("Measurement interrupted; nothing was decided and the experiment stays open.");
 				if (r.code !== 0) {
@@ -130,8 +145,71 @@ export default async function climb(pi: ExtensionAPI) {
 		}
 		} finally {
 			await restore(root);
+			progress?.("");
 		}
 		return { values, samples, errors };
+	}
+
+	// Unbiased runs (A/A, controls) by tree and command. A tree measured minutes ago is
+	// not measured again: a rejected scorecard retries for free, and the control after a
+	// revert reuses the runs of the tree it restored. Kept results never enter the cache:
+	// they were selected for measuring well.
+	const FRESH_MS = 30 * 60_000;
+	const runs = new Map<string, { ts: number; xs: number[] }>();
+	async function measureTree(root: string, metrics: L.Metric[], need: (m: L.Metric) => number, signal?: AbortSignal, progress?: Progress) {
+		const t = await tree(root);
+		const prior: Record<string, number[]> = {};
+		const plan = metrics.map(m => {
+			const hit = t ? runs.get(`${t}\0${m.cmd}`) : undefined;
+			prior[m.name] = hit && L.clock.ms() - hit.ts < FRESH_MS ? hit.xs : [];
+			return { ...m, samples: Math.max(0, need(m) - prior[m.name].length) };
+		});
+		const r = await measure(root, plan, signal, prior, progress);
+		for (const m of plan) {
+			const key = `${t}\0${m.cmd}`;
+			if (t && m.samples && r.samples[m.name]) runs.set(key, { ts: prior[m.name].length ? runs.get(key)!.ts : L.clock.ms(), xs: r.samples[m.name] });
+		}
+		return { ...r, reused: plan.filter(m => !m.samples).map(m => m.name) };
+	}
+
+	/** Live progress of a long measurement: the tool's partial output and the status line. */
+	const progressTo =
+		(ctx: Ctx, root: string, onUpdate: Update | undefined, what: string): Progress =>
+		text => {
+			if (!text) return void refresh(ctx, root);
+			onUpdate?.({ content: [{ type: "text", text: `${what}: ${text}` }] });
+			ctx.ui?.setStatus?.("climb", `⛰ ${what}: ${text}`);
+		};
+
+	// A proof is a fast deterministic check: it fails at the base and passes once the change works.
+	const PROOF_MS = 120_000;
+	async function proofRuns(root: string, cmd: string, signal?: AbortSignal): Promise<{ passed: number; out: string; killed: boolean }> {
+		let passed = 0;
+		let out = "";
+		let killed = false;
+		try {
+			for (let i = 0; i < 2; i++) {
+				const r = await sh(root, cmd, PROOF_MS, signal);
+				if (signal?.aborted) throw new Error("Proof interrupted; nothing was decided.");
+				if (r.code === 0) passed++;
+				else {
+					out = tail(r.stderr || r.stdout);
+					killed ||= !!r.killed;
+				}
+			}
+		} finally {
+			await restore(root);
+		}
+		return { passed, out, killed };
+	}
+
+	async function hashes(root: string, files: string[]): Promise<Record<string, string>> {
+		const out: Record<string, string> = {};
+		for (const f of files) {
+			const r = await git(root, "hash-object", "--", f);
+			out[f] = r.code === 0 ? r.stdout.trim() : "missing";
+		}
+		return out;
 	}
 
 	/** Frozen instrument files changed between `from` and HEAD. */
@@ -162,11 +240,16 @@ export default async function climb(pi: ExtensionAPI) {
 		if (!lease(root, ctx)) throw new Error("Another omp/pi session is driving this climb. Run /climb resume in this session to take over.");
 	}
 
+	// A guard that passed on this tree minutes ago passes again: retries skip the test suite.
+	const guardPassed = new Map<string, number>();
 	async function guard(root: string, cmd: string | undefined, signal?: AbortSignal): Promise<string | undefined> {
 		if (!cmd) return undefined;
+		const key = `${await tree(root)}\0${cmd}`;
+		if (L.clock.ms() - (guardPassed.get(key) ?? -Infinity) < FRESH_MS) return undefined;
 		const r = await sh(root, cmd, 1_800_000, signal);
 		await restore(root);
 		if (signal?.aborted) throw new Error("Guard interrupted; nothing was decided and the experiment stays open.");
+		if (r.code === 0) guardPassed.set(key, L.clock.ms());
 		return r.code === 0 ? undefined : `guard failed (exit ${r.code}): ${tail(r.stderr || r.stdout)}`;
 	}
 
@@ -473,8 +556,9 @@ export default async function climb(pi: ExtensionAPI) {
 		if (!editing || ctx.agent?.kind === "sub") return;
 		const root = await repoRoot(ctx.cwd);
 		if (!root) return;
-		const open = L.active(load(root)).find(g => g.open && g.card?.frozen?.length);
-		if (!open?.card) return;
+		const open = L.active(load(root)).find(g => g.open);
+		const frozen = [...(open?.card?.frozen ?? []), ...Object.keys(open?.open?.proof?.files ?? {})];
+		if (!open?.open || !frozen.length) return;
 		const real = (p: string) => {
 			try {
 				return path.join(fs.realpathSync(path.dirname(p)), path.basename(p));
@@ -485,11 +569,11 @@ export default async function climb(pi: ExtensionAPI) {
 		const paths = Object.entries((event.input ?? {}) as Record<string, unknown>)
 			.filter(([k, v]) => /path|file/i.test(k) && typeof v === "string")
 			.map(([, v]) => path.relative(real(root), real(path.resolve(ctx.cwd, v as string))));
-		const hit = X.touchedFrozen(paths, open.card.frozen);
+		const hit = X.touchedFrozen(paths, frozen);
 		if (hit.length)
 			return {
 				block: true,
-				reason: `${hit.join(", ")} is part of the frozen instrument of ${open.id} while ${open.open!.id} is open. Finish the experiment first; to change the instrument, re-baseline with climb_scorecard afterwards.`,
+				reason: `${hit.join(", ")} is part of the frozen instrument (scorecard or proof) of ${open.id} while ${open.open.id} is open. Finish the experiment first; to change the instrument, re-baseline with climb_scorecard afterwards.`,
 			};
 	});
 
@@ -510,8 +594,8 @@ export default async function climb(pi: ExtensionAPI) {
 					target: S.opt(S.num("Ambitious target value (omit for hold metrics)")),
 					hold: S.opt(S.bool("Constraint, not a goal (e.g. 'no slower'): must not regress beyond noise; no target")),
 					unit: S.opt(S.str("Unit label, e.g. ms")),
-					noise: S.opt(S.num("Relative change treated as noise; default 0.02")),
-					samples: S.opt(S.num("Runs per measurement, median taken; default 1, max 9")),
+					noise: S.opt(S.num("Floor for the relative noise; default 0.01. The real noise is measured by A/A runs")),
+					samples: S.opt(S.num("Runs per measurement, median taken; default 1, max 9. Noise shrinks with √samples: the lever for a noisy metric")),
 					timeout_s: S.opt(S.num("Per-run timeout in seconds; default 600")),
 				}),
 				"1-3 metrics",
@@ -527,7 +611,7 @@ export default async function climb(pi: ExtensionAPI) {
 			axioms: S.opt(S.arr(S.str("axiom"), "Why these metrics")),
 		}),
 		loadMode: "essential",
-		execute: (_id, p: ScorecardParams, signal, _u, ctx) => exclusive(async () => {
+		execute: (_id, p: ScorecardParams, signal, onUpdate: Update | undefined, ctx) => exclusive(async () => {
 			worker(ctx);
 			const root = await needRoot(ctx);
 			holder(root, ctx);
@@ -565,19 +649,39 @@ export default async function climb(pi: ExtensionAPI) {
 			if (gerr) throw new Error(`The guard must pass at HEAD before climbing: ${gerr}`);
 			// A/A: at least 3 runs on one commit expose the metric's own noise, so the
 			// keep/drop bar is measured, not guessed.
-			const aa = metrics.map(m => ({ ...m, samples: Math.max(3, m.samples) }));
-			const { values, samples, errors } = await measure(root, aa, signal);
+			const say = progressTo(ctx, root, onUpdate, "scorecard A/A");
+			const { values, samples, errors, reused } = await measureTree(root, metrics, m => Math.max(3, m.samples), signal, say);
 			if (errors.length) throw new Error(`Fix these metric commands (exit 0 and print a number):\n${errors.join("\n")}`);
 			const warnings: string[] = [];
+			const problems: string[] = [];
+			const pct = (x: number) => `±${(x * 100).toFixed(1)}%`;
 			for (const m of metrics) {
 				m.baseline = values[m.name];
-				if (m.hold) m.target = m.baseline;
-				else if (L.met(m, m.baseline)) throw new Error(`${m.name} already meets its target (${m.baseline}, ${m.dir} ${m.target}); set an ambitious target.`);
 				const xs = samples[m.name];
-				const spread = (Math.max(...xs) - Math.min(...xs)) / (Math.abs(m.baseline) || 1);
-				m.noise = Math.max(m.noise, 2 * spread);
-				if (spread > 0.1) warnings.push(`${m.name} is noisy (A/A spread ${(spread * 100).toFixed(1)}%): raise samples or steady the command.`);
+				const aa = `A/A runs ${xs.map(x => +x.toPrecision(4)).join(", ")}`;
+				m.noise = Math.max(m.noise, X.noiseOf(xs, m.baseline, m.samples));
+				if (m.hold) {
+					m.target = m.baseline;
+					if (m.noise > 0.5) warnings.push(`${m.name} only catches regressions beyond ${pct(m.noise)} (${aa}).`);
+					continue;
+				}
+				if (L.met(m, m.baseline)) {
+					problems.push(`${m.name} already meets its target (${m.baseline}, ${m.dir} ${m.target}); set an ambitious target.`);
+					continue;
+				}
+				// The bar every kept step must clear, against the whole way to the target.
+				const way = L.gain(m, m.baseline, m.target);
+				const s = X.samplesFor(xs, m.baseline, way / 3) ?? X.samplesFor(xs, m.baseline, way);
+				const fix = `${s && s > m.samples ? `samples: ${s} brings it to ${pct(X.noiseOf(xs, m.baseline, s))}` : "more samples will not fix it"}; or steady the command (fixed inputs, warm-up, no sentinel penalties)`;
+				if (m.noise >= way)
+					problems.push(`${m.name}: noise ${pct(m.noise)} (${aa}) is as large as the whole way to the target (${pct(way)}), so no result could be told apart from luck. ${fix}.`);
+				else if (m.noise > way / 3) warnings.push(`${m.name}: each kept step must beat ${pct(m.noise)}, ${Math.round((m.noise / way) * 100)}% of the way to target (${aa}). ${fix}.`);
 			}
+			if (problems.length) throw new Error(`${problems.join("\n")}\nRuns on this commit are cached for 30 minutes, so a retry only measures what changed.`);
+			const outside = [...new Set(commands.flatMap(X.absolutePaths))].filter(f => !SYSTEM.test(f) && !f.startsWith(`${root}/`) && fs.existsSync(f));
+			if (outside.length)
+				warnings.push(`Instrument outside the repo, so climb cannot freeze or version it: ${outside.join(", ")}. A change there moves the metric invisibly.`);
+			if (reused.length) warnings.push(`Reused A/A runs of this commit for ${reused.join(", ")}.`);
 			const tracked = new Set((await git(root, "ls-files")).stdout.split("\n").filter(Boolean));
 			// An explicit list is authoritative (pass [] to freeze nothing); otherwise freeze what the commands execute.
 			const frozen = p.frozen ?? [...new Set(commands.flatMap(c => X.instrumentFiles(c, tracked)))];
@@ -610,6 +714,7 @@ export default async function climb(pi: ExtensionAPI) {
 			name: S.str("snake_case candidate metric name"),
 			cmd: S.str("Shell command printing the value as its last number"),
 			note: S.opt(S.str("Why it might matter, direction, what it measures")),
+			timeout_s: S.opt(S.num("Timeout in seconds; default 120, max 1800")),
 		}),
 		loadMode: "essential",
 		execute: (_id, p: ProbeParams, signal, _u, ctx) =>
@@ -620,10 +725,18 @@ export default async function climb(pi: ExtensionAPI) {
 				const g = pick(load(root), p.goal);
 				if (!/^[a-z][a-z0-9_]*$/.test(p.name)) throw new Error(`Probe names must be snake_case: "${p.name}".`);
 				// Research may run on an uncommitted tree, so nothing is restored afterwards.
-				const r = await sh(root, p.cmd, 120_000, signal);
+				const limit = Math.min(1800, Math.max(1, Math.round(p.timeout_s ?? 120)));
+				const r = await sh(root, p.cmd, limit * 1000, signal);
 				if (signal?.aborted) throw new Error("Probe interrupted; nothing recorded.");
 				const n = r.code === 0 ? X.parseNumber(r.stdout) : undefined;
-				const error = r.code !== 0 ? `exit ${r.code}: ${tail(r.stderr || r.stdout)}` : n === undefined ? `no number in output: ${tail(r.stdout) || "(empty)"}` : undefined;
+				const error =
+					r.code !== 0
+						? r.killed
+							? `timed out after ${limit}s (pass timeout_s for a slow command)`
+							: `exit ${r.code}: ${tail(r.stderr || r.stdout)}`
+						: n === undefined
+							? `no number in output: ${tail(r.stdout) || "(empty)"}`
+							: undefined;
 				append(root, { ts: L.now(), kind: "probe", goal: g.id, name: p.name, cmd: p.cmd, value: n, error, note: p.note });
 				refresh(ctx, root);
 				const count = load(root).goals.get(g.id)!.probes.filter(x => x.value !== undefined).length;
@@ -635,15 +748,20 @@ export default async function climb(pi: ExtensionAPI) {
 		name: "climb_experiment",
 		label: "Climb: experiment",
 		description:
-			"Pre-register one experiment before touching code: the lever (kind of change, reused across attempts), hypothesis, and predicted metric movement. The extension measures the control on the current clean commit. Then implement, commit, and call climb_measure. One experiment at a time: one working tree measures one change.",
+			"Pre-register one experiment before touching code: the lever (kind of change, reused across attempts), hypothesis, and predicted metric movement. The extension measures the control on the current clean commit. Then implement, commit, and call climb_measure. One experiment at a time: one working tree measures one change. Scorecard metrics decide; for a defect fix they are too coarse to see, add a proof.",
 		parameters: S.obj({
 			goal: S.opt(S.str("Goal id; optional when one goal is active")),
 			lever: S.str("Short lever name, e.g. 'caching' or 'sieve algorithm'"),
 			hypothesis: S.str("Why this should move the metric"),
 			prediction: S.str("Expected movement, e.g. 'runtime_ms -60%'"),
+			proof: S.opt(
+				S.str(
+					"Optional fast check (<120s, deterministic) that fails now and passes (exit 0) once the change works: a regression test or a replay of the defect, e.g. 'bun test test/handoff.test.ts' or 'test \"$(bun bench/replay.ts)\" -eq 0'. Write it before registering; it must fail here and its scripts must stay unchanged. It is this experiment's claim: no keep unless it passes. With it passing and no metric regressed, the experiment is kept even if nothing moved beyond noise. One claim per experiment: register an unrelated gain separately.",
+				),
+			),
 		}),
 		loadMode: "essential",
-		execute: (_id, p: ExperimentParams, signal, _u, ctx) => exclusive(async () => {
+		execute: (_id, p: ExperimentParams, signal, onUpdate: Update | undefined, ctx) => exclusive(async () => {
 			worker(ctx);
 			const root = await needRoot(ctx);
 			holder(root, ctx);
@@ -669,15 +787,35 @@ export default async function climb(pi: ExtensionAPI) {
 			if (moved.length) throw new Error(`The instrument changed since the scorecard (${moved.join(", ")}); re-baseline with climb_scorecard first.`);
 			const base = await head(root);
 			if (!base) throw new Error("The repository has no commits yet.");
-			const control = await measure(root, g.card.metrics, signal);
+			// Evidence that is not on the scorecard cannot decide; say so before an expensive control.
+			const onCard = new Set(g.card.metrics.map(m => m.name));
+			const offCard = [...new Set(g.probes.map(x => x.name))].filter(n => !onCard.has(n) && new RegExp(`\\b${n}\\b`).test(p.prediction));
+			if (offCard.length && !p.proof)
+				throw new Error(
+					`The prediction rests on ${offCard.join(", ")}, a probe, not a scorecard metric: it cannot decide this experiment, and a real fix would be reverted if the scorecard does not move beyond noise. Pass proof (a check that fails now and passes once fixed, e.g. the probe as 'test "$(<probe cmd>)" -eq 1'), or predict scorecard movement only.`,
+				);
+			const say = progressTo(ctx, root, onUpdate, `${g.id} x${g.nextExp} control`);
+			let proof: L.Proof | undefined;
+			if (p.proof) {
+				const missing = X.scriptPaths(p.proof).filter(f => !fs.existsSync(path.join(root, f)));
+				if (missing.length) throw new Error(`The proof runs ${missing.join(", ")}, which does not exist yet. Write the failing check first, then register.`);
+				say("proof must fail at base");
+				const pr = await proofRuns(root, p.proof, signal);
+				if (pr.killed) throw new Error(`The proof timed out (${PROOF_MS / 1000}s); a proof must be a fast check.`);
+				if (pr.passed) throw new Error(`The proof passed ${pr.passed}/2 runs at ${base.slice(0, 8)}: it must fail before the change, or it proves nothing.`);
+				const files = new Set([...(await git(root, "ls-files", "--cached", "--others", "--exclude-standard")).stdout.split("\n").filter(Boolean)]);
+				const scripts = [...new Set([...X.instrumentFiles(p.proof, files).filter(f => !f.endsWith("/")), ...X.scriptPaths(p.proof)])];
+				proof = { cmd: p.proof, files: await hashes(root, scripts) };
+			}
+			const control = await measureTree(root, g.card.metrics, m => m.samples, signal, say);
 			if (control.errors.length) throw new Error(`Control measurement failed at ${base.slice(0, 8)}:\n${control.errors.join("\n")}`);
 			// Commits made outside an experiment (a .gitignore, a failed revert) are adopted
 			// only if they pass the guard and regress nothing against the last measured baseline:
 			// they must never quietly lower the bar.
 			let adopted = "";
 			if (g.baseRef) {
-				const [want, have] = await Promise.all([git(root, "rev-parse", `${g.baseRef}^{tree}`), git(root, "rev-parse", "HEAD^{tree}")]);
-				if (want.code === 0 && want.stdout.trim() !== have.stdout.trim()) {
+				const [want, have] = await Promise.all([tree(root, g.baseRef), tree(root)]);
+				if (want && want !== have) {
 					const short = g.baseRef.slice(0, 8);
 					const gerr = await guard(root, g.card.guard, signal);
 					if (gerr) throw new Error(`Commits since the last measured baseline ${short} break the guard: ${gerr}. Fix or revert them before experimenting.`);
@@ -690,10 +828,14 @@ export default async function climb(pi: ExtensionAPI) {
 				}
 			}
 			const id = `x${g.nextExp}`;
-			append(root, { ts: L.now(), kind: "exp", goal: g.id, id, lever: p.lever, hypothesis: p.hypothesis, prediction: p.prediction, base, ref: control.values });
+			append(root, { ts: L.now(), kind: "exp", goal: g.id, id, lever: p.lever, hypothesis: p.hypothesis, prediction: p.prediction, base, ref: control.values, proof });
 			refresh(ctx, root);
 			const ref = Object.entries(control.values).map(([k, v]) => `${k}=${v}`).join(", ");
-			return ok(`Registered ${id} on ${g.id}.${adopted} Control at ${base.slice(0, 8)}: ${ref}. Implement it and commit (any number of commits), then call climb_measure. Everything after ${base.slice(0, 8)} is this experiment; if it is dropped the extension reverts it.`);
+			const reused = control.reused.length ? ` (${control.reused.join(", ")}: reused runs of this tree from the last 30 minutes)` : "";
+			const proved = proof ? ` The proof fails here, as it must; its scripts (${Object.keys(proof.files).join(", ") || "inline"}) are frozen for ${id}.` : "";
+			return ok(
+				`Registered ${id} on ${g.id}.${adopted} Control at ${base.slice(0, 8)}: ${ref}${reused}.${proved} Implement it and commit (any number of commits), then call climb_measure. Everything after ${base.slice(0, 8)} is this experiment; if it is dropped the extension reverts it.`,
+			);
 		}),
 	});
 
@@ -704,7 +846,7 @@ export default async function climb(pi: ExtensionAPI) {
 			"Close the open experiment: the extension runs the guard and every metric on the committed HEAD, compares against the pre-registered control, and decides kept or dropped (noise-aware). Dropped experiments are reverted with a revert commit. Requires a clean tree and at least one commit since registration.",
 		parameters: S.obj({ goal: S.opt(S.str("Goal id; optional")) }),
 		loadMode: "essential",
-		execute: (_id, p: GoalParam, signal, _u, ctx) => exclusive(async () => {
+		execute: (_id, p: GoalParam, signal, onUpdate: Update | undefined, ctx) => exclusive(async () => {
 			worker(ctx);
 			const root = await needRoot(ctx);
 			holder(root, ctx);
@@ -715,21 +857,46 @@ export default async function climb(pi: ExtensionAPI) {
 			if (d) throw new Error(`Commit your change first; climb measures commits, never a dirty tree:\n${d}`);
 			const h = await head(root);
 			if (!h || h === exp.base) throw new Error(`HEAD is still the base commit ${exp.base.slice(0, 8)}; commit ${exp.id} first.`);
+			const say = progressTo(ctx, root, onUpdate, `${g.id} ${exp.id}`);
 			let values: L.Values = {};
 			let samples: Record<string, number[]> = {};
 			let kept = false;
+			let byProof = false;
+			say("guard");
 			let reason = await guard(root, g.card.guard, signal);
 			const moved = reason ? [] : await instrumentChanged(root, g.card, exp.base);
 			if (moved.length) reason = `instrument changed (${moved.join(", ")}): the measurement is not comparable`;
 			if (!reason) {
-				let r = await measure(root, g.card.metrics, signal);
+				let r = await measure(root, g.card.metrics, signal, {}, say);
 				// Within 2x noise either way: measure again before deciding, so noise
 				// neither keeps a lucky draw nor kills a real gain.
-				if (!r.errors.length && X.borderline(g.card.metrics, exp.ref, r.values)) r = await measure(root, g.card.metrics, signal, r.samples);
+				if (!r.errors.length && X.borderline(g.card.metrics, exp.ref, r.values)) r = await measure(root, g.card.metrics, signal, r.samples, t => say(t && `re-measure (borderline) ${t}`));
 				if (r.errors.length) reason = `measurement failed: ${r.errors.join("; ")}`;
 				else {
 					({ values, samples } = r);
-					({ kept, reason } = X.verdict(g.card.metrics, exp.ref, values));
+					const v = X.verdict(g.card.metrics, exp.ref, values);
+					({ kept, reason } = v);
+					// A registered proof is the experiment's own claim: it must hold for any keep, and
+					// when nothing regressed it keeps a fix the scorecard is too coarse to see.
+					if (!v.regressed && exp.proof) {
+						const now = await hashes(root, Object.keys(exp.proof.files));
+						const edited = Object.keys(exp.proof.files).filter(f => now[f] !== exp.proof!.files[f]);
+						let failed = edited.length ? `proof void: ${edited.join(", ")} changed since registration` : "";
+						if (!failed) {
+							say("proof");
+							const pr = await proofRuns(root, exp.proof.cmd, signal);
+							if (pr.passed < 2) failed = `proof still fails (${pr.passed}/2 runs passed): ${pr.out}`;
+						}
+						if (failed && kept)
+							reason = `${failed}. ${exp.id} did not do what it registered, though ${reason}: keep a gain by registering it without the proof`;
+						else if (failed) reason += `; ${failed}`;
+						else if (kept) reason += "; proof passes";
+						else {
+							byProof = true;
+							reason = `proof passes (it failed at ${exp.base.slice(0, 8)}): ${exp.proof.cmd}; ${reason.replace(/^no metric beat noise/, "no metric regressed")}`;
+						}
+						kept = !failed;
+					}
 				}
 			}
 			let reverted: string | undefined;
@@ -738,16 +905,18 @@ export default async function climb(pi: ExtensionAPI) {
 				if (rv.sha) reverted = rv.sha;
 				else reason += ` — auto-revert failed (${rv.err}); restore by hand: git revert --no-commit ${exp.base.slice(0, 8)}..HEAD && git commit`;
 			}
-			append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: h, values, verdict: kept ? "kept" : "dropped", reason: reason!, reverted });
+			append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: h, values, verdict: kept ? "kept" : "dropped", reason: reason!, reverted, proof: byProof || undefined });
 			let won = kept && g.card.metrics.every(m => L.met(m, values[m.name]));
 			if (won) {
 				// "Done" is never claimed from a single draw: confirm with fresh samples.
-				const c = await measure(root, g.card.metrics, signal, samples);
+				const c = await measure(root, g.card.metrics, signal, samples, t => say(t && `confirming targets ${t}`));
 				won = !c.errors.length && g.card.metrics.every(m => L.met(m, c.values[m.name]));
 				if (won) append(root, { ts: L.now(), kind: "done", goal: g.id, result: "achieved", values: c.values });
 			}
 			const st = refresh(ctx, root);
-			let text = kept ? `KEPT ${exp.id}: ${reason}.` : `DROPPED ${exp.id}: ${reason}.${reverted ? ` Reverted in ${reverted.slice(0, 8)}.` : ""}`;
+			let text = kept
+				? `KEPT ${exp.id}${byProof ? " by proof" : ""}: ${reason}.${byProof ? " A verified fix, but the scorecard has not moved: it does not count as progress." : ""}`
+				: `DROPPED ${exp.id}: ${reason}.${reverted ? ` Reverted in ${reverted.slice(0, 8)}.` : ""}`;
 			if (won) {
 				text += `\nGOAL ACHIEVED: ${g.id}, every target met.${g.card.parked?.length ? ` Parked metrics remain: ${g.card.parked.join(", ")}.` : ""}`;
 				ctx.ui?.notify?.(`climb ${g.id} achieved`, "info");
@@ -932,11 +1101,13 @@ interface ProbeParams extends GoalParam {
 	name: string;
 	cmd: string;
 	note?: string;
+	timeout_s?: number;
 }
 interface ExperimentParams extends GoalParam {
 	lever: string;
 	hypothesis: string;
 	prediction: string;
+	proof?: string;
 }
 interface JudgeParams extends GoalParam {
 	verdict: L.Verdict;

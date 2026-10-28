@@ -489,3 +489,129 @@ describe("hold metrics", () => {
 		}
 	});
 });
+
+// Fumbles seen in a 5-hour live climb (voice agent, real omp), each pinned here.
+describe("lessons from a live run", () => {
+	let d: string;
+	let z: ReturnType<typeof host>;
+	const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+	// A metric whose runs are counted in .git/ (outside the tree) so tests can see what was re-measured.
+	const counted = (file: string) => `n=$(cat .git/runs 2>/dev/null || echo 0); echo $((n+1)) > .git/runs; cat ${file}`;
+	const runsSoFar = async () => Number((await run("cat .git/runs 2>/dev/null || echo 0")).stdout.trim());
+	const realMs = L.clock.ms;
+
+	beforeAll(async () => {
+		d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-live-"));
+		await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo 50 > ms.txt && git add -A && git commit -qm init");
+		z = host(d, "main", "live");
+		await z.load();
+		await z.cmd("shrink work");
+	});
+	afterAll(() => {
+		L.clock.ms = realMs;
+		fs.rmSync(d, { recursive: true, force: true });
+	});
+
+	test("a probe gets its own timeout and says when it hit it", async () => {
+		expect(await z.tool("climb_probe", { name: "slow", cmd: "sleep 3; echo 1", timeout_s: 1 })).toContain("timed out after 1s");
+		expect(await z.tool("climb_probe", { name: "work_left", cmd: "cat work.txt" })).toContain("= 100");
+	});
+
+	test("noise shrinks with samples; a metric that cannot resolve its target is refused, and the retry reuses runs", async () => {
+		// Runs cycle 100, 160, 40: a ±60% spread per run.
+		const noisy = "n=$(cat .git/cyc 2>/dev/null || echo 0); echo $((n+1)) > .git/cyc; awk -v n=$n 'BEGIN{split(\"100 160 40\",a,\" \"); print a[n%3+1]}'";
+		const err = await z.tool("climb_scorecard", { metrics: [{ name: "lat", cmd: noisy, dir: "down", target: 1 }] }).catch(e => String(e));
+		expect(err).toContain("as large as the whole way to the target");
+		expect(err).toContain("samples: 5");
+		const card = await z.tool("climb_scorecard", { metrics: [{ name: "lat", cmd: noisy, dir: "down", target: 1, samples: 5 }] });
+		expect(Number((await run("cat .git/cyc")).stdout.trim())).toBe(5); // 3 cached + 2 topped up, not 3 + 5
+		expect(card).toContain("each kept step must beat");
+		expect(X.noiseOf([100, 160, 40], 100, 9)).toBeLessThan(X.noiseOf([100, 160, 40], 100, 1) / 2);
+	});
+
+	test("a tree measured minutes ago is not re-measured for the control; a stale one is", async () => {
+		await z.tool("climb_scorecard", { metrics: [{ name: "work", cmd: counted("work.txt"), dir: "down", target: 10, noise: 0.05 }] });
+		const before = await runsSoFar();
+		expect(await z.tool("climb_experiment", { lever: "noop", hypothesis: "", prediction: "" })).toContain("reused runs of this tree");
+		expect(await runsSoFar()).toBe(before);
+		await run("echo 100 > other.txt && git add other.txt && git commit -qm noop");
+		expect(await z.tool("climb_measure", {})).toContain("DROPPED x1");
+		const measured = await runsSoFar();
+		expect(measured).toBe(before + 1); // the candidate is always measured fresh
+		// The revert restored the base tree: its control runs are reused.
+		expect(await z.tool("climb_experiment", { lever: "noop again", hypothesis: "", prediction: "" })).toContain("reused runs");
+		expect(await runsSoFar()).toBe(measured);
+		await run("echo 101 > other.txt && git add other.txt && git commit -qm noop2");
+		await z.tool("climb_measure", {});
+		const clock = L.clock.ms; // earlier suites may have moved it
+		L.clock.ms = () => clock() + 31 * 60_000;
+		expect(await z.tool("climb_experiment", { lever: "later", hypothesis: "", prediction: "" })).not.toContain("reused");
+		expect(await runsSoFar()).toBe(measured + 2);
+		await run("echo 50 > work.txt && git commit -qam halve");
+		expect(await z.tool("climb_measure", {})).toContain("KEPT x3");
+		L.clock.ms = clock;
+	});
+
+	test("a probe named in the prediction cannot decide; a proof can, and keeps a real fix the scorecard cannot see", async () => {
+		await expect(z.tool("climb_experiment", { lever: "fix", hypothesis: "", prediction: "work_left stays, bug fixed" })).rejects.toThrow("work_left, a probe");
+		await expect(z.tool("climb_experiment", { lever: "fix", hypothesis: "", prediction: "", proof: "true" })).rejects.toThrow("must fail before the change");
+		await expect(z.tool("climb_experiment", { lever: "fix", hypothesis: "", prediction: "", proof: "bash checks/fixed.sh" })).rejects.toThrow("does not exist yet");
+		await run("mkdir -p checks && printf 'test \"$(cat fixed.txt 2>/dev/null)\" = yes\\n' > checks/fixed.sh");
+		const reg = await z.tool("climb_experiment", { lever: "fix", hypothesis: "the bug", prediction: "work_left unchanged; fixed", proof: "bash checks/fixed.sh" });
+		expect(reg).toContain("The proof fails here");
+		expect((await z.emit("tool_call", { toolName: "write", input: { path: path.join(d, "checks/fixed.sh"), content: "true" } }))?.block).toBe(true);
+		await run("echo yes > fixed.txt && git add fixed.txt && git commit -qm fix");
+		const out = await z.tool("climb_measure", {});
+		expect(out).toContain("KEPT x4 by proof");
+		const entries = L.read(d);
+		const g = L.fold(entries).goals.get("g-shrink-work")!;
+		expect(entries.at(-1)).toMatchObject({ kind: "result", verdict: "kept", proof: true });
+		expect(g.streak).toBe(0);
+		// A proven fix is kept, but only x3's measured gain counts as progress for the heartbeat.
+		expect(g.lastKeptSeq).toBe(entries.findIndex(e => e.kind === "result" && e.exp === "x3"));
+		expect(g.best.work).toBe(50);
+	});
+
+	test("an edited proof proves nothing, and the experiment is dropped", async () => {
+		await run("printf 'test \"$(cat fixed2.txt 2>/dev/null)\" = yes\\n' > checks/fixed2.sh");
+		await z.tool("climb_experiment", { lever: "fix2", hypothesis: "", prediction: "", proof: "bash checks/fixed2.sh" });
+		await run("echo true > checks/fixed2.sh && echo x > fixed2.txt && git add -A && git commit -qm cheat");
+		const out = await z.tool("climb_measure", {});
+		expect(out).toContain("DROPPED x5");
+		expect(out).toContain("proof void: checks/fixed2.sh changed");
+	});
+
+	test("a proof is the experiment's claim: a metric gain that leaves it failing is not kept", async () => {
+		await run("mkdir -p checks && printf 'test \"$(cat fixed3.txt 2>/dev/null)\" = yes\\n' > checks/fixed3.sh");
+		await z.tool("climb_experiment", { lever: "fix3", hypothesis: "", prediction: "", proof: "bash checks/fixed3.sh" });
+		await run("echo 25 > work.txt && git commit -qam faster-but-unfixed");
+		const out = await z.tool("climb_measure", {});
+		expect(out).toContain("DROPPED x6");
+		expect(out).toContain("did not do what it registered");
+		await z.tool("climb_experiment", { lever: "fix3", hypothesis: "", prediction: "", proof: "bash checks/fixed3.sh" });
+		await run("echo 25 > work.txt && echo yes > fixed3.txt && git add -A && git commit -qm faster-and-fixed");
+		expect(await z.tool("climb_measure", {})).toMatch(/KEPT x7: work 50→25 .*; proof passes/);
+	});
+
+	test("a hold metric bouncing back is not a gain; one flaky run is retried", async () => {
+		// The hold metric's first-ever run fails: the retry absorbs it.
+		const flaky = "test -f .git/warm || { touch .git/warm; exit 1; }; cat ms.txt";
+		await z.tool("climb_scorecard", {
+			metrics: [
+				{ name: "work", cmd: "cat work.txt", dir: "down", target: 10, noise: 0.05 },
+				{ name: "ms", cmd: flaky, dir: "down", hold: true, noise: 0.05 },
+			],
+		});
+		await z.tool("climb_experiment", { lever: "speed only", hypothesis: "", prediction: "" });
+		await run("echo 40 > ms.txt && git commit -qam faster");
+		expect(await z.tool("climb_measure", {})).toContain("no metric beat noise");
+	});
+
+	test("instrument outside the repo is flagged", async () => {
+		const ext = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "climb-ext-")), "bench.sh");
+		fs.writeFileSync(ext, "echo 100\n");
+		const out = await z.tool("climb_scorecard", { metrics: [{ name: "work", cmd: `bash ${ext}`, dir: "down", target: 10 }] });
+		expect(out).toContain("Instrument outside the repo");
+		fs.rmSync(path.dirname(ext), { recursive: true, force: true });
+	});
+});
