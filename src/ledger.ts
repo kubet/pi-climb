@@ -54,7 +54,7 @@ export interface ResultE extends Base {
 }
 export interface BeatE extends Base { kind: "beat"; head: string; values?: Values; progress: boolean; stale: number; note?: string }
 export interface StallE extends Base { kind: "stall"; stale: number }
-export interface JudgeE extends Base { kind: "judge"; by: "judge" | "worker"; verdict: Verdict; diagnosis: string; next: string }
+export interface JudgeE extends Base { kind: "judge"; by: "judge" | "worker" | "human"; verdict: Verdict; diagnosis: string; next: string }
 export interface DoneE extends Base { kind: "done"; result: "achieved" | "abandoned"; values: Values }
 export interface PauseE extends Base { kind: "pause" | "resume" }
 export interface RollupE extends Base { kind: "rollup"; cd: number; n: number; from: string; to: string; progress: number; stale: number; values?: Values }
@@ -76,12 +76,17 @@ export interface Goal {
 	open?: ExpE;
 	results: ResultE[];
 	levers: Map<string, { tried: number; kept: number; dropped: number }>;
-	/** Consecutive drops (any lever) since the last kept result or judge verdict. */
+	/** Consecutive drops (any lever) since the last kept result or independent verdict. */
 	streak: number;
+	/** Commit whose tree is the measured baseline; HEAD must match it to start an experiment. */
+	baseRef?: string;
 	lastBeat?: { ts: string; head: string; stale: number; seq: number };
 	stallPending: boolean;
+	/** Latest independent verdict (the judge or a human). */
 	judge?: JudgeE;
-	/** Ledger line of the latest judge verdict; line order never ties, timestamps can. */
+	/** Latest diagnosis from anyone, the worker included (display only). */
+	diagnosis?: JudgeE;
+	/** Ledger line of the latest independent verdict; line order never ties, timestamps can. */
 	judgeSeq: number;
 	lastKeptSeq: number;
 	lastProgress?: string;
@@ -160,16 +165,6 @@ export function gain(m: Metric, ref: number, v: number): number {
 	return d / (Math.abs(ref) || 1);
 }
 
-/** True when any metric in `values` beats the goal's best by more than noise. */
-export function improves(g: Goal, values: Values | undefined): boolean {
-	if (!values || !g.card) return false;
-	return g.card.metrics.some(m => {
-		const v = values[m.name];
-		const b = g.best[m.name];
-		return v !== undefined && b !== undefined && gain(m, b, v) > m.noise;
-	});
-}
-
 // Only kept results (and the baseline) move `best`: a heartbeat's single lucky
 // draw must never become the bar every later experiment is judged against.
 function record(g: Goal, ts: string, values: Values | undefined, ratchet: boolean): void {
@@ -197,6 +192,7 @@ export function fold(entries: Entry[]): State {
 		switch (e.kind) {
 			case "card":
 				g.card = e;
+				g.baseRef = e.head;
 				g.best = {};
 				g.series = new Map();
 				record(g, e.ts, Object.fromEntries(e.metrics.map(m => [m.name, m.baseline])), true);
@@ -209,7 +205,11 @@ export function fold(entries: Entry[]): State {
 			case "result": {
 				if (g.open?.id === e.exp) g.open = undefined;
 				g.results.push(e);
-				const key = lever(exps.get(`${e.goal}|${e.exp}`)?.lever ?? e.exp);
+				const exp = exps.get(`${e.goal}|${e.exp}`);
+				const key = lever(exp?.lever ?? e.exp);
+				// Kept: the experiment head is the new baseline. Dropped: the revert restored
+				// the base tree; if the revert failed, HEAD will not match and climbing halts.
+				g.baseRef = e.verdict === "kept" ? e.head : (e.reverted ?? exp?.base ?? g.baseRef);
 				const l = g.levers.get(key) ?? { tried: 0, kept: 0, dropped: 0 };
 				l.tried++;
 				if (e.verdict === "kept") {
@@ -238,9 +238,13 @@ export function fold(entries: Entry[]): State {
 				g.stallPending = true;
 				break;
 			case "judge":
+				g.diagnosis = e;
+				g.stallPending = false;
+				// A worker grading its own work is recorded but never resets the stale count
+				// or the grid-search gate: only an independent verdict does.
+				if (e.by === "worker") break;
 				g.judge = e;
 				g.judgeSeq = seq;
-				g.stallPending = false;
 				g.streak = 0;
 				break;
 			case "done":

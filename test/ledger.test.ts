@@ -118,6 +118,8 @@ describe("ledger fold", () => {
 		drop(3, "other");
 		expect(X.streakBlocked(L.fold(entries).goals.get("g")!)).toContain("3 experiments dropped in a row");
 		entries.push({ ts: iso(1e5, nowMs), kind: "judge", goal: "g", by: "worker", verdict: "pivot", diagnosis: "", next: "" });
+		expect(X.streakBlocked(L.fold(entries).goals.get("g")!)).toContain("in a row"); // self-grading does not clear it
+		entries.push({ ts: iso(5e4, nowMs), kind: "judge", goal: "g", by: "judge", verdict: "pivot", diagnosis: "", next: "" });
 		expect(X.streakBlocked(L.fold(entries).goals.get("g")!)).toBeUndefined();
 	});
 

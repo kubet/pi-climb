@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import climb from "../src/index";
 import * as L from "../src/ledger";
+import * as X from "../src/logic";
 
 type Handler = (e: unknown, ctx: unknown) => unknown;
 
@@ -68,6 +69,7 @@ function host(cwd: string, kind: "main" | "sub" = "main", sid = "s1") {
 		notes,
 		load: () => climb(pi as never),
 		tool: async (name: string, params: object) => (await tools.get(name)!.execute("id", params, undefined, undefined, ctx)).content[0].text,
+		toolWith: async (name: string, params: object, signal: AbortSignal) => (await tools.get(name)!.execute("id", params, signal, undefined, ctx)).content[0].text,
 		cmd: (args: string) => commands.get("climb")!.handler(args, ctx),
 		emit: async (ev: string, e: object = {}) => {
 			let out: unknown;
@@ -154,7 +156,7 @@ describe("climb extension", () => {
 		expect(out).toContain("DROPPED x2");
 		expect(out).toContain("Reverted");
 		expect(fs.readFileSync(path.join(dir, "work.txt"), "utf8").trim()).toBe("50");
-		expect((await sh("git log -1 --format=%s")).stdout).toContain("climb: revert x2");
+		expect((await sh("git log -1 --format=%s")).stdout).toContain("revert: climb x2");
 	});
 
 	test("guard failure drops the experiment", async () => {
@@ -217,8 +219,11 @@ describe("climb extension", () => {
 			await commit(90, lever);
 			expect(await x.tool("climb_measure", {})).toContain("DROPPED");
 		}
-		await expect(x.tool("climb_experiment", { lever: "brand new idea", hypothesis: "?", prediction: "?" })).rejects.toThrow("in a row");
 		await x.tool("climb_judge", { verdict: "pivot", diagnosis: "every attempt added work", next: "delete instead" });
+		const judged = ledger().filter(e => e.kind === "judge" && e.by === "judge").length;
+		// self-grading does not clear the gate; tripping it summons the independent judge
+		await expect(x.tool("climb_experiment", { lever: "brand new idea", hypothesis: "?", prediction: "?" })).rejects.toThrow("in a row");
+		await until(() => ledger().filter(e => e.kind === "judge" && e.by === "judge").length > judged);
 		expect(await x.tool("climb_experiment", { lever: "noop", hypothesis: "?", prediction: "?" })).toContain("Registered");
 		await commit(50, "noop");
 		expect(await x.tool("climb_measure", {})).toContain("DROPPED");
@@ -227,15 +232,19 @@ describe("climb extension", () => {
 	test("one session drives the climb; another takes over only when the driver goes silent", async () => {
 		const other = host(dir, "main", "s2");
 		await other.load();
+		process.env.CLIMB_LEASE_ID = "other-process";
 		await expect(other.tool("climb_experiment", { lever: "x", hypothesis: "", prediction: "" })).rejects.toThrow("Another omp/pi session");
 		expect(await other.emit("session_stop")).toBeUndefined();
 		const t = L.clock.ms();
 		L.clock.ms = () => t + 61_000 + (Date.now() - t);
 		expect(await other.tool("climb_status", {})).toContain("climbing");
 		await other.cmd("resume");
+		delete process.env.CLIMB_LEASE_ID;
 		await expect(x.tool("climb_experiment", { lever: "x", hypothesis: "", prediction: "" })).rejects.toThrow("Another omp/pi session");
 		await x.cmd("resume"); // take it back explicitly
+		process.env.CLIMB_LEASE_ID = "other-process";
 		await expect(other.tool("climb_experiment", { lever: "x", hypothesis: "", prediction: "" })).rejects.toThrow("Another omp/pi session");
+		delete process.env.CLIMB_LEASE_ID;
 	});
 
 	test("stop-hook valve: two idle stops in a row release the worker to the heartbeat", async () => {
@@ -329,5 +338,73 @@ describe("climb extension", () => {
 			delete process.env.CLIMB_SINK;
 			server.stop(true);
 		}
+	});
+});
+
+describe("reviewer regressions", () => {
+	let rdir: string;
+	let y: ReturnType<typeof host>;
+	const rsh = (cmd: string) => exec("bash", ["-c", cmd], { cwd: rdir });
+	const card = { metrics: [{ name: "w", cmd: "cat work.txt", dir: "down", target: 1, noise: 0.05 }] };
+
+	beforeAll(async () => {
+		rdir = fs.mkdtempSync(path.join(os.tmpdir(), "climb-r-"));
+		await rsh("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && git add -A && git commit -qm init");
+		y = host(rdir, "main", "r1");
+		await y.load();
+		await y.cmd("shrink work");
+	});
+	afterAll(() => fs.rmSync(rdir, { recursive: true, force: true }));
+
+	test("an untracked instrument script is rejected before it can be reverted away", async () => {
+		await rsh("printf 'cat work.txt\\n' > bench.sh");
+		await expect(y.tool("climb_scorecard", { metrics: [{ name: "w", cmd: "bash bench.sh", dir: "down", target: 1 }] })).rejects.toThrow("Commit the instrument first");
+		await rsh("rm bench.sh");
+		expect(await y.tool("climb_scorecard", card)).toContain("w = 100");
+	});
+
+	test("bun test / go test do not freeze the test directory", () => {
+		const t = new Set(["test/a.test.ts", "src/x.ts"]);
+		expect(X.instrumentFiles("bun test", t)).toEqual([]);
+		expect(X.instrumentFiles("go test ./...", t)).toEqual([]);
+		expect(X.instrumentFiles("bun test test/", t)).toEqual(["test/"]);
+	});
+
+	test("an interrupted measurement decides nothing and keeps the experiment open", async () => {
+		await y.tool("climb_experiment", { lever: "halve", hypothesis: "", prediction: "" });
+		await rsh("echo 50 > work.txt && git commit -qam halve");
+		const ac = new AbortController();
+		ac.abort();
+		await expect(y.toolWith("climb_measure", {}, ac.signal)).rejects.toThrow("interrupted");
+		expect(L.fold(L.read(rdir)).goals.get("g-shrink-work")!.open?.id).toBe("x1");
+		expect(await y.tool("climb_measure", {})).toContain("KEPT x1");
+	});
+
+	test("commits climb never measured cannot become the baseline", async () => {
+		await rsh("echo 400 > work.txt && git commit -qam sneaky");
+		await expect(y.tool("climb_experiment", { lever: "x", hypothesis: "", prediction: "" })).rejects.toThrow("never measured");
+		await rsh("git revert --no-edit HEAD >/dev/null");
+		expect(await y.tool("climb_experiment", { lever: "x", hypothesis: "", prediction: "" })).toContain("Control at");
+	});
+
+	test("a revert blocked by a commit hook is reported and halts climbing instead of poisoning the baseline", async () => {
+		await rsh("printf '#!/bin/sh\\ngrep -q \"^feat\" \"$1\"\\n' > .git/hooks/commit-msg && chmod +x .git/hooks/commit-msg");
+		await rsh("echo 90 > work.txt && git commit -qam 'feat: bloat'");
+		const out = await y.tool("climb_measure", {});
+		expect(out).toContain("auto-revert failed");
+		expect((await rsh("git status --porcelain --untracked-files=no")).stdout.trim()).toBe("");
+		await expect(y.tool("climb_experiment", { lever: "y", hypothesis: "", prediction: "" })).rejects.toThrow("never measured");
+		await rsh("rm .git/hooks/commit-msg && git revert --no-edit HEAD >/dev/null");
+		expect(await y.tool("climb_experiment", { lever: "y", hypothesis: "", prediction: "" })).toContain("Control at");
+	});
+
+	test("/climb resume is the human's verdict that un-sticks a goal", async () => {
+		y.h.judge = "VERDICT: stuck\nDIAGNOSIS: needs a human\nNEXT: ask";
+		await y.cmd("judge");
+		await until(() => (L.read(rdir).filter(e => e.kind === "judge").at(-1) as L.JudgeE | undefined)?.verdict === "stuck");
+		expect(await y.emit("session_stop")).toBeUndefined();
+		await y.cmd("resume");
+		expect(L.read(rdir).filter(e => e.kind === "judge").at(-1)).toMatchObject({ by: "human", verdict: "continue" });
+		expect((await y.emit("session_stop"))?.decision).toBe("block");
 	});
 });

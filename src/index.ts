@@ -11,6 +11,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as L from "./ledger";
 import * as X from "./logic";
@@ -103,10 +104,13 @@ export default async function climb(pi: ExtensionAPI) {
 		const values: L.Values = {};
 		const samples: Record<string, number[]> = {};
 		const errors: string[] = [];
+		try {
 		for (const m of metrics) {
 			const xs: number[] = [];
 			for (let i = 0; i < m.samples; i++) {
 				const r = await sh(root, m.cmd, m.timeout_s * 1000, signal);
+				// An operator interrupt is not a verdict: nothing is decided or reverted.
+				if (signal?.aborted) throw new Error("Measurement interrupted; nothing was decided and the experiment stays open.");
 				if (r.code !== 0) {
 					errors.push(`${m.name}: exit ${r.code}${r.killed ? " (killed/timeout)" : ""}: ${tail(r.stderr || r.stdout)}`);
 					break;
@@ -122,7 +126,9 @@ export default async function climb(pi: ExtensionAPI) {
 			samples[m.name] = [...(prior[m.name] ?? []), ...xs];
 			values[m.name] = X.median(samples[m.name]);
 		}
-		await restore(root);
+		} finally {
+			await restore(root);
+		}
 		return { values, samples, errors };
 	}
 
@@ -136,7 +142,8 @@ export default async function climb(pi: ExtensionAPI) {
 	// One session drives a repo's climb. The holder renews the lease every tick;
 	// another session takes over only when the holder has gone silent.
 	const LEASE_STALE_MS = 4 * TICK_MS;
-	const me = (ctx: Ctx) => `${process.pid}:${ctx.sessionManager?.getSessionId?.() ?? "main"}`;
+	// Keyed on the process, not the session id: /new or a session switch must not orphan the lease.
+	const me = (_ctx: Ctx) => process.env.CLIMB_LEASE_ID ?? `${os.hostname()}:${process.pid}`;
 	function lease(root: string, ctx: Ctx, claim = false): boolean {
 		const file = path.join(root, L.DIR, "lease.json");
 		let cur: { who: string; ts: number } | undefined;
@@ -157,19 +164,18 @@ export default async function climb(pi: ExtensionAPI) {
 		if (!cmd) return undefined;
 		const r = await sh(root, cmd, 1_800_000, signal);
 		await restore(root);
+		if (signal?.aborted) throw new Error("Guard interrupted; nothing was decided and the experiment stays open.");
 		return r.code === 0 ? undefined : `guard failed (exit ${r.code}): ${tail(r.stderr || r.stdout)}`;
 	}
 
 	async function revert(root: string, exp: L.ExpE, reason: string): Promise<{ sha?: string; err?: string }> {
-		const r = await git(root, "revert", "--no-commit", `${exp.base}..HEAD`);
-		if (r.code !== 0) {
-			await git(root, "revert", "--abort");
-			return { err: tail(r.stderr || r.stdout) };
-		}
-		const c = await git(root, "commit", "-m", `climb: revert ${exp.id} (${exp.lever})`, "-m", reason.slice(0, 500));
+		// Restore the base tree exactly (handles merges and added files), then commit it.
+		const r = await git(root, "restore", `--source=${exp.base}`, "--staged", "--worktree", ":/");
+		if (r.code !== 0) return { err: tail(r.stderr || r.stdout) };
+		const c = await git(root, "commit", "-m", `revert: climb ${exp.id} (${exp.lever})`, "-m", reason.slice(0, 500));
 		if (c.code !== 0 && !/nothing to commit/.test(c.stdout + c.stderr)) {
-			await git(root, "revert", "--abort");
-			return { err: tail(c.stderr || c.stdout) };
+			await git(root, "reset", "-q", "--hard", "HEAD"); // undo only our staged restore; the tree was clean before
+			return { err: tail(c.stderr || c.stdout) || `git commit exit ${c.code}` };
 		}
 		return { sha: await head(root) };
 	}
@@ -236,6 +242,14 @@ export default async function climb(pi: ExtensionAPI) {
 		const msg = { customType: "climb", content: text, display: true };
 		if (ctx.isIdle()) pi.sendMessage(msg, { triggerTurn: trigger });
 		else pi.sendMessage(msg, { deliverAs: omp ? "aside" : "steer" });
+	}
+
+	// One measurement at a time: concurrent benchmarks corrupt each other's numbers.
+	let measuring: Promise<unknown> = Promise.resolve();
+	function exclusive<T>(fn: () => Promise<T>): Promise<T> {
+		const run = measuring.then(fn, fn);
+		measuring = run.catch(() => {});
+		return run;
 	}
 
 	const ok = (text: string) => ({ content: [{ type: "text" as const, text: text + artifactNote() }] });
@@ -315,24 +329,14 @@ export default async function climb(pi: ExtensionAPI) {
 	}
 
 	async function beat(ctx: Ctx, root: string, g: L.Goal, idle: boolean, paused: boolean): Promise<void> {
+		// The heartbeat audits the ledger; it never measures. Measuring here would race the
+		// worker's edits and its benchmarks, and only kept results move the climb anyway.
 		const h = (await head(root)) ?? "";
-		let values: L.Values | undefined;
-		let note: string | undefined;
-		if (!g.card) note = "no scorecard yet";
-		else if (g.open) note = `${g.open.id} open`;
-		else if (!idle) note = "worker busy"; // never measure a tree that is being edited
-		else if (h === g.lastBeat?.head) note = "no new commits";
-		else if (await dirty(root)) note = "dirty tree";
-		else if ((await instrumentChanged(root, g.card, g.card.head)).length) note = "instrument changed since the scorecard";
-		else {
-			const r = await measure(root, g.card.metrics);
-			if (r.errors.length) note = `measure failed: ${r.errors.join("; ")}`;
-			else values = r.values;
-		}
-		const progress = L.keptSinceBeat(g) || L.improves(g, values);
-		// A judge verdict restarts the count, so the judge runs once per stall, not every beat.
+		const note = !g.card ? "no scorecard yet" : g.open ? `${g.open.id} open` : !idle ? "worker busy" : undefined;
+		const progress = L.keptSinceBeat(g);
+		// An independent verdict restarts the count, so the judge runs once per stall, not every beat.
 		const stale = progress ? 0 : (L.judgedSinceBeat(g) ? 0 : (g.lastBeat?.stale ?? 0)) + 1;
-		append(root, { ts: L.now(), kind: "beat", goal: g.id, head: h, values, progress, stale, note });
+		append(root, { ts: L.now(), kind: "beat", goal: g.id, head: h, progress, stale, note });
 
 		const after = load(root).goals.get(g.id)!;
 		if (paused || L.stuck(after)) return;
@@ -358,12 +362,18 @@ export default async function climb(pi: ExtensionAPI) {
 				.slice(-15);
 			const log = (await git(root, "log", "--oneline", "-15")).stdout.trim();
 			const promptText = X.judgePrompt(g, ledgerTail, log);
-			let reply: string;
-			try {
-				reply = (await ctx.runEphemeralTurn({ promptText, tools: false, maxTokens: 1500 })).replyText;
-			} catch {
-				reply = (await ctx.runEphemeralTurn({ promptText, tools: false })).replyText;
+			// Transports differ in what side turns accept (output caps, tool opt-out): degrade.
+			let reply: string | undefined;
+			let lastErr: unknown;
+			for (const opts of [{ tools: false as const, maxTokens: 1500 }, { tools: false as const }, {}]) {
+				try {
+					reply = (await ctx.runEphemeralTurn({ promptText, ...opts })).replyText;
+					break;
+				} catch (e) {
+					lastErr = e;
+				}
 			}
+			if (reply === undefined) throw lastErr;
 			const j = X.parseJudge(reply);
 			append(root, { ts: L.now(), kind: "judge", goal: id, by: "judge", ...j });
 			const msg = `[climb JUDGE ${id}] ${j.verdict.toUpperCase()}: ${j.diagnosis}\nNEXT: ${j.next}`;
@@ -495,14 +505,14 @@ export default async function climb(pi: ExtensionAPI) {
 			frozen: S.opt(
 				S.arr(
 					S.str("path or glob"),
-					"Instrument paths experiments may not change (bench scripts, fixtures, tests). Scripts run by the metric commands and guard are frozen automatically.",
+					"Instrument paths experiments may not change (bench scripts, fixtures, tests). Omit to freeze the scripts the metric and guard commands execute; pass [] when the goal is to change them (e.g. adding tests).",
 				),
 			),
 			parked: S.opt(S.arr(S.str("metric"), "Metrics worth tracking later, not now")),
 			axioms: S.opt(S.arr(S.str("axiom"), "Why these metrics")),
 		}),
 		loadMode: "essential",
-		async execute(_id, p: ScorecardParams, signal, _u, ctx) {
+		execute: (_id, p: ScorecardParams, signal, _u, ctx) => exclusive(async () => {
 			worker(ctx);
 			const root = await needRoot(ctx);
 			holder(root, ctx);
@@ -528,6 +538,11 @@ export default async function climb(pi: ExtensionAPI) {
 				timeout_s: m.timeout_s ?? 600,
 				baseline: Number.NaN,
 			}));
+			const commands = [...metrics.map(m => m.cmd), p.guard ?? ""];
+			const untracked = new Set((await git(root, "ls-files", "--others", "--exclude-standard")).stdout.split("\n").filter(Boolean));
+			const loose = commands.flatMap(c => X.instrumentFiles(c, untracked));
+			if (loose.length)
+				throw new Error(`Commit the instrument first: ${[...new Set(loose)].join(", ")} is untracked, so the first revert would delete it and break every later measurement.`);
 			const gerr = await guard(root, p.guard, signal);
 			if (gerr) throw new Error(`The guard must pass at HEAD before climbing: ${gerr}`);
 			// A/A: at least 3 runs on one commit expose the metric's own noise, so the
@@ -545,7 +560,8 @@ export default async function climb(pi: ExtensionAPI) {
 				if (spread > 0.1) warnings.push(`${m.name} is noisy (A/A spread ${(spread * 100).toFixed(1)}%): raise samples or steady the command.`);
 			}
 			const tracked = new Set((await git(root, "ls-files")).stdout.split("\n").filter(Boolean));
-			const frozen = [...new Set([...(p.frozen ?? []), ...[...metrics.map(m => m.cmd), p.guard ?? ""].flatMap(c => X.instrumentFiles(c, tracked))])];
+			// An explicit list is authoritative (pass [] to freeze nothing); otherwise freeze what the commands execute.
+			const frozen = p.frozen ?? [...new Set(commands.flatMap(c => X.instrumentFiles(c, tracked)))];
 			const h = await head(root);
 			append(root, { ts: L.now(), kind: "card", goal: g.id, metrics, guard: p.guard, frozen, head: h, parked: p.parked, axioms: p.axioms });
 			refresh(ctx, root);
@@ -561,7 +577,7 @@ export default async function climb(pi: ExtensionAPI) {
 					"Next: call climb_experiment with your highest-expected-gain lever.",
 				].join("\n"),
 			);
-		},
+		}),
 	});
 
 	pi.registerTool({
@@ -576,7 +592,7 @@ export default async function climb(pi: ExtensionAPI) {
 			prediction: S.str("Expected movement, e.g. 'runtime_ms -60%'"),
 		}),
 		loadMode: "essential",
-		async execute(_id, p: ExperimentParams, signal, _u, ctx) {
+		execute: (_id, p: ExperimentParams, signal, _u, ctx) => exclusive(async () => {
 			worker(ctx);
 			const root = await needRoot(ctx);
 			holder(root, ctx);
@@ -588,9 +604,22 @@ export default async function climb(pi: ExtensionAPI) {
 			if (g.stallPending)
 				throw new Error(judging.has(g.id) ? "The judge is reviewing this stall; its verdict arrives as a message shortly." : X.nextAction(g));
 			const blocked = X.streakBlocked(g);
-			if (blocked) throw new Error(blocked);
+			if (blocked) {
+				void judge(ctx, root, g.id);
+				throw new Error(blocked);
+			}
 			const d = await dirty(root);
-			if (d) throw new Error(`Working tree is dirty; experiments start from a clean commit. Commit or stash:\n${d}`);
+			if (d)
+				throw new Error(
+					`Working tree has uncommitted changes; an experiment starts from the measured commit. If they are this experiment: git stash, call climb_experiment, git stash pop, commit, climb_measure.\n${d}`,
+				);
+			if (g.baseRef) {
+				const [want, have] = await Promise.all([git(root, "rev-parse", `${g.baseRef}^{tree}`), git(root, "rev-parse", "HEAD^{tree}")]);
+				if (want.code === 0 && want.stdout.trim() !== have.stdout.trim())
+					throw new Error(
+						`HEAD has changes climb never measured (baseline is ${g.baseRef.slice(0, 8)}). Unmeasured commits cannot enter the baseline: move them into an experiment (git reset --soft ${g.baseRef.slice(0, 8)} && git stash, climb_experiment, git stash pop, commit, climb_measure), restore the baseline (git revert), or re-baseline with climb_scorecard if they are intended.`,
+					);
+			}
 			const moved = await instrumentChanged(root, g.card, g.card.head);
 			if (moved.length) throw new Error(`The instrument changed since the scorecard (${moved.join(", ")}); re-baseline with climb_scorecard first.`);
 			const base = await head(root);
@@ -602,7 +631,7 @@ export default async function climb(pi: ExtensionAPI) {
 			refresh(ctx, root);
 			const ref = Object.entries(control.values).map(([k, v]) => `${k}=${v}`).join(", ");
 			return ok(`Registered ${id} on ${g.id}. Control at ${base.slice(0, 8)}: ${ref}. Implement it and commit (any number of commits), then call climb_measure. Everything after ${base.slice(0, 8)} is this experiment; if it is dropped the extension reverts it.`);
-		},
+		}),
 	});
 
 	pi.registerTool({
@@ -612,7 +641,7 @@ export default async function climb(pi: ExtensionAPI) {
 			"Close the open experiment: the extension runs the guard and every metric on the committed HEAD, compares against the pre-registered control, and decides kept or dropped (noise-aware). Dropped experiments are reverted with a revert commit. Requires a clean tree and at least one commit since registration.",
 		parameters: S.obj({ goal: S.opt(S.str("Goal id; optional")) }),
 		loadMode: "essential",
-		async execute(_id, p: GoalParam, signal, _u, ctx) {
+		execute: (_id, p: GoalParam, signal, _u, ctx) => exclusive(async () => {
 			worker(ctx);
 			const root = await needRoot(ctx);
 			holder(root, ctx);
@@ -665,7 +694,7 @@ export default async function climb(pi: ExtensionAPI) {
 				text += `\n${X.nextAction(st.goals.get(g.id)!)}`;
 			}
 			return ok(text);
-		},
+		}),
 	});
 
 	pi.registerTool({
@@ -755,6 +784,9 @@ export default async function climb(pi: ExtensionAPI) {
 			}
 			if (words.length === 1 && sub === "resume") {
 				append(root, { ts: L.now(), kind: "resume", goal: "*" });
+				// The human is the unblocker of a STUCK goal: resuming is their verdict to continue.
+				for (const g of L.active(st).filter(L.stuck))
+					append(root, { ts: L.now(), kind: "judge", goal: g.id, by: "human", verdict: "continue", diagnosis: "resumed by the user", next: "continue climbing" });
 				lease(root, ctx, true);
 				ensureTimer(ctx);
 				const now = refresh(ctx, root);

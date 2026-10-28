@@ -125,7 +125,8 @@ export function report(st: State, nowMs = clock.ms()): string {
 		const levers = [...g.levers.entries()].map(([k, l]) => `${k} ${l.kept}/${l.tried}`);
 		if (levers.length) out.push(`  levers (kept/tried): ${levers.join(", ")}`);
 		out.push(`  last progress ${ago(g.lastProgress, nowMs)} · stale ${g.lastBeat?.stale ?? 0}/${g.cfg.poke_max} · beat every ${Math.round(g.cfg.beat_s / 60)}m, last ${ago(g.lastBeat?.ts, nowMs)}`);
-		if (g.judge) out.push(`  judge (${g.judge.by}, ${ago(g.judge.ts, nowMs)}): ${g.judge.verdict} — ${g.judge.diagnosis} → ${g.judge.next}`);
+		const d = g.diagnosis;
+		if (d) out.push(`  last diagnosis (${d.by}, ${ago(d.ts, nowMs)}): ${d.verdict} — ${d.diagnosis} → ${d.next}`);
 		if (g.card.parked?.length) out.push(`  parked: ${g.card.parked.join(", ")}`);
 	}
 	return out.join("\n");
@@ -147,14 +148,14 @@ export function nextAction(g: Goal): string {
 	if (g.stallPending)
 		return `[climb ${g.id}] STALLED: no progress in ${g.lastBeat?.stale ?? "several"} heartbeats. Stop and diagnose before experimenting: is the lever wrong, the metric broken/noisy, something blocked, or are you grid-searching one idea? Call climb_judge with an honest diagnosis and the next move. State: ${cardSummary(g)}.`;
 	const tried = [...g.levers.entries()].map(([k, l]) => `${k} (${l.kept}/${l.tried} kept)`).join(", ");
-	const judged = g.judge ? ` Last judge: ${g.judge.verdict} — ${g.judge.next}.` : "";
+	const judged = g.diagnosis ? ` Last diagnosis (${g.diagnosis.by}): ${g.diagnosis.verdict} — ${g.diagnosis.next}.` : "";
 	return `[climb ${g.id}] Keep climbing. State: ${cardSummary(g)}.${tried ? ` Levers tried: ${tried}.` : ""}${judged} Pick the lever with the highest expected gain on the metric furthest from target and call climb_experiment.`;
 }
 
-/** Consecutive drops on any lever (renaming a lever does not reset it) demand a diagnosis. */
+/** Consecutive drops on any lever (renaming a lever does not reset it) demand an independent diagnosis. */
 export function streakBlocked(g: Goal): string | undefined {
 	if (g.streak < DROP_STREAK) return undefined;
-	return `${g.streak} experiments dropped in a row. Diagnose, don't grid-search: call climb_judge with why they failed and what is different about the next move.`;
+	return `${g.streak} experiments dropped in a row: that is grid search. The independent judge is reviewing; its verdict arrives as a message. Meanwhile think about what is fundamentally different about the next move.`;
 }
 
 const globRe = (glob: string) =>
@@ -191,7 +192,8 @@ export function instrumentFiles(cmd: string, tracked: Set<string>): string[] {
 			if (tok.startsWith("-") || !executed) continue;
 			const t = tok.replace(/^\.\//, "").replace(/\/+$/, "");
 			if (tracked.has(t)) out.add(t);
-			else if ([...tracked].some(f => f.startsWith(`${t}/`))) out.add(`${t}/`);
+			// Directories only when written as paths: `bun test` / `go test` are subcommands.
+			else if (tok.includes("/") && [...tracked].some(f => f.startsWith(`${t}/`))) out.add(`${t}/`);
 		}
 	}
 	return [...out];
