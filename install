@@ -6,7 +6,7 @@ set -euo pipefail
 #   --project: symlink to .claude/skills/goal/ in current directory
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SKILL_SRC="$SCRIPT_DIR/.claude/skills/goal"
+SKILL_SRC="$SCRIPT_DIR/skill"
 MODE="${1:---global}"
 
 case "$MODE" in
