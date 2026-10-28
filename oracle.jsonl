@@ -1,4 +1,17 @@
-{"ts":"2026-10-28T16:26:33Z","kind":"goal_created","goal_id":"g-perf-test","intent":"pi-goal smoke test under 0.3s","config":{"poke_max":3,"heartbeat_m":30}}
-{"ts":"2026-10-28T16:26:34Z","kind":"metrics_defined","goal_id":"g-perf-test","metrics":[{"name":"smoke_time","baseline":0.37,"target":0.3,"direction":"down","measure":"python3 -c \"import time,subprocess;s=time.time();subprocess.run(['bash','test/smoke'],capture_output=True);print(f'{time.time()-s:.3f}')\"","unit":"seconds"}],"axioms":["fast tests enable confident iteration"]}
-{"ts":"2026-10-28T16:26:34Z","kind":"heartbeat_started","goal_id":"g-perf-test","mechanism":"cron","cron_id":"simulated","guard":"2x_watchdog"}
-{"ts":"2026-10-28T16:26:34Z","kind":"heartbeat","goal_id":"g-perf-test","snapshot":{"smoke_time":0.613},"delta":{"smoke_time":0.243},"progress":false,"stale_pokes":1}
+{"ts":"2026-10-28T16:27:48Z","kind":"goal_created","goal_id":"g-e2e-test","intent":"e2e validation of pi-goal","config":{"poke_max":2,"heartbeat_m":30}}
+{"ts":"2026-10-28T16:27:48Z","kind":"metrics_defined","goal_id":"g-e2e-test","metrics":[{"name":"file_count","baseline":8,"target":10,"direction":"up","measure":"find . -name \"*.py\" -o -name \"*.md\" | wc -l | tr -d \" \"","unit":"files"},{"name":"lib_scripts","baseline":4,"target":5,"direction":"up","measure":"ls lib/*.py lib/compact lib/status lib/observe lib/poke 2>/dev/null | wc -l | tr -d \" \"","unit":"scripts"}],"axioms":["more tooling = more autonomous capability"]}
+{"ts":"2026-10-28T16:27:48Z","kind":"heartbeat_started","goal_id":"g-e2e-test","mechanism":"cron","cron_id":"e2e-sim","guard":"2x_watchdog"}
+{"ts":"2026-10-28T16:27:48Z","kind":"heartbeat","goal_id":"g-e2e-test","snapshot":{"file_count":2,"lib_scripts":5},"delta":{"file_count":-6,"lib_scripts":1},"progress":true,"stale_pokes":0}
+{"ts":"2026-10-28T16:27:48Z","kind":"experiment","goal_id":"g-e2e-test","experiment_id":"x-e2e-001","hypothesis":"adding a test file increases file_count","prediction":"file_count 8->9","keep_rule":"file_count > 8","commit":"simulated"}
+{"ts":"2026-10-28T16:27:48Z","kind":"measurement","goal_id":"g-e2e-test","experiment_id":"x-e2e-001","metrics":{"file_count":9,"lib_scripts":5},"control":{"file_count":8,"lib_scripts":4}}
+{"ts":"2026-10-28T16:27:48Z","kind":"decision","goal_id":"g-e2e-test","experiment_id":"x-e2e-001","verdict":"kept","reason":"file_count 8->9"}
+{"ts":"2026-10-28T16:27:48Z","kind":"heartbeat","goal_id":"g-e2e-test","snapshot":{"file_count":2,"lib_scripts":5},"delta":{"file_count":0,"lib_scripts":0},"progress":false,"stale_pokes":1}
+{"ts":"2026-10-28T16:27:48Z","kind":"heartbeat","goal_id":"g-e2e-test","snapshot":{"file_count":9,"lib_scripts":5},"delta":{"file_count":0,"lib_scripts":0},"progress":false,"stale_pokes":1}
+{"ts":"2026-10-28T16:27:48Z","kind":"heartbeat","goal_id":"g-e2e-test","snapshot":{"file_count":9,"lib_scripts":5},"delta":{"file_count":0,"lib_scripts":0},"progress":false,"stale_pokes":2}
+{"ts":"2026-10-28T16:27:48Z","kind":"heartbeat","goal_id":"g-e2e-test","snapshot":{"file_count":2,"lib_scripts":5},"delta":{"file_count":-7,"lib_scripts":0},"progress":false,"stale_pokes":3}
+{"ts":"2026-10-28T16:27:48Z","kind":"stall","goal_id":"g-e2e-test","stale_pokes":3,"action":"investigation_needed"}
+{"ts":"2026-10-28T16:27:48Z","kind":"investigation","goal_id":"g-e2e-test","diagnosis":"need to add more files to hit target","evidence":["file_count stuck at 9, target is 10"],"recommendation":"add lib/init script","strategy_change":false}
+{"ts":"2026-10-28T16:27:48Z","kind":"goal_done","goal_id":"g-e2e-test","result":"achieved","final_metrics":{"file_count":10,"lib_scripts":5},"summary":"e2e test passed all phases"}
+{"ts":"2026-10-28T16:27:48Z","kind":"goal_created","goal_id":"g-second","intent":"second concurrent goal","config":{"poke_max":3,"heartbeat_m":30}}
+{"ts":"2026-10-28T16:27:48Z","kind":"metrics_defined","goal_id":"g-second","metrics":[{"name":"test_val","baseline":0,"target":100,"direction":"up","measure":"echo 42","unit":"units"}]}
+{"ts":"2026-10-28T16:27:48Z","kind":"heartbeat","goal_id":"g-second","snapshot":{"test_val":42},"delta":{"test_val":42},"progress":true,"stale_pokes":0}
