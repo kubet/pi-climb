@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""observe — metric trajectory, velocity, ETA from oracle.jsonl."""
+import json, sys, os, math
+from datetime import datetime, timezone
+from collections import defaultdict
+
+SPARK = "▁▂▃▄▅▆▇█"
+
+def main():
+    oracle = sys.argv[1] if len(sys.argv) > 1 else "oracle.jsonl"
+    goal_filter = None
+    raw = "--raw" in sys.argv
+    for a in sys.argv[1:]:
+        if a.startswith("g-"):
+            goal_filter = a
+
+    with open(oracle) as f:
+        entries = [json.loads(l) for l in f]
+
+    goals = _active_goals(entries)
+    if goal_filter:
+        goals = {g: v for g, v in goals.items() if g == goal_filter}
+
+    series = _extract_series(entries, goals)
+    result = {}
+
+    for gid, metrics_def in goals.items():
+        goal_obs = {}
+        for m in metrics_def:
+            name = m["name"]
+            pts = series.get(gid, {}).get(name, [])
+            if not pts:
+                goal_obs[name] = {"points": 0, "baseline": m.get("baseline"), "target": m.get("target")}
+                continue
+
+            values = [p["v"] for p in pts]
+            times = [p["t"] for p in pts]
+            current = values[-1]
+            baseline = m.get("baseline", values[0])
+            target = m.get("target")
+            direction = m.get("direction", "down")
+
+            obs = {
+                "points": len(values),
+                "baseline": baseline,
+                "current": current,
+                "target": target,
+                "direction": direction,
+                "best": min(values) if direction == "down" else max(values),
+                "worst": max(values) if direction == "down" else min(values),
+            }
+
+            if target is not None:
+                total = abs(target - baseline)
+                done = abs(current - baseline)
+                if total > 0:
+                    obs["progress_pct"] = round(min(done / total, 1.0) * 100, 1)
+                else:
+                    obs["progress_pct"] = 100.0
+
+            if len(values) >= 2:
+                vel = _velocity(times, values)
+                obs["velocity_per_hour"] = round(vel, 4)
+
+                if len(values) >= 4:
+                    mid = len(values) // 2
+                    v1 = _velocity(times[:mid], values[:mid])
+                    v2 = _velocity(times[mid:], values[mid:])
+                    obs["acceleration"] = "increasing" if abs(v2) > abs(v1) else "decreasing" if abs(v2) < abs(v1) else "steady"
+
+                if target is not None and vel != 0:
+                    remaining = target - current
+                    if (direction == "down" and vel < 0) or (direction == "up" and vel > 0):
+                        hours = remaining / vel
+                        if hours > 0:
+                            obs["eta_hours"] = round(hours, 1)
+
+            if len(values) >= 3:
+                obs["sparkline"] = _sparkline(values[-20:])
+
+            if len(values) >= 4:
+                obs["anomalies"] = _anomalies(values, times, obs)
+
+            goal_obs[name] = obs
+        result[gid] = goal_obs
+
+    if raw:
+        print(json.dumps(result, separators=(",", ":")))
+    else:
+        _print_report(result, goals)
+
+
+def _active_goals(entries):
+    created = set()
+    done = set()
+    metrics = {}
+    for e in entries:
+        gid = e.get("goal_id", "?")
+        if e["kind"] == "goal_created":
+            created.add(gid)
+        elif e["kind"] == "goal_done":
+            done.add(gid)
+        elif e["kind"] == "metrics_defined":
+            metrics[gid] = e.get("metrics", [])
+    return {g: metrics.get(g, []) for g in created - done if g in metrics}
+
+
+def _extract_series(entries, goals):
+    metric_names = {}
+    for gid, mlist in goals.items():
+        metric_names[gid] = {m["name"] for m in mlist}
+
+    series = defaultdict(lambda: defaultdict(list))
+
+    for e in entries:
+        gid = e.get("goal_id", "?")
+        if gid not in metric_names:
+            continue
+
+        snap = None
+        if e["kind"] == "heartbeat" and e.get("snapshot"):
+            snap = e["snapshot"]
+        elif e["kind"] == "compaction" and e.get("summary", {}).get("snapshot"):
+            snap = e["summary"]["snapshot"]
+        elif e["kind"] == "measurement" and e.get("metrics"):
+            snap = e["metrics"]
+
+        if snap:
+            try:
+                t = _epoch(e["ts"])
+            except (ValueError, KeyError):
+                continue
+            for name in metric_names[gid]:
+                if name in snap:
+                    series[gid][name].append({"t": t, "v": snap[name]})
+
+    return series
+
+
+def _velocity(times, values):
+    if len(times) < 2:
+        return 0.0
+    dt = (times[-1] - times[0]) / 3600
+    if dt == 0:
+        return 0.0
+    return (values[-1] - values[0]) / dt
+
+
+def _sparkline(values):
+    if not values:
+        return ""
+    lo, hi = min(values), max(values)
+    if lo == hi:
+        return SPARK[4] * len(values)
+    return "".join(SPARK[min(int((v - lo) / (hi - lo) * 7), 7)] for v in values)
+
+
+def _anomalies(values, times, obs):
+    flags = []
+    recent = values[-4:]
+    if all(v == recent[0] for v in recent):
+        flags.append("flat: zero velocity for 4+ observations")
+    best = obs.get("best")
+    current = obs.get("current")
+    if best is not None and current is not None:
+        direction = obs.get("direction", "down")
+        if direction == "down" and current > best * 1.1:
+            flags.append(f"regression: current {current} > best {best}")
+        elif direction == "up" and current < best * 0.9:
+            flags.append(f"regression: current {current} < best {best}")
+    if obs.get("acceleration") == "decreasing":
+        flags.append("deceleration: improvement rate slowing")
+    return flags
+
+
+def _epoch(ts):
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+
+
+def _print_report(result, goals):
+    for gid, metrics_obs in result.items():
+        print(f"## {gid}")
+        for name, obs in metrics_obs.items():
+            target_str = f" (target: {obs.get('target')})" if obs.get("target") else ""
+            print(f"\n### {name}{target_str}")
+
+            if obs.get("points", 0) == 0:
+                print("  no data yet")
+                continue
+
+            prog = obs.get("progress_pct", "?")
+            print(f"  baseline: {obs['baseline']} | current: {obs['current']} | progress: {prog}%")
+
+            if obs.get("sparkline"):
+                print(f"  trend: {obs['sparkline']}")
+
+            parts = []
+            if "velocity_per_hour" in obs:
+                parts.append(f"velocity: {obs['velocity_per_hour']}/h")
+            if "acceleration" in obs:
+                parts.append(f"accel: {obs['acceleration']}")
+            if "eta_hours" in obs:
+                h = obs["eta_hours"]
+                if h < 24:
+                    parts.append(f"ETA: ~{h:.0f}h")
+                else:
+                    parts.append(f"ETA: ~{h/24:.1f}d")
+            if parts:
+                print(f"  {' | '.join(parts)}")
+
+            if obs.get("anomalies"):
+                for a in obs["anomalies"]:
+                    print(f"  ⚠ {a}")
+
+
+if __name__ == "__main__":
+    main()

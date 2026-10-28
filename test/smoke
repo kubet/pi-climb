@@ -8,7 +8,8 @@ set -euo pipefail
 DIR=$(mktemp -d)
 trap 'rm -rf "$DIR"' EXIT
 ORACLE="$DIR/oracle.jsonl"
-COMPACT="$(cd "$(dirname "$0")/.." && pwd)/lib/compact"
+LIBDIR="$(cd "$(dirname "$0")/.." && pwd)/lib"
+COMPACT="$LIBDIR/compact"
 PASS=0
 FAIL=0
 
@@ -206,6 +207,85 @@ assert len(invs) == 1, f'expected 1 investigation, got {len(invs)}'
 
 print('state reconstruction OK')
 " && ok "state reconstruction correct" || fail "state reconstruction"
+
+# --- Phase 9: lib/status ---
+echo ""
+echo "Phase 9: lib/status"
+
+STATUS_OUT=$(python3 "$LIBDIR/status" "$ORACLE" --raw 2>/dev/null)
+ACTIVE=$(echo "$STATUS_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['active_goals'])")
+[[ "$ACTIVE" == "1" ]] && ok "lib/status: 1 active goal" || fail "lib/status active count: $ACTIVE"
+
+DONE_COUNT=$(echo "$STATUS_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['done_goals'])")
+[[ "$DONE_COUNT" == "1" ]] && ok "lib/status: 1 done goal" || fail "lib/status done count: $DONE_COUNT"
+
+# --- Phase 10: lib/observe ---
+echo ""
+echo "Phase 10: lib/observe"
+
+# Build a fresh observe-test oracle with clean timestamps
+OBS_ORACLE="$DIR/obs-test.jsonl"
+python3 -c "
+import json, datetime
+base = datetime.datetime(2026, 10, 1, 12, 0, 0)
+entries = [
+    {'ts': '2026-10-01T12:00:00Z', 'kind': 'goal_created', 'goal_id': 'g-obs',
+     'intent': 'test', 'config': {'poke_max': 3}},
+    {'ts': '2026-10-01T12:01:00Z', 'kind': 'metrics_defined', 'goal_id': 'g-obs',
+     'metrics': [{'name': 'val', 'baseline': 100, 'target': 50, 'direction': 'down'}]}
+]
+for i in range(10):
+    ts = base + datetime.timedelta(minutes=30*(i+1))
+    entries.append({'ts': ts.strftime('%Y-%m-%dT%H:%M:%SZ'), 'kind': 'heartbeat',
+        'goal_id': 'g-obs', 'snapshot': {'val': 100 - i*5}, 'progress': True, 'stale_pokes': 0})
+with open('$OBS_ORACLE', 'w') as f:
+    for e in entries:
+        f.write(json.dumps(e, separators=(',',':')) + '\n')
+"
+
+OBS_OUT=$(python3 "$LIBDIR/observe" "$OBS_ORACLE" --raw 2>/dev/null)
+echo "$OBS_OUT" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+assert 'g-obs' in data, f'g-obs not in observe output: {list(data.keys())}'
+val = data['g-obs'].get('val', {})
+assert val.get('points', 0) > 0, 'no data points for val metric'
+print('observe output OK')
+" && ok "lib/observe: trajectory data present" || fail "lib/observe output"
+
+echo "$OBS_OUT" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+val = data.get('g-obs', {}).get('val', {})
+assert 'sparkline' in val, f'no sparkline: {list(val.keys())}'
+assert 'velocity_per_hour' in val, 'no velocity'
+print('sparkline + velocity OK')
+" && ok "lib/observe: sparkline + velocity" || fail "lib/observe sparkline"
+
+# --- Phase 11: lib/poke ---
+echo ""
+echo "Phase 11: lib/poke"
+
+# Add a heartbeat_started entry (missing from earlier phases)
+echo '{"ts":"2026-09-01T00:03:00Z","kind":"heartbeat_started","goal_id":"g-alpha","mechanism":"cron","cron_id":"test","guard":"2x_watchdog"}' >> "$ORACLE"
+
+POKE_OUT=$(python3 "$LIBDIR/poke" "$ORACLE" 2>/dev/null)
+echo "$POKE_OUT" | grep -q "g-alpha" && ok "lib/poke: poke ran for active goal" || fail "lib/poke: no output for g-alpha"
+
+# Verify heartbeat was appended (stall may follow it)
+HAS_HB=$(python3 -c "
+import json
+with open('$ORACLE') as f:
+    kinds = [json.loads(l)['kind'] for l in f]
+# poke appends heartbeat, then stall if stale >= poke_max
+print('yes' if 'heartbeat' in kinds[-3:] else 'no')
+")
+[[ "$HAS_HB" == "yes" ]] && ok "lib/poke: heartbeat appended" || fail "lib/poke: no heartbeat in last entries"
+
+# Test lock guard — second poke should skip
+POKE2_OUT=$(python3 "$LIBDIR/poke" "$ORACLE" 2>&1)
+# Lock was removed, so it should run again (not skip)
+echo "$POKE2_OUT" | grep -q "g-alpha" && ok "lib/poke: second poke runs (lock cleared)" || fail "lib/poke: second poke blocked"
 
 # --- Summary ---
 echo ""

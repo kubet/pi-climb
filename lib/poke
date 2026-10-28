@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""poke — one heartbeat tick. Measure, classify, log, guard."""
+import json, sys, os, subprocess, time
+from datetime import datetime, timezone
+
+def main():
+    oracle = sys.argv[1] if len(sys.argv) > 1 else "oracle.jsonl"
+
+    lock = oracle + ".poke.lock"
+    if not _acquire_lock(lock, oracle):
+        return
+
+    try:
+        _poke(oracle)
+    finally:
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+
+
+def _acquire_lock(lock, oracle):
+    if os.path.exists(lock):
+        try:
+            age = time.time() - os.path.getmtime(lock)
+        except OSError:
+            age = 0
+        hb_m = _get_heartbeat_m(oracle)
+        max_age = hb_m * 120
+        if age < max_age:
+            print(f"poke already running ({int(age)}s old), skipping", file=sys.stderr)
+            return False
+        print(f"stale lock ({int(age)}s > {max_age}s), forcing poke", file=sys.stderr)
+    with open(lock, "w") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def _get_heartbeat_m(oracle):
+    try:
+        with open(oracle) as f:
+            for line in f:
+                e = json.loads(line)
+                if e["kind"] == "goal_created":
+                    return e.get("config", {}).get("heartbeat_m", 30)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return 30
+
+
+def _poke(oracle):
+    status_out = subprocess.run(
+        ["python3", os.path.join(os.path.dirname(__file__), "status"), oracle, "--raw"],
+        capture_output=True, text=True
+    )
+    if status_out.returncode != 0:
+        print(f"status failed: {status_out.stderr}", file=sys.stderr)
+        return
+
+    state = json.loads(status_out.stdout)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    appends = []
+
+    for goal in state["goals"]:
+        if goal["status"] != "active":
+            continue
+
+        gid = goal["goal_id"]
+        prev_snapshot = goal.get("snapshot", {})
+        if not prev_snapshot:
+            prev_snapshot = {m["name"]: m["baseline"] for m in metrics if "baseline" in m}
+        prev_stale = goal.get("stale_pokes", 0)
+        poke_max = goal.get("poke_max", 3)
+        metrics = goal.get("metrics", [])
+
+        snapshot = {}
+        for m in metrics:
+            cmd = m.get("measure")
+            if not cmd:
+                continue
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+                val = r.stdout.strip().split("\n")[-1]
+                snapshot[m["name"]] = _parse_num(val)
+            except (subprocess.TimeoutExpired, ValueError):
+                pass
+
+        delta = {}
+        progress = False
+        for m in metrics:
+            name = m["name"]
+            if name in snapshot and name in prev_snapshot:
+                d = snapshot[name] - prev_snapshot[name]
+                delta[name] = round(d, 4)
+                direction = m.get("direction", "down")
+                baseline = m.get("baseline", prev_snapshot[name])
+                threshold = abs(baseline) * 0.05 if baseline else 0.05
+                if (direction == "down" and d < -threshold) or \
+                   (direction == "up" and d > threshold):
+                    progress = True
+
+        stale = 0 if progress else prev_stale + 1
+
+        hb = {
+            "ts": now, "kind": "heartbeat", "goal_id": gid,
+            "snapshot": snapshot, "delta": delta,
+            "progress": progress, "stale_pokes": stale
+        }
+        appends.append(hb)
+
+        if progress:
+            print(f"[{gid}] progress | " + " ".join(
+                f"{k}:{v}" for k, v in snapshot.items()) + f" | stale: 0/{poke_max}")
+        else:
+            print(f"[{gid}] no change (stale {stale}/{poke_max})")
+
+        if stale >= poke_max:
+            stall = {
+                "ts": now, "kind": "stall", "goal_id": gid,
+                "stale_pokes": stale, "action": "investigation_needed"
+            }
+            appends.append(stall)
+            print(f"[{gid}] STALL: {stale} pokes, investigation needed")
+
+    # Compaction check
+    try:
+        lines = sum(1 for _ in open(oracle))
+        size = os.path.getsize(oracle)
+        if lines > 500 or size > 1_000_000:
+            compact = os.path.join(os.path.dirname(__file__), "compact")
+            subprocess.run(["python3", compact, oracle], capture_output=True)
+            print(f"compacted ({lines} lines, {size} bytes)")
+    except (FileNotFoundError, OSError):
+        pass
+
+    with open(oracle, "a") as f:
+        for e in appends:
+            f.write(json.dumps(e, separators=(",", ":")) + "\n")
+
+
+def _parse_num(s):
+    s = s.strip()
+    try:
+        return int(s)
+    except ValueError:
+        return float(s)
+
+
+if __name__ == "__main__":
+    main()

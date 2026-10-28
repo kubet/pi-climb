@@ -5,6 +5,14 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 PROTECTED = frozenset(("goal_created", "goal_done", "stall", "investigation"))
+_ts_cache = {}
+
+def _epoch(ts):
+    v = _ts_cache.get(ts)
+    if v is None:
+        v = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        _ts_cache[ts] = v
+    return v
 
 def main():
     oracle = sys.argv[1] if len(sys.argv) > 1 else "oracle.jsonl"
@@ -17,19 +25,28 @@ def main():
         return
 
     for pass_num in range(1, max_passes + 1):
-        with open(oracle) as f:
-            lines = f.readlines()
+        _ts_cache.clear()
 
-        n = len(lines)
+        with open(oracle) as f:
+            raw_lines = f.readlines()
+
+        n = len(raw_lines)
         if n < 100:
             if pass_num == 1:
                 print(f"only {n} lines, skipping")
             return
 
         if pass_num == 1:
-            print(f"oracle: {n} lines, {sum(len(l) for l in lines)} bytes")
+            print(f"oracle: {n} lines, {sum(len(l) for l in raw_lines)} bytes")
 
-        entries = [json.loads(l) for l in lines]
+        # Parse entries, keeping raw lines for unchanged entries
+        entries = []
+        line_map = {}  # id(entry) -> raw line
+        for raw in raw_lines:
+            e = json.loads(raw)
+            entries.append(e)
+            line_map[id(e)] = raw if raw.endswith("\n") else raw + "\n"
+
         result = _compact_once(entries)
 
         if len(result) == n:
@@ -40,8 +57,12 @@ def main():
         tmp = oracle + ".tmp"
         with open(tmp, "w") as f:
             for e in result:
-                f.write(json.dumps(e, separators=(",", ":")))
-                f.write("\n")
+                cached = line_map.get(id(e))
+                if cached is not None:
+                    f.write(cached)
+                else:
+                    f.write(json.dumps(e, separators=(",", ":")))
+                    f.write("\n")
 
         if dry_run:
             print(f"dry run: {n} -> {len(result)} lines")
@@ -50,6 +71,7 @@ def main():
         else:
             os.rename(tmp, oracle)
             print(f"compacted: {n} -> {len(result)} lines")
+
 
 def _compact_once(entries):
     now = time.time()
@@ -87,14 +109,12 @@ def _compact_once(entries):
     result.sort(key=lambda e: e["ts"])
     return result
 
+
 def _print_stats(oracle):
-    """Print oracle statistics without modifying the file."""
     with open(oracle) as f:
         entries = [json.loads(l) for l in f]
 
     n = len(entries)
-    now = time.time()
-
     by_kind = defaultdict(int)
     by_goal = defaultdict(lambda: {"entries": 0, "kinds": defaultdict(int)})
     by_depth = defaultdict(int)
@@ -134,8 +154,6 @@ def _print_stats(oracle):
         status = "done" if gid in done else "active" if gid in created else "?"
         print(f"  {gid} [{status}]: {g['entries']} entries")
 
-def _epoch(ts):
-    return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
 
 def _compact_groups(entries, key_fn, cd):
     groups = defaultdict(list)
@@ -165,8 +183,8 @@ def _compact_groups(entries, key_fn, cd):
         })
     return out
 
+
 def _roll_up_groups(entries, key_fn, cd):
-    """Roll up higher-depth compaction entries into the next level."""
     groups = defaultdict(list)
     for e in entries:
         groups[key_fn(e)].append(e)
