@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""poke — one heartbeat tick. Measure, classify, log, guard."""
+"""poke — one heartbeat tick. Measure, classify, log, report trajectory."""
 import json, sys, os, subprocess, time
-from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(__file__))
+import oracle as orc
+
+SPARK = "▁▂▃▄▅▆▇█"
 
 def main():
-    oracle = sys.argv[1] if len(sys.argv) > 1 else "oracle.jsonl"
+    path = sys.argv[1] if len(sys.argv) > 1 else "oracle.jsonl"
 
-    lock = oracle + ".poke.lock"
-    if not _acquire_lock(lock, oracle):
+    lock = path + ".poke.lock"
+    if not _acquire_lock(lock, path):
         return
 
     try:
-        _poke(oracle)
+        _poke(path)
     finally:
         try:
             os.remove(lock)
@@ -19,13 +23,21 @@ def main():
             pass
 
 
-def _acquire_lock(lock, oracle):
+def _acquire_lock(lock, path):
     if os.path.exists(lock):
         try:
             age = time.time() - os.path.getmtime(lock)
         except OSError:
             age = 0
-        hb_m = _get_heartbeat_m(oracle)
+        hb_m = 30
+        try:
+            st = orc.state(path)
+            for g in st["goals"]:
+                if g["status"] == "active":
+                    hb_m = g["config"].get("heartbeat_m", 30)
+                    break
+        except Exception:
+            pass
         max_age = hb_m * 120
         if age < max_age:
             print(f"poke already running ({int(age)}s old), skipping", file=sys.stderr)
@@ -36,43 +48,31 @@ def _acquire_lock(lock, oracle):
     return True
 
 
-def _get_heartbeat_m(oracle):
-    try:
-        with open(oracle) as f:
-            for line in f:
-                e = json.loads(line)
-                if e["kind"] == "goal_created":
-                    return e.get("config", {}).get("heartbeat_m", 30)
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    return 30
-
-
-def _poke(oracle):
-    status_out = subprocess.run(
-        ["python3", os.path.join(os.path.dirname(__file__), "status"), oracle, "--raw"],
-        capture_output=True, text=True
-    )
-    if status_out.returncode != 0:
-        print(f"status failed: {status_out.stderr}", file=sys.stderr)
-        return
-
-    state = json.loads(status_out.stdout)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _poke(path):
+    st = orc.state(path)
+    now = orc.now_ts()
     appends = []
 
-    for goal in state["goals"]:
+    goals_metrics = {}
+    for goal in st["goals"]:
+        if goal["status"] == "active":
+            goals_metrics[goal["goal_id"]] = goal["metrics"]
+
+    series = orc.metric_series(st["entries"], goals_metrics)
+
+    for goal in st["goals"]:
         if goal["status"] != "active":
             continue
 
         gid = goal["goal_id"]
         prev_snapshot = goal.get("snapshot", {})
         if not prev_snapshot:
-            prev_snapshot = {m["name"]: m["baseline"] for m in metrics if "baseline" in m}
+            prev_snapshot = {m["name"]: m["baseline"] for m in goal["metrics"] if "baseline" in m}
         prev_stale = goal.get("stale_pokes", 0)
         poke_max = goal.get("poke_max", 3)
         metrics = goal.get("metrics", [])
 
+        # Measure
         snapshot = {}
         for m in metrics:
             cmd = m.get("measure")
@@ -82,9 +82,10 @@ def _poke(oracle):
                 r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
                 val = r.stdout.strip().split("\n")[-1]
                 snapshot[m["name"]] = _parse_num(val)
-            except (subprocess.TimeoutExpired, ValueError):
+            except (subprocess.TimeoutExpired, ValueError, IndexError):
                 pass
 
+        # Classify
         delta = {}
         progress = False
         for m in metrics:
@@ -108,12 +109,39 @@ def _poke(oracle):
         }
         appends.append(hb)
 
-        if progress:
-            print(f"[{gid}] progress | " + " ".join(
-                f"{k}:{v}" for k, v in snapshot.items()) + f" | stale: 0/{poke_max}")
-        else:
-            print(f"[{gid}] no change (stale {stale}/{poke_max})")
+        # Report with trajectory
+        parts = []
+        for m in metrics:
+            name = m["name"]
+            if name not in snapshot:
+                continue
+            val = snapshot[name]
+            target = m.get("target")
+            pts = series.get(gid, {}).get(name, [])
+            values = [p["v"] for p in pts] + [val]
 
+            chunk = f"{name}:{val}"
+            if target is not None:
+                baseline = m.get("baseline", values[0])
+                direction = m.get("direction", "down")
+                pct = orc.progress_pct(val, baseline, target, direction)
+                chunk += f" ({pct:.0f}%)"
+
+            if len(values) >= 3:
+                chunk += " " + _sparkline(values[-10:])
+
+            if len(values) >= 2:
+                times = [p["t"] for p in pts] + [time.time()]
+                vel = orc.velocity(times, values)
+                if vel != 0:
+                    chunk += f" v:{vel:+.2f}/h"
+
+            parts.append(chunk)
+
+        status = "progress" if progress else f"stale {stale}/{poke_max}"
+        print(f"[{gid}] {status} | " + " | ".join(parts))
+
+        # Stall detection
         if stale >= poke_max:
             stall = {
                 "ts": now, "kind": "stall", "goal_id": gid,
@@ -124,18 +152,25 @@ def _poke(oracle):
 
     # Compaction check
     try:
-        lines = sum(1 for _ in open(oracle))
-        size = os.path.getsize(oracle)
-        if lines > 500 or size > 1_000_000:
+        n = st["total_entries"] + len(appends)
+        size = os.path.getsize(path)
+        if n > 500 or size > 1_000_000:
             compact = os.path.join(os.path.dirname(__file__), "compact")
-            subprocess.run(["python3", compact, oracle], capture_output=True)
-            print(f"compacted ({lines} lines, {size} bytes)")
+            subprocess.run(["python3", compact, path], capture_output=True)
+            print(f"compacted ({n} entries, {size} bytes)")
     except (FileNotFoundError, OSError):
         pass
 
-    with open(oracle, "a") as f:
-        for e in appends:
-            f.write(json.dumps(e, separators=(",", ":")) + "\n")
+    orc.append(path, *appends)
+
+
+def _sparkline(values):
+    if not values:
+        return ""
+    lo, hi = min(values), max(values)
+    if lo == hi:
+        return SPARK[4] * min(len(values), 10)
+    return "".join(SPARK[min(int((v - lo) / (hi - lo) * 7), 7)] for v in values[-10:])
 
 
 def _parse_num(s):

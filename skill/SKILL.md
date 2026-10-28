@@ -157,7 +157,9 @@ The heartbeat tick. Called automatically by CronCreate every 30m. Also works man
 {"ts":"<utc>","kind":"heartbeat","goal_id":"<id>","snapshot":{...},"delta":{...},"progress":true|false,"stale_pokes":N}
 ```
 
-**5. Judge check (poke_max).** If `stale_pokes >= poke_max`:
+**5. Keep working.** If no active experiments: pick the next highest-impact lever and pre-register a new experiment. Don't wait for a stall to start working — idle pokes are wasted pokes. If all known levers are exhausted, spawn a research subagent to find new ones (cheaper than a full investigation).
+
+**6. Judge check (poke_max).** If `stale_pokes >= poke_max`:
 
 This is where the expensive LLM judge intervenes. The heartbeat does NOT stop.
 
@@ -167,9 +169,9 @@ This is where the expensive LLM judge intervenes. The heartbeat does NOT stop.
 
 Spawn investigation subagent (fire-and-forget — see below). Reset stale_pokes to 0. The heartbeat continues on the next cron tick.
 
-**6. Compaction.** If oracle.jsonl > 500 lines or > 1MB, run `lib/compact oracle.jsonl` (or inline).
+**7. Compaction.** If oracle.jsonl > 500 lines or > 1MB, run `lib/compact oracle.jsonl` (or inline).
 
-**7. Report.** One line per goal:
+**8. Report.** One line per goal:
 ```
 [g-slug] poke 7 | metric: 315 (target 225) ↓135 | stale: 0/3
 ```
@@ -179,7 +181,7 @@ No progress:
 [g-slug] no change (stale 2/3)
 ```
 
-**8. If called via `/loop` dynamic mode:** also call ScheduleWakeup to self-pace:
+**9. If called via `/loop` dynamic mode:** also call ScheduleWakeup to self-pace:
 ```
 ScheduleWakeup(delaySeconds: <next>, prompt: "/goal poke", noop: <no_change>, reason: "<what>")
 ```
@@ -220,10 +222,14 @@ When stale_pokes hits poke_max, spawn this subagent (fire-and-forget):
 
 The heartbeat picks up the investigation's findings on the next tick.
 
-If consecutive investigations produce no actionable result, escalate to user:
+**When out of levers:** If all known levers have been tried and no active experiments remain, the investigation MUST research new approaches — web search, read deeper into the codebase, examine similar projects. The judge doesn't just diagnose; it finds new work. Log what it finds as new levers in the investigation entry.
+
+**Consecutive failures:** If 2 investigations in a row produce no actionable result, escalate to user:
 ```
 [g-slug] STUCK: 2 investigations, no path. Need human input.
 ```
+
+The loop still doesn't stop. It checks back every heartbeat in case the user pushed a change or the environment shifted.
 
 ---
 
@@ -341,10 +347,23 @@ Max 2 active experiments. When one finishes, pick the next lever.
 6. **No secrets in oracle.jsonl.**
 7. **Budget** — if config has max_hours/max_experiments, stop at limit → goal_done(budget_spent).
 
+## lib/ tools
+
+Use these instead of reimplementing. They share `lib/oracle.py` for state reading.
+
+| Script | Purpose | Key flags |
+|---|---|---|
+| `lib/status <oracle>` | State reconstruction → JSON | `--raw` for compact JSON |
+| `lib/observe <oracle> [goal_id]` | Trajectory, velocity, ETA, anomalies | `--raw` for JSON |
+| `lib/poke <oracle>` | One heartbeat tick with lockfile guard | measures, classifies, logs |
+| `lib/compact <oracle>` | N-level compaction (multi-pass) | `--stats`, `--dry-run` |
+
+Python import: `sys.path.insert(0, "lib"); import oracle as orc` → `orc.state()`, `orc.append()`, `orc.metric_series()`, `orc.velocity()`, `orc.now_ts()`.
+
 ## Self-test
 
-After any SKILL.md or lib/compact change:
+After any change to skill/ or lib/:
 ```bash
 test/smoke
 ```
-14 checks. All must pass before touching a live goal.
+21 checks. All must pass before touching a live goal.
