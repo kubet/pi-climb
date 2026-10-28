@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# compact — n-level oracle.jsonl compaction
+# D0 (raw) older than 24h -> D1 (hourly summaries)
+# D1 older than 7d -> D2 (daily summaries)
+# Protected entries never compact. Last 50 raw always kept.
+# Usage: compact [oracle.jsonl] [--dry-run]
+
+ORACLE="${1:-oracle.jsonl}"
+DRY_RUN=false
+[[ "${2:-}" == "--dry-run" ]] && DRY_RUN=true
+
+[[ -f "$ORACLE" ]] || { echo "not found: $ORACLE" >&2; exit 1; }
+command -v jq &>/dev/null || { echo "jq required" >&2; exit 1; }
+
+BEFORE=$(wc -l < "$ORACLE" | tr -d ' ')
+SIZE=$(stat -f%z "$ORACLE" 2>/dev/null || stat -c%s "$ORACLE" 2>/dev/null)
+
+if [[ "$BEFORE" -lt 100 ]]; then
+  echo "only $BEFORE lines, skipping"
+  exit 0
+fi
+
+echo "oracle: $BEFORE lines, $SIZE bytes"
+
+NOW=$(date -u +%s)
+
+jq -sc --argjson now "$NOW" '
+  def epoch: fromdateiso8601;
+  def prot: .kind == "goal_created" or .kind == "goal_done"
+    or .kind == "stall" or .kind == "investigation";
+
+  length as $n |
+  [.[-([50,$n]|min):][]] as $tail |
+  [.[:-([50,$n]|min)][]] as $head |
+
+  # Partition head
+  [$head[] | select(prot)] as $keep |
+  [$head[] | select(prot|not) | select((.cd//0)==0)
+    | select(($now - (.ts|epoch)) > 86400)] as $d0_old |
+  [$head[] | select(prot|not) | select((.cd//0)==0)
+    | select(($now - (.ts|epoch)) <= 86400)] as $d0_fresh |
+  [$head[] | select(prot|not) | select((.cd//0)==1)
+    | select(($now - (.ts|epoch)) > 604800)] as $d1_old |
+  [$head[] | select(prot|not) | select((.cd//0)==1)
+    | select(($now - (.ts|epoch)) <= 604800)] as $d1_fresh |
+  [$head[] | select(prot|not) | select((.cd//0)>=2)] as $higher |
+
+  # D0 -> D1: group by goal_id + hour
+  [$d0_old | group_by(.goal_id+"|"+.ts[0:13])[] | {
+    ts: .[0].ts,
+    kind: "compaction",
+    goal_id: .[0].goal_id,
+    cd: 1,
+    n: length,
+    window: [.[0].ts, .[-1].ts],
+    summary: {
+      heartbeats: [.[] | select(.kind=="heartbeat")] | length,
+      progress: [.[] | select(.kind=="heartbeat" and .progress==true)] | length,
+      experiments: [.[] | select(.kind=="experiment")] | length,
+      kept: [.[] | select(.kind=="decision" and .verdict=="kept")] | length,
+      dropped: [.[] | select(.kind=="decision" and .verdict=="dropped")] | length,
+      snapshot: ([.[] | select(.kind=="heartbeat" and .snapshot!=null)] | last // {}).snapshot
+    }
+  }] as $d1_new |
+
+  # D1 -> D2: group by goal_id + day
+  [$d1_old | group_by(.goal_id+"|"+.ts[0:10])[] | {
+    ts: .[0].ts,
+    kind: "compaction",
+    goal_id: .[0].goal_id,
+    cd: 2,
+    n: ([.[] | .n // 1] | add),
+    window: [.[0].ts, .[-1].ts],
+    summary: {
+      heartbeats: ([.[] | .summary.heartbeats // 0] | add),
+      progress: ([.[] | .summary.progress // 0] | add),
+      experiments: ([.[] | .summary.experiments // 0] | add),
+      kept: ([.[] | .summary.kept // 0] | add),
+      dropped: ([.[] | .summary.dropped // 0] | add),
+      snapshot: ([.[] | select(.summary.snapshot != null)] | last // {}).summary.snapshot
+    }
+  }] as $d2_new |
+
+  # Recombine, sort by timestamp
+  ($keep + $higher + $d2_new + $d1_fresh + $d1_new + $d0_fresh + $tail)
+  | sort_by(.ts) | .[]
+' "$ORACLE" > "${ORACLE}.tmp"
+
+AFTER=$(wc -l < "${ORACLE}.tmp" | tr -d ' ')
+
+if $DRY_RUN; then
+  echo "dry run: $BEFORE -> $AFTER lines"
+  rm "${ORACLE}.tmp"
+else
+  mv "${ORACLE}.tmp" "$ORACLE"
+  echo "compacted: $BEFORE -> $AFTER lines"
+fi
