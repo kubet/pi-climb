@@ -1,12 +1,12 @@
 ---
-name: goal
-description: "Autonomous hill-climbing optimizer. /goal <intent> → research → scorecard → auto-start heartbeat → climb forever. Oracle JSONL ledger. Never stops unless told to."
+name: climb
+description: "Autonomous hill-climbing optimizer. /climb <intent> → research → scorecard → auto-start heartbeat → climb forever. Oracle JSONL ledger. Never stops unless told to."
 ---
 
-# /goal — autonomous hill-climber
+# /climb — autonomous hill-climber
 
 ```
-/goal <intent>
+/climb <intent>
     ↓
 research (subagents) → scorecard (3 metrics max active)
     ↓
@@ -33,7 +33,7 @@ The oracle is the brain. You are a stateless worker that advances it.
 
 ## Rules
 
-1. **The loop NEVER stops** unless: user says `/goal done`, user kills the session, or budget exhausted. Nothing else stops it.
+1. **The loop NEVER stops** unless: user says `/climb done`, user kills the session, or budget exhausted. Nothing else stops it.
 2. **poke_max = judge threshold.** When stale_pokes hits poke_max, spawn an investigation subagent (expensive LLM). The heartbeat continues. The investigation is fire-and-forget.
 3. **Focus.** Max 3 active metrics per goal. Max 2 active experiments at a time. Work on the highest-pressure levers, not everything at once. Park the rest.
 4. **Oracle is the brain.** Agent is stateless. Everything in oracle.jsonl.
@@ -44,18 +44,18 @@ The oracle is the brain. You are a stateless worker that advances it.
 
 | Input | Action |
 |---|---|
-| `/goal <intent>` | Create goal, research, scorecard, AUTO-START heartbeat |
-| `/goal status` | All active goals with metrics |
-| `/goal poke` | One heartbeat tick (auto-called by cron, or manual) |
-| `/goal observe [goal_id]` | Metric trajectory, velocity, ETA |
-| `/goal compact` | Force oracle compaction |
-| `/goal done <goal_id>` | Mark complete, stop heartbeat |
-| `/goal stop` | Pause all heartbeats (CronDelete). Goals stay active. |
-| `/goal resume` | Restart heartbeats for active goals |
+| `/climb <intent>` | Create goal, research, scorecard, AUTO-START heartbeat |
+| `/climb status` | All active goals with metrics |
+| `/climb poke` | One heartbeat tick (auto-called by cron, or manual) |
+| `/climb observe [goal_id]` | Metric trajectory, velocity, ETA |
+| `/climb compact` | Force oracle compaction |
+| `/climb done <goal_id>` | Mark complete, stop heartbeat |
+| `/climb stop` | Pause all heartbeats (CronDelete). Goals stay active. |
+| `/climb resume` | Restart heartbeats for active goals |
 
 ---
 
-## `/goal <intent>`
+## `/climb <intent>`
 
 ### 1. Create
 
@@ -93,7 +93,7 @@ Show scorecard. One question: approve?
 **Do not ask the user to start a loop.** After approval, immediately:
 
 ```
-CronCreate(cron: "*/<heartbeat_m> * * * *", prompt: "/goal poke")
+CronCreate(cron: "*/<heartbeat_m> * * * *", prompt: "/climb poke")
 ```
 
 Default `heartbeat_m` is 30. The cron auto-expires after 7 days — re-create before expiry.
@@ -133,7 +133,7 @@ Max depth 4. Each sub-goal gets its own scorecard. Parent rolls up.
 
 ---
 
-## `/goal poke`
+## `/climb poke`
 
 The heartbeat tick. Called automatically by CronCreate every 30m. Also works manually.
 
@@ -183,7 +183,7 @@ No progress:
 
 **9. If called via `/loop` dynamic mode:** also call ScheduleWakeup to self-pace:
 ```
-ScheduleWakeup(delaySeconds: <next>, prompt: "/goal poke", noop: <no_change>, reason: "<what>")
+ScheduleWakeup(delaySeconds: <next>, prompt: "/climb poke", noop: <no_change>, reason: "<what>")
 ```
 
 Pick delay from context: 300s if actively experimenting, 1800s if waiting, 600s if investigation pending.
@@ -233,7 +233,7 @@ The loop still doesn't stop. It checks back every heartbeat in case the user pus
 
 ---
 
-## `/goal status`
+## `/climb status`
 
 Per active goal:
 ```
@@ -252,7 +252,7 @@ Last decision: x003 "index hot queries" — kept (+15%)
 
 ---
 
-## `/goal observe [goal_id]`
+## `/climb observe [goal_id]`
 
 Extract time series from oracle.jsonl heartbeats + compaction summaries.
 
@@ -275,7 +275,7 @@ Anomalies: flag if velocity=0 for >3 obs, regression from best, ETA > budget, ac
 
 ---
 
-## `/goal done <goal_id>`
+## `/climb done <goal_id>`
 
 ```jsonl
 {"ts":"<utc>","kind":"goal_done","goal_id":"<id>","result":"achieved|budget_spent|abandoned","final_metrics":{...},"summary":"..."}
@@ -285,11 +285,11 @@ Delete the cron job for this goal. Show final scorecard vs baseline.
 
 If no active goals remain, delete all heartbeat crons.
 
-## `/goal stop`
+## `/climb stop`
 
-Pause heartbeats. Delete all cron jobs. Goals stay active in oracle — `/goal resume` restarts them.
+Pause heartbeats. Delete all cron jobs. Goals stay active in oracle — `/climb resume` restarts them.
 
-## `/goal resume`
+## `/climb resume`
 
 Re-read oracle for active goals. Re-create cron jobs. Resume climbing.
 

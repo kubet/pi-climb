@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Install /goal skill globally for Claude Code.
+# Install /climb skill globally for Claude Code.
 # Usage: ./install [--global|--project]
-#   --global:  symlink to ~/.claude/skills/goal/ (default)
-#   --project: symlink to .claude/skills/goal/ in current directory
+#   --global:  symlink to ~/.claude/skills/climb/ (default)
+#   --project: symlink to .claude/skills/climb/ in current directory
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_SRC="$SCRIPT_DIR/skill"
@@ -11,11 +11,11 @@ MODE="${1:---global}"
 
 case "$MODE" in
   --global)
-    TARGET="$HOME/.claude/skills/goal"
+    TARGET="$HOME/.claude/skills/climb"
     mkdir -p "$HOME/.claude/skills"
     ;;
   --project)
-    TARGET="$(pwd)/.claude/skills/goal"
+    TARGET="$(pwd)/.claude/skills/climb"
     mkdir -p "$(pwd)/.claude/skills"
     ;;
   *)
@@ -43,8 +43,8 @@ ln -s "$SKILL_SRC" "$TARGET"
 echo "installed: $TARGET -> $SKILL_SRC"
 
 # Also make lib/compact available on PATH if not already
-if ! command -v goal-compact &>/dev/null; then
+if ! command -v climb-compact &>/dev/null; then
   echo ""
   echo "optional: add lib/compact to your PATH:"
-  echo "  ln -s $SCRIPT_DIR/lib/compact ~/.local/bin/goal-compact"
+  echo "  ln -s $SCRIPT_DIR/lib/compact ~/.local/bin/climb-compact"
 fi
