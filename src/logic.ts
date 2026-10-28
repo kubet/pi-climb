@@ -33,12 +33,16 @@ export function median(xs: number[]): number {
 	return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
+export function regressions(metrics: Metric[], ref: Values, values: Values): Metric[] {
+	return metrics.filter(m => ref[m.name] !== undefined && values[m.name] !== undefined && gain(m, ref[m.name], values[m.name]) < -m.noise);
+}
+
 export function verdict(metrics: Metric[], ref: Values, values: Values): { kept: boolean; reason: string } {
 	const fmt = (m: Metric) => {
 		const g = gain(m, ref[m.name], values[m.name]);
 		return `${m.name} ${ref[m.name]}→${values[m.name]} (${g >= 0 ? "+" : ""}${(g * 100).toFixed(1)}%)`;
 	};
-	const regressed = metrics.filter(m => gain(m, ref[m.name], values[m.name]) < -m.noise);
+	const regressed = regressions(metrics, ref, values);
 	if (regressed.length) return { kept: false, reason: `regressed: ${regressed.map(fmt).join(", ")}` };
 	const improved = metrics.filter(m => gain(m, ref[m.name], values[m.name]) > m.noise);
 	if (!improved.length) return { kept: false, reason: `no metric beat noise: ${metrics.map(fmt).join(", ")}` };
@@ -155,7 +159,7 @@ export function nextAction(g: Goal): string {
 /** Consecutive drops on any lever (renaming a lever does not reset it) demand an independent diagnosis. */
 export function streakBlocked(g: Goal): string | undefined {
 	if (g.streak < DROP_STREAK) return undefined;
-	return `${g.streak} experiments dropped in a row: that is grid search. The independent judge is reviewing; its verdict arrives as a message. Meanwhile think about what is fundamentally different about the next move.`;
+	return `${g.streak} experiments dropped in a row: that is grid search.`;
 }
 
 const globRe = (glob: string) =>

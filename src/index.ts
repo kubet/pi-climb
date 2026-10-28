@@ -32,6 +32,8 @@ export default async function climb(pi: ExtensionAPI) {
 	let stopIdle = 0;
 	let stopLines = -1;
 	let rests = 0;
+	let judgeBroken = false;
+	const hasJudge = (ctx: Ctx) => typeof ctx.runEphemeralTurn === "function" && !judgeBroken;
 	let restProgress = -2;
 
 	// --- shell -----------------------------------------------------------------
@@ -356,7 +358,9 @@ export default async function climb(pi: ExtensionAPI) {
 		try {
 			const g = load(root).goals.get(id);
 			if (!g || g.done) return;
-			if (typeof ctx.runEphemeralTurn !== "function") return deliver(ctx, X.nextAction(g), true);
+			// Always retry the judge itself; judgeBroken only decides who may clear the gate meanwhile.
+			const turn = ctx.runEphemeralTurn?.bind(ctx);
+			if (!turn) return deliver(ctx, `${X.nextAction(g)} No independent judge on this host: call climb_judge with an honest diagnosis.`, true);
 			const ledgerTail = L.read(root)
 				.filter(e => e.goal === id && e.kind !== "beat" && e.kind !== "rollup")
 				.slice(-15);
@@ -367,13 +371,17 @@ export default async function climb(pi: ExtensionAPI) {
 			let lastErr: unknown;
 			for (const opts of [{ tools: false as const, maxTokens: 1500 }, { tools: false as const }, {}]) {
 				try {
-					reply = (await ctx.runEphemeralTurn({ promptText, ...opts })).replyText;
+					reply = (await turn({ promptText, ...opts })).replyText;
 					break;
 				} catch (e) {
 					lastErr = e;
 				}
 			}
-			if (reply === undefined) throw lastErr;
+			if (reply === undefined) {
+				judgeBroken = true;
+				throw lastErr;
+			}
+			judgeBroken = false;
 			const j = X.parseJudge(reply);
 			append(root, { ts: L.now(), kind: "judge", goal: id, by: "judge", ...j });
 			const msg = `[climb JUDGE ${id}] ${j.verdict.toUpperCase()}: ${j.diagnosis}\nNEXT: ${j.next}`;
@@ -383,7 +391,8 @@ export default async function climb(pi: ExtensionAPI) {
 		} catch (e) {
 			pi.logger?.warn?.("climb judge failed", { error: String(e) });
 			const g = load(root).goals.get(id);
-			if (g && !g.done) deliver(ctx, X.nextAction(g), true);
+			// Never leave the worker gated on a judge that cannot answer.
+			if (g && !g.done) deliver(ctx, `${X.nextAction(g)} The independent judge failed (${String(e).slice(0, 160)}): call climb_judge with an honest diagnosis.`, true);
 		} finally {
 			judging.delete(id);
 		}
@@ -426,8 +435,13 @@ export default async function climb(pi: ExtensionAPI) {
 			const progress = Math.max(...goals.map(g => g.progressSeq));
 			rests = progress === restProgress ? rests + 1 : 1;
 			restProgress = progress;
-			if (rests >= 3) ctx.ui?.notify?.(`climb: the worker keeps stopping without progress (${rests} rests). It needs your direction.`, "warning");
-			else ctx.ui?.notify?.("climb: worker stopped twice without touching the ledger; resting until the next heartbeat.", "info");
+			if (rests >= 3) {
+				ctx.ui?.notify?.(`climb: the worker keeps stopping without progress (${rests} rests). It needs your direction.`, "warning");
+				return;
+			}
+			// A worker that stops without working needs direction, not a 30-minute nap.
+			ctx.ui?.notify?.("climb: worker stopped twice without touching the ledger; asking the judge for direction.", "info");
+			for (const g of goals) void judge(ctx, root, g.id);
 			return;
 		}
 		return { decision: "block" as const, reason: goals.map(X.nextAction).join("\n") };
@@ -605,32 +619,44 @@ export default async function climb(pi: ExtensionAPI) {
 				throw new Error(judging.has(g.id) ? "The judge is reviewing this stall; its verdict arrives as a message shortly." : X.nextAction(g));
 			const blocked = X.streakBlocked(g);
 			if (blocked) {
+				if (!hasJudge(ctx)) throw new Error(`${blocked} No independent judge on this host: call climb_judge with an honest diagnosis of why they failed and what is fundamentally different next.`);
 				void judge(ctx, root, g.id);
-				throw new Error(blocked);
+				throw new Error(`${blocked} The independent judge is reviewing; its verdict arrives as a message. Meanwhile work out what is fundamentally different about the next move.`);
 			}
 			const d = await dirty(root);
 			if (d)
 				throw new Error(
 					`Working tree has uncommitted changes; an experiment starts from the measured commit. If they are this experiment: git stash, call climb_experiment, git stash pop, commit, climb_measure.\n${d}`,
 				);
-			if (g.baseRef) {
-				const [want, have] = await Promise.all([git(root, "rev-parse", `${g.baseRef}^{tree}`), git(root, "rev-parse", "HEAD^{tree}")]);
-				if (want.code === 0 && want.stdout.trim() !== have.stdout.trim())
-					throw new Error(
-						`HEAD has changes climb never measured (baseline is ${g.baseRef.slice(0, 8)}). Unmeasured commits cannot enter the baseline: move them into an experiment (git reset --soft ${g.baseRef.slice(0, 8)} && git stash, climb_experiment, git stash pop, commit, climb_measure), restore the baseline (git revert), or re-baseline with climb_scorecard if they are intended.`,
-					);
-			}
 			const moved = await instrumentChanged(root, g.card, g.card.head);
 			if (moved.length) throw new Error(`The instrument changed since the scorecard (${moved.join(", ")}); re-baseline with climb_scorecard first.`);
 			const base = await head(root);
 			if (!base) throw new Error("The repository has no commits yet.");
 			const control = await measure(root, g.card.metrics, signal);
 			if (control.errors.length) throw new Error(`Control measurement failed at ${base.slice(0, 8)}:\n${control.errors.join("\n")}`);
+			// Commits made outside an experiment (a .gitignore, a failed revert) are adopted
+			// only if they pass the guard and regress nothing against the last measured baseline:
+			// they must never quietly lower the bar.
+			let adopted = "";
+			if (g.baseRef) {
+				const [want, have] = await Promise.all([git(root, "rev-parse", `${g.baseRef}^{tree}`), git(root, "rev-parse", "HEAD^{tree}")]);
+				if (want.code === 0 && want.stdout.trim() !== have.stdout.trim()) {
+					const short = g.baseRef.slice(0, 8);
+					const gerr = await guard(root, g.card.guard, signal);
+					if (gerr) throw new Error(`Commits since the last measured baseline ${short} break the guard: ${gerr}. Fix or revert them before experimenting.`);
+					const worse = g.baseValues ? X.regressions(g.card.metrics, g.baseValues, control.values) : [];
+					if (worse.length)
+						throw new Error(
+							`Commits since the last measured baseline ${short} regressed ${worse.map(m => `${m.name} ${g.baseValues![m.name]}→${control.values[m.name]}`).join(", ")}. Revert them (git revert) or register them as an experiment; unmeasured regressions cannot lower the bar.`,
+						);
+					adopted = ` Adopted commits since ${short}: guard passes, no regression.`;
+				}
+			}
 			const id = `x${g.nextExp}`;
 			append(root, { ts: L.now(), kind: "exp", goal: g.id, id, lever: p.lever, hypothesis: p.hypothesis, prediction: p.prediction, base, ref: control.values });
 			refresh(ctx, root);
 			const ref = Object.entries(control.values).map(([k, v]) => `${k}=${v}`).join(", ");
-			return ok(`Registered ${id} on ${g.id}. Control at ${base.slice(0, 8)}: ${ref}. Implement it and commit (any number of commits), then call climb_measure. Everything after ${base.slice(0, 8)} is this experiment; if it is dropped the extension reverts it.`);
+			return ok(`Registered ${id} on ${g.id}.${adopted} Control at ${base.slice(0, 8)}: ${ref}. Implement it and commit (any number of commits), then call climb_measure. Everything after ${base.slice(0, 8)} is this experiment; if it is dropped the extension reverts it.`);
 		}),
 	});
 
@@ -715,8 +741,17 @@ export default async function climb(pi: ExtensionAPI) {
 			const root = await needRoot(ctx);
 			holder(root, ctx);
 			const g = pick(load(root), p.goal, x => x.stallPending || x.streak >= X.DROP_STREAK);
-			const escalate = p.verdict === "stuck" && typeof ctx.runEphemeralTurn === "function";
-			append(root, { ts: L.now(), kind: "judge", goal: g.id, by: "worker", verdict: escalate ? "pivot" : p.verdict, diagnosis: p.diagnosis, next: p.next });
+			const independent = hasJudge(ctx);
+			const escalate = p.verdict === "stuck" && independent;
+			append(root, {
+				ts: L.now(),
+				kind: "judge",
+				goal: g.id,
+				by: independent ? "worker" : "fallback",
+				verdict: escalate ? "pivot" : p.verdict,
+				diagnosis: p.diagnosis,
+				next: p.next,
+			});
 			if (escalate) {
 				void judge(ctx, root, g.id);
 				return ok("Recorded. 'stuck' is decided by the independent judge, now reviewing; keep working meanwhile.");

@@ -69,6 +69,9 @@ function host(cwd: string, kind: "main" | "sub" = "main", sid = "s1") {
 		notes,
 		load: () => climb(pi as never),
 		tool: async (name: string, params: object) => (await tools.get(name)!.execute("id", params, undefined, undefined, ctx)).content[0].text,
+		noJudge: () => {
+			delete (ctx as { runEphemeralTurn?: unknown }).runEphemeralTurn;
+		},
 		toolWith: async (name: string, params: object, signal: AbortSignal) => (await tools.get(name)!.execute("id", params, signal, undefined, ctx)).content[0].text,
 		cmd: (args: string) => commands.get("climb")!.handler(args, ctx),
 		emit: async (ev: string, e: object = {}) => {
@@ -247,10 +250,14 @@ describe("climb extension", () => {
 		delete process.env.CLIMB_LEASE_ID;
 	});
 
-	test("stop-hook valve: two idle stops in a row release the worker to the heartbeat", async () => {
+	test("stop-hook valve: a worker that stops twice without working gets the judge, not a nap", async () => {
+		const judged = () => ledger().filter(e => e.kind === "judge" && e.by === "judge").length;
+		const before = judged();
 		expect((await x.emit("session_stop"))?.decision).toBe("block");
 		expect((await x.emit("session_stop"))?.decision).toBe("block");
 		expect(await x.emit("session_stop")).toBeUndefined();
+		await until(() => judged() > before);
+		expect(x.sent.at(-1)!.m.content).toContain("[climb JUDGE");
 		expect((await x.emit("session_stop"))?.decision).toBe("block");
 	});
 
@@ -382,7 +389,7 @@ describe("reviewer regressions", () => {
 
 	test("commits climb never measured cannot become the baseline", async () => {
 		await rsh("echo 400 > work.txt && git commit -qam sneaky");
-		await expect(y.tool("climb_experiment", { lever: "x", hypothesis: "", prediction: "" })).rejects.toThrow("never measured");
+		await expect(y.tool("climb_experiment", { lever: "x", hypothesis: "", prediction: "" })).rejects.toThrow("regressed w 50→400");
 		await rsh("git revert --no-edit HEAD >/dev/null");
 		expect(await y.tool("climb_experiment", { lever: "x", hypothesis: "", prediction: "" })).toContain("Control at");
 	});
@@ -393,9 +400,19 @@ describe("reviewer regressions", () => {
 		const out = await y.tool("climb_measure", {});
 		expect(out).toContain("auto-revert failed");
 		expect((await rsh("git status --porcelain --untracked-files=no")).stdout.trim()).toBe("");
-		await expect(y.tool("climb_experiment", { lever: "y", hypothesis: "", prediction: "" })).rejects.toThrow("never measured");
+		await expect(y.tool("climb_experiment", { lever: "y", hypothesis: "", prediction: "" })).rejects.toThrow("regressed");
 		await rsh("rm .git/hooks/commit-msg && git revert --no-edit HEAD >/dev/null");
 		expect(await y.tool("climb_experiment", { lever: "y", hypothesis: "", prediction: "" })).toContain("Control at");
+	});
+
+	test("harmless commits outside an experiment are adopted, not fought", async () => {
+		await rsh("git commit -q --allow-empty -m y");
+		await y.tool("climb_measure", {}); // close the experiment the previous test opened
+		await rsh("echo notes > NOTES.md && git add NOTES.md && git commit -qm notes");
+		const out = await y.tool("climb_experiment", { lever: "z", hypothesis: "", prediction: "" });
+		expect(out).toContain("Adopted commits");
+		await rsh("echo 45 > work.txt && git commit -qam z");
+		expect(await y.tool("climb_measure", {})).toContain("KEPT");
 	});
 
 	test("/climb resume is the human's verdict that un-sticks a goal", async () => {
@@ -406,5 +423,31 @@ describe("reviewer regressions", () => {
 		await y.cmd("resume");
 		expect(L.read(rdir).filter(e => e.kind === "judge").at(-1)).toMatchObject({ by: "human", verdict: "continue" });
 		expect((await y.emit("session_stop"))?.decision).toBe("block");
+	});
+});
+
+describe("hosts without an independent judge", () => {
+	test("the worker's own diagnosis clears the gate instead of deadlocking it", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-nj-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "nj");
+			z.noJudge();
+			await z.load();
+			await z.cmd("shrink");
+			await z.tool("climb_scorecard", { metrics: [{ name: "w", cmd: "cat work.txt", dir: "down", target: 1, noise: 0.05 }] });
+			for (const v of [120, 130, 140]) {
+				await z.tool("climb_experiment", { lever: `l${v}`, hypothesis: "", prediction: "" });
+				await run(`echo ${v} > work.txt && git commit -qam l${v}`);
+				expect(await z.tool("climb_measure", {})).toContain("DROPPED");
+			}
+			await expect(z.tool("climb_experiment", { lever: "next", hypothesis: "", prediction: "" })).rejects.toThrow("No independent judge");
+			await z.tool("climb_judge", { verdict: "pivot", diagnosis: "adding work never helps", next: "remove work" });
+			expect(L.read(d).filter(e => e.kind === "judge").at(-1)).toMatchObject({ by: "fallback" });
+			expect(await z.tool("climb_experiment", { lever: "next", hypothesis: "", prediction: "" })).toContain("Registered");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
 	});
 });

@@ -54,7 +54,7 @@ export interface ResultE extends Base {
 }
 export interface BeatE extends Base { kind: "beat"; head: string; values?: Values; progress: boolean; stale: number; note?: string }
 export interface StallE extends Base { kind: "stall"; stale: number }
-export interface JudgeE extends Base { kind: "judge"; by: "judge" | "worker" | "human"; verdict: Verdict; diagnosis: string; next: string }
+export interface JudgeE extends Base { kind: "judge"; by: "judge" | "worker" | "human" | "fallback"; verdict: Verdict; diagnosis: string; next: string }
 export interface DoneE extends Base { kind: "done"; result: "achieved" | "abandoned"; values: Values }
 export interface PauseE extends Base { kind: "pause" | "resume" }
 export interface RollupE extends Base { kind: "rollup"; cd: number; n: number; from: string; to: string; progress: number; stale: number; values?: Values }
@@ -78,8 +78,9 @@ export interface Goal {
 	levers: Map<string, { tried: number; kept: number; dropped: number }>;
 	/** Consecutive drops (any lever) since the last kept result or independent verdict. */
 	streak: number;
-	/** Commit whose tree is the measured baseline; HEAD must match it to start an experiment. */
+	/** Commit whose tree is the measured baseline, and the values measured there. */
 	baseRef?: string;
+	baseValues?: Values;
 	lastBeat?: { ts: string; head: string; stale: number; seq: number };
 	stallPending: boolean;
 	/** Latest independent verdict (the judge or a human). */
@@ -193,6 +194,7 @@ export function fold(entries: Entry[]): State {
 			case "card":
 				g.card = e;
 				g.baseRef = e.head;
+				g.baseValues = Object.fromEntries(e.metrics.map(m => [m.name, m.baseline]));
 				g.best = {};
 				g.series = new Map();
 				record(g, e.ts, Object.fromEntries(e.metrics.map(m => [m.name, m.baseline])), true);
@@ -210,6 +212,7 @@ export function fold(entries: Entry[]): State {
 				// Kept: the experiment head is the new baseline. Dropped: the revert restored
 				// the base tree; if the revert failed, HEAD will not match and climbing halts.
 				g.baseRef = e.verdict === "kept" ? e.head : (e.reverted ?? exp?.base ?? g.baseRef);
+				g.baseValues = e.verdict === "kept" ? e.values : (exp?.ref ?? g.baseValues);
 				const l = g.levers.get(key) ?? { tried: 0, kept: 0, dropped: 0 };
 				l.tried++;
 				if (e.verdict === "kept") {
@@ -241,7 +244,8 @@ export function fold(entries: Entry[]): State {
 				g.diagnosis = e;
 				g.stallPending = false;
 				// A worker grading its own work is recorded but never resets the stale count
-				// or the grid-search gate: only an independent verdict does.
+				// or the grid-search gate: only an independent verdict does. ("fallback" is a
+				// worker diagnosis accepted because the host has no independent judge.)
 				if (e.by === "worker") break;
 				g.judge = e;
 				g.judgeSeq = seq;
