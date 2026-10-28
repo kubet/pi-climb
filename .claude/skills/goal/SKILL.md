@@ -239,36 +239,53 @@ If `lib/compact` exists (from the pi-goal repo), run it:
 lib/compact oracle.jsonl
 ```
 
-Otherwise, do it inline with jq:
-```bash
-# Count and decide
-LINES=$(wc -l < oracle.jsonl)
-if [ "$LINES" -lt 100 ]; then exit 0; fi
+Otherwise, compact inline with Python (no deps beyond stdlib):
+```python
+import json, time, os
+from collections import defaultdict
+from datetime import datetime, timezone
 
-# Run compaction (jq slurp, partition, group, merge, output JSONL)
-NOW=$(date -u +%s)
-jq -sc --argjson now "$NOW" '
-  def epoch: fromdateiso8601;
-  def prot: .kind == "goal_created" or .kind == "goal_done" or .kind == "stall" or .kind == "investigation";
-  length as $n |
-  [.[-([50,$n]|min):][]] as $tail |
-  [.[:-([50,$n]|min)][]] as $head |
-  [$head[]|select(prot)] as $keep |
-  [$head[]|select(prot|not)|select((.cd//0)==0)|select(($now - (.ts|epoch)) > 86400)] as $old |
-  [$head[]|select(prot|not)|select((.cd//0)==0)|select(($now - (.ts|epoch)) <= 86400)] as $fresh |
-  [$head[]|select(prot|not)|select((.cd//0)>0)] as $hi |
-  [$old|group_by(.goal_id+"|"+.ts[0:13])[]|{
-    ts:.[0].ts,kind:"compaction",goal_id:.[0].goal_id,cd:1,n:length,
-    window:[.[0].ts,.[-1].ts],
-    summary:{
-      heartbeats:[.[]|select(.kind=="heartbeat")]|length,
-      progress:[.[]|select(.kind=="heartbeat" and .progress==true)]|length,
-      experiments:[.[]|select(.kind=="experiment")]|length,
-      snapshot:([.[]|select(.kind=="heartbeat" and .snapshot!=null)]|last//{}).snapshot
-    }}] as $d1 |
-  ($keep+$hi+$d1+$fresh+$tail)|sort_by(.ts)|.[]
-' oracle.jsonl > oracle.jsonl.tmp && mv oracle.jsonl.tmp oracle.jsonl
+PROTECTED = frozenset(("goal_created", "goal_done", "stall", "investigation"))
+oracle = "oracle.jsonl"
+with open(oracle) as f:
+    entries = [json.loads(l) for l in f]
+n = len(entries)
+if n < 100: exit()
+now = time.time()
+tail = entries[-min(50,n):]
+head = entries[:-min(50,n)] if min(50,n) < n else []
+
+keep, d0_old, d0_fresh, d1_old, d1_fresh, higher = [], [], [], [], [], []
+for e in head:
+    if e["kind"] in PROTECTED: keep.append(e); continue
+    cd = e.get("cd", 0)
+    age = now - datetime.fromisoformat(e["ts"].replace("Z","+00:00")).timestamp()
+    if cd == 0: (d0_old if age > 86400 else d0_fresh).append(e)
+    elif cd == 1: (d1_old if age > 604800 else d1_fresh).append(e)
+    else: higher.append(e)
+
+def fold(group, cd):
+    hb=pr=ex=ke=dr=0; snap=None
+    for e in group:
+        k=e["kind"]
+        if k=="heartbeat": hb+=1; pr+=e.get("progress",False); snap=e.get("snapshot",snap)
+        elif k=="experiment": ex+=1
+        elif k=="decision": v=e.get("verdict"); ke+=(v=="kept"); dr+=(v=="dropped")
+    return {"ts":group[0]["ts"],"kind":"compaction","goal_id":group[0]["goal_id"],"cd":cd,
+            "n":len(group),"window":[group[0]["ts"],group[-1]["ts"]],
+            "summary":{"heartbeats":hb,"progress":pr,"experiments":ex,"kept":ke,"dropped":dr,"snapshot":snap}}
+
+groups = defaultdict(list)
+for e in d0_old: groups[e["goal_id"]+"|"+e["ts"][:13]].append(e)
+d1_new = [fold(g,1) for g in groups.values()]
+
+result = sorted(keep+higher+d1_fresh+d1_new+d0_fresh+tail, key=lambda e:e["ts"])
+with open(oracle+".tmp","w") as f:
+    for e in result: f.write(json.dumps(e,separators=(",",":"))+"\n")
+os.rename(oracle+".tmp", oracle)
 ```
+
+Compaction converges in 2-3 passes (D0→D1, then D1→D2). Run `lib/compact` multiple times until stable.
 
 Report: `compacted: {before} -> {after} lines`
 
@@ -387,6 +404,15 @@ Always UTC. Always append. Never edit existing lines (compaction rewrites atomic
 Multiple goals coexist in one `oracle.jsonl`. Each heartbeat checks ALL active goals. Goals are independent unless linked by `parent_id` (sub-goals).
 
 Cross-repo goals: an experiment entry can reference `"repo":"other-repo","commit":"sha"`. The measurement runs in that repo at that commit.
+
+## Self-test
+
+After any SKILL.md or lib/compact change, run the smoke test:
+```bash
+test/smoke
+```
+
+It exercises: goal creation, metrics, experiments, heartbeats, stall detection, investigation, sub-goals, compaction (with convergence check), multi-goal state reconstruction. All 14 checks must pass before touching a live goal.
 
 ## Hill-climbing protocol
 

@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# smoke — self-test for the /goal plugin
+# Exercises: create, metrics, experiment, measurement, decision,
+# heartbeat, stall, compaction, multi-goal, correctness invariants.
+# Run after any SKILL.md or lib/compact change.
+
+DIR=$(mktemp -d)
+trap 'rm -rf "$DIR"' EXIT
+ORACLE="$DIR/oracle.jsonl"
+COMPACT="$(cd "$(dirname "$0")/.." && pwd)/lib/compact"
+PASS=0
+FAIL=0
+
+ok()   { PASS=$((PASS+1)); echo "  PASS: $1"; }
+fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1" >&2; }
+
+check_json() {
+  python3 -c "
+import json, sys
+with open('$1') as f:
+    for i, line in enumerate(f, 1):
+        try: json.loads(line)
+        except: print(f'invalid JSON line {i}', file=sys.stderr); sys.exit(1)
+" && return 0 || return 1
+}
+
+count_kind() {
+  python3 -c "
+import json
+with open('$1') as f:
+    print(sum(1 for l in f if json.loads(l).get('kind')=='$2'))
+"
+}
+
+echo "=== /goal smoke test ==="
+echo "scratch dir: $DIR"
+echo ""
+
+# --- Phase 1: Oracle creation and basic entries ---
+echo "Phase 1: Oracle lifecycle"
+
+# Create two goals
+echo '{"ts":"2026-09-01T00:00:00Z","kind":"goal_created","goal_id":"g-alpha","intent":"test alpha","config":{"poke_max":3,"heartbeat_s":1800}}' >> "$ORACLE"
+echo '{"ts":"2026-09-01T00:01:00Z","kind":"goal_created","goal_id":"g-beta","intent":"test beta","config":{"poke_max":2,"heartbeat_s":900}}' >> "$ORACLE"
+
+# Metrics
+echo '{"ts":"2026-09-01T00:02:00Z","kind":"metrics_defined","goal_id":"g-alpha","metrics":[{"name":"speed","baseline":100,"target":50,"direction":"down"}]}' >> "$ORACLE"
+echo '{"ts":"2026-09-01T00:02:00Z","kind":"metrics_defined","goal_id":"g-beta","metrics":[{"name":"score","baseline":0.5,"target":0.9,"direction":"up"}]}' >> "$ORACLE"
+
+[[ $(wc -l < "$ORACLE" | tr -d ' ') == "4" ]] && ok "4 entries created" || fail "expected 4 entries"
+check_json "$ORACLE" && ok "all valid JSON" || fail "invalid JSON"
+
+# --- Phase 2: Experiment cycle ---
+echo ""
+echo "Phase 2: Experiment cycle"
+
+echo '{"ts":"2026-09-01T01:00:00Z","kind":"experiment","goal_id":"g-alpha","experiment_id":"x001","hypothesis":"cache","prediction":"speed -30%","commit":"aaa111"}' >> "$ORACLE"
+echo '{"ts":"2026-09-01T01:30:00Z","kind":"measurement","goal_id":"g-alpha","experiment_id":"x001","metrics":{"speed":70},"control":{"speed":100}}' >> "$ORACLE"
+echo '{"ts":"2026-09-01T01:31:00Z","kind":"decision","goal_id":"g-alpha","experiment_id":"x001","verdict":"kept","reason":"speed 100->70, -30%"}' >> "$ORACLE"
+
+[[ $(count_kind "$ORACLE" "experiment") == "1" ]] && ok "1 experiment" || fail "experiment count"
+[[ $(count_kind "$ORACLE" "decision") == "1" ]] && ok "1 decision" || fail "decision count"
+
+# --- Phase 3: Heartbeats with progress and stall ---
+echo ""
+echo "Phase 3: Heartbeats and stall detection"
+
+# Progress heartbeat
+echo '{"ts":"2026-09-01T02:00:00Z","kind":"heartbeat","goal_id":"g-alpha","snapshot":{"speed":70},"delta":{"speed":-30},"progress":true,"stale_pokes":0}' >> "$ORACLE"
+
+# 3 no-progress heartbeats -> stall
+for i in 1 2 3; do
+  ts="2026-09-01T0$((2+i)):00:00Z"
+  echo "{\"ts\":\"$ts\",\"kind\":\"heartbeat\",\"goal_id\":\"g-alpha\",\"snapshot\":{\"speed\":70},\"delta\":{\"speed\":0},\"progress\":false,\"stale_pokes\":$i}" >> "$ORACLE"
+done
+
+echo '{"ts":"2026-09-01T06:00:00Z","kind":"stall","goal_id":"g-alpha","stale_pokes":3,"last_progress_at":"2026-09-01T02:00:00Z","action":"investigation_launched"}' >> "$ORACLE"
+echo '{"ts":"2026-09-01T06:05:00Z","kind":"investigation","goal_id":"g-alpha","diagnosis":"wrong lever","evidence":["3 no-progress pokes"],"recommendation":"profile first","strategy_change":true}' >> "$ORACLE"
+
+[[ $(count_kind "$ORACLE" "stall") == "1" ]] && ok "stall detected at poke_max=3" || fail "stall count"
+[[ $(count_kind "$ORACLE" "investigation") == "1" ]] && ok "investigation launched" || fail "investigation count"
+
+# --- Phase 4: Sub-goals ---
+echo ""
+echo "Phase 4: Sub-goals"
+
+echo '{"ts":"2026-09-01T07:00:00Z","kind":"sub_goal_created","goal_id":"g-alpha-db","parent_id":"g-alpha","intent":"optimize DB queries","depth":1}' >> "$ORACLE"
+
+parent_count=$(python3 -c "
+import json
+with open('$ORACLE') as f:
+    print(sum(1 for l in f if json.loads(l).get('parent_id')=='g-alpha'))
+")
+[[ "$parent_count" == "1" ]] && ok "sub-goal links to parent" || fail "sub-goal parent link"
+
+# --- Phase 5: Goal completion ---
+echo ""
+echo "Phase 5: Goal done"
+
+echo '{"ts":"2026-09-01T10:00:00Z","kind":"goal_done","goal_id":"g-beta","result":"abandoned","final_metrics":{"score":0.6},"summary":"abandoned after alpha took priority"}' >> "$ORACLE"
+
+active=$(python3 -c "
+import json
+with open('$ORACLE') as f:
+    entries = [json.loads(l) for l in f]
+created = {e['goal_id'] for e in entries if e['kind']=='goal_created'}
+done = {e['goal_id'] for e in entries if e['kind']=='goal_done'}
+print(len(created - done))
+")
+[[ "$active" == "1" ]] && ok "1 active goal (beta done)" || fail "active goal count: $active"
+
+# --- Phase 6: Compaction ---
+echo ""
+echo "Phase 6: Compaction"
+
+BEFORE=$(wc -l < "$ORACLE" | tr -d ' ')
+
+# Generate 200 more heartbeats to make it worth compacting
+python3 -c "
+import json, datetime
+base = datetime.datetime(2026, 9, 2, 0, 0, 0)
+lines = []
+for i in range(200):
+    ts = base + datetime.timedelta(minutes=i*30)
+    lines.append(json.dumps({
+        'ts': ts.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'kind': 'heartbeat',
+        'goal_id': 'g-alpha',
+        'snapshot': {'speed': 70 - i*0.1},
+        'delta': {'speed': -0.1},
+        'progress': i % 5 == 0,
+        'stale_pokes': 0 if i % 5 == 0 else (i % 5)
+    }, separators=(',',':')))
+with open('$ORACLE', 'a') as f:
+    f.write('\n'.join(lines) + '\n')
+"
+
+MID=$(wc -l < "$ORACLE" | tr -d ' ')
+echo "  before compact: $MID lines"
+
+# Count protected before
+PROT_BEFORE=$(python3 -c "
+import json
+PROT = {'goal_created','goal_done','stall','investigation'}
+with open('$ORACLE') as f:
+    print(sum(1 for l in f if json.loads(l)['kind'] in PROT))
+")
+
+# Run compact
+python3 "$COMPACT" "$ORACLE" 2>&1
+
+AFTER=$(wc -l < "$ORACLE" | tr -d ' ')
+echo "  after compact: $AFTER lines"
+
+PROT_AFTER=$(python3 -c "
+import json
+PROT = {'goal_created','goal_done','stall','investigation'}
+with open('$ORACLE') as f:
+    print(sum(1 for l in f if json.loads(l)['kind'] in PROT))
+")
+
+[[ "$AFTER" -lt "$MID" ]] && ok "compacted: $MID -> $AFTER" || fail "no compaction happened"
+[[ "$PROT_BEFORE" == "$PROT_AFTER" ]] && ok "protected entries preserved ($PROT_AFTER)" || fail "protected entries lost: $PROT_BEFORE -> $PROT_AFTER"
+check_json "$ORACLE" && ok "post-compact JSON valid" || fail "post-compact invalid JSON"
+
+# Check compaction entries exist
+COMP_COUNT=$(count_kind "$ORACLE" "compaction")
+[[ "$COMP_COUNT" -gt "0" ]] && ok "$COMP_COUNT compaction summaries created" || fail "no compaction entries"
+
+# --- Phase 7: Compact converges in single invocation ---
+echo ""
+echo "Phase 7: Compaction convergence"
+
+PREV=$(wc -l < "$ORACLE" | tr -d ' ')
+python3 "$COMPACT" "$ORACLE" 2>&1
+CUR=$(wc -l < "$ORACLE" | tr -d ' ')
+[[ "$CUR" == "$PREV" ]] && ok "re-compact is idempotent ($CUR lines)" || fail "re-compact changed: $PREV -> $CUR"
+
+# --- Phase 8: Multi-goal state reconstruction ---
+echo ""
+echo "Phase 8: State reconstruction"
+
+python3 -c "
+import json, sys
+
+with open('$ORACLE') as f:
+    entries = [json.loads(l) for l in f]
+
+# Active goals
+created = {e['goal_id'] for e in entries if e['kind']=='goal_created'}
+done = {e['goal_id'] for e in entries if e['kind']=='goal_done'}
+active = created - done
+assert len(active) == 1, f'expected 1 active goal, got {len(active)}: {active}'
+assert 'g-alpha' in active, f'g-alpha should be active'
+
+# Latest snapshot for g-alpha (from heartbeat or compaction)
+snapshots = [e for e in entries if e.get('goal_id')=='g-alpha' and
+    (e['kind']=='heartbeat' and e.get('snapshot')) or
+    (e['kind']=='compaction' and e.get('summary',{}).get('snapshot'))]
+assert len(snapshots) > 0, 'no snapshots for g-alpha'
+
+# Investigations
+invs = [e for e in entries if e['kind']=='investigation']
+assert len(invs) == 1, f'expected 1 investigation, got {len(invs)}'
+
+print('state reconstruction OK')
+" && ok "state reconstruction correct" || fail "state reconstruction"
+
+# --- Summary ---
+echo ""
+echo "================================"
+TOTAL=$((PASS + FAIL))
+echo "$PASS/$TOTAL passed, $FAIL failed"
+[[ $FAIL -eq 0 ]] && echo "SMOKE TEST PASSED" || { echo "SMOKE TEST FAILED"; exit 1; }

@@ -9,20 +9,46 @@ PROTECTED = frozenset(("goal_created", "goal_done", "stall", "investigation"))
 def main():
     oracle = sys.argv[1] if len(sys.argv) > 1 else "oracle.jsonl"
     dry_run = "--dry-run" in sys.argv
+    max_passes = 5
 
-    with open(oracle) as f:
-        lines = f.readlines()
+    for pass_num in range(1, max_passes + 1):
+        with open(oracle) as f:
+            lines = f.readlines()
 
-    n = len(lines)
-    if n < 100:
-        print(f"only {n} lines, skipping")
-        return
+        n = len(lines)
+        if n < 100:
+            if pass_num == 1:
+                print(f"only {n} lines, skipping")
+            return
 
-    print(f"oracle: {n} lines, {sum(len(l) for l in lines)} bytes")
+        if pass_num == 1:
+            print(f"oracle: {n} lines, {sum(len(l) for l in lines)} bytes")
 
-    entries = [json.loads(l) for l in lines]
+        entries = [json.loads(l) for l in lines]
+        result = _compact_once(entries)
+
+        if len(result) == n:
+            if pass_num > 1:
+                print(f"  stable after {pass_num} passes")
+            break
+
+        tmp = oracle + ".tmp"
+        with open(tmp, "w") as f:
+            for e in result:
+                f.write(json.dumps(e, separators=(",", ":")))
+                f.write("\n")
+
+        if dry_run:
+            print(f"dry run: {n} -> {len(result)} lines")
+            os.remove(tmp)
+            return
+        else:
+            os.rename(tmp, oracle)
+            print(f"compacted: {n} -> {len(result)} lines")
+
+def _compact_once(entries):
     now = time.time()
-
+    n = len(entries)
     tail_n = min(50, n)
     tail = entries[-tail_n:]
     head = entries[:-tail_n] if tail_n < n else []
@@ -47,20 +73,7 @@ def main():
 
     result = keep + higher + d2_new + d1_fresh + d1_new + d0_fresh + tail
     result.sort(key=lambda e: e["ts"])
-
-    tmp = oracle + ".tmp"
-    with open(tmp, "w") as f:
-        for e in result:
-            f.write(json.dumps(e, separators=(",", ":")))
-            f.write("\n")
-
-    after = len(result)
-    if dry_run:
-        print(f"dry run: {n} -> {after} lines")
-        os.remove(tmp)
-    else:
-        os.rename(tmp, oracle)
-        print(f"compacted: {n} -> {after} lines")
+    return result
 
 def _epoch(ts):
     return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
