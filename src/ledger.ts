@@ -19,6 +19,8 @@ export interface Metric {
 	noise: number;
 	samples: number;
 	timeout_s: number;
+	/** A constraint, not a goal: must not regress beyond noise; target = baseline. */
+	hold?: boolean;
 }
 
 export interface Cfg {
@@ -119,7 +121,8 @@ export const epoch = (ts: string) => Date.parse(ts);
 export const lever = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
 
 export const better = (dir: Dir, a: number, b: number) => (dir === "down" ? a < b : a > b);
-export const met = (m: Metric, v: number | undefined) => v !== undefined && (m.dir === "down" ? v <= m.target : v >= m.target);
+export const met = (m: Metric, v: number | undefined): boolean =>
+	v !== undefined && (m.hold ? gain(m, m.baseline, v) >= -m.noise : m.dir === "down" ? v <= m.target : v >= m.target);
 
 export function read(root: string): Entry[] {
 	let text: string;

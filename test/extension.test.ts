@@ -460,3 +460,32 @@ describe("hosts without an independent judge", () => {
 		}
 	});
 });
+
+describe("hold metrics", () => {
+	test("a constraint like 'no slower' needs no target, blocks regressions, and does not block achievement", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-hold-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > mem.txt && echo 50 > ms.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "hold");
+			await z.load();
+			await z.cmd("halve memory, no slower");
+			await expect(z.tool("climb_scorecard", { metrics: [{ name: "ms", cmd: "cat ms.txt", dir: "down", hold: true }] })).rejects.toThrow("must have a target");
+			const card = await z.tool("climb_scorecard", {
+				metrics: [
+					{ name: "mem", cmd: "cat mem.txt", dir: "down", target: 50, noise: 0.05 },
+					{ name: "ms", cmd: "cat ms.txt", dir: "down", hold: true, noise: 0.05 },
+				],
+			});
+			expect(card).toContain("ms = 50 → hold (must not regress)");
+			await z.tool("climb_experiment", { lever: "trade speed for memory", hypothesis: "", prediction: "" });
+			await run("echo 40 > mem.txt && echo 70 > ms.txt && git commit -qam slower");
+			expect(await z.tool("climb_measure", {})).toContain("regressed: ms 50→70");
+			await z.tool("climb_experiment", { lever: "smaller structures", hypothesis: "", prediction: "" });
+			await run("echo 45 > mem.txt && git commit -qam smaller");
+			expect(await z.tool("climb_measure", {})).toContain("GOAL ACHIEVED");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+});

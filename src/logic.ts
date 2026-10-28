@@ -51,6 +51,7 @@ export function verdict(metrics: Metric[], ref: Values, values: Values): { kept:
 
 export function progressPct(m: Metric, best: number | undefined): number {
 	if (best === undefined) return 0;
+	if (m.hold) return met(m, best) ? 100 : -100;
 	const total = m.dir === "down" ? m.baseline - m.target : m.target - m.baseline;
 	const moved = m.dir === "down" ? m.baseline - best : best - m.baseline;
 	return total ? Math.round((moved / total) * 100) : 100;
@@ -93,7 +94,8 @@ export function statusLine(st: State, nowMs = clock.ms()): string | undefined {
 	if (!goals.length) return undefined;
 	const parts = goals.map(g => {
 		if (!g.card) return `${g.id}: researching (${g.probes.filter(p => p.value !== undefined).length} probes)`;
-		const pct = Math.min(...g.card.metrics.map(m => progressPct(m, g.best[m.name])));
+		const goals = g.card.metrics.filter(m => !m.hold);
+		const pct = Math.min(...(goals.length ? goals : g.card.metrics).map(m => progressPct(m, g.best[m.name])));
 		const due = g.lastBeat ? Math.max(0, g.cfg.beat_s - (nowMs - epoch(g.lastBeat.ts)) / 1000) : g.cfg.beat_s;
 		const flag = stuck(g) ? " STUCK" : g.stallPending ? " STALL" : "";
 		return `${g.id} ${pct}% · stale ${g.lastBeat?.stale ?? 0}/${g.cfg.poke_max}${g.open ? ` · ${g.open.id}` : ""} · beat ${Math.ceil(due / 60)}m${flag}`;
@@ -125,7 +127,7 @@ export function report(st: State, nowMs = clock.ms()): string {
 			}
 			const u = m.unit ? ` ${m.unit}` : "";
 			out.push(
-				`  ${met(m, best) ? "✓" : "·"} ${m.name}: ${m.baseline} → ${best}${u} (target ${m.target}, ${progressPct(m, best)}%) ${sparkline(pts.slice(-20).map(p => p.v))}${vel !== undefined ? ` · ${vel >= 0 ? "+" : ""}${num(vel)}/h` : ""}${eta}`,
+				`  ${met(m, best) ? "✓" : "·"} ${m.name}: ${m.baseline} → ${best}${u} (${m.hold ? "hold: no regression" : `target ${m.target}, ${progressPct(m, best)}%`}) ${sparkline(pts.slice(-20).map(p => p.v))}${vel !== undefined ? ` · ${vel >= 0 ? "+" : ""}${num(vel)}/h` : ""}${eta}`,
 			);
 		}
 		const kept = g.results.filter(r => r.verdict === "kept").length;
@@ -143,7 +145,11 @@ export function report(st: State, nowMs = clock.ms()): string {
 export function cardSummary(g: Goal): string {
 	if (!g.card) return `${g.id}: no scorecard`;
 	return g.card.metrics
-		.map(m => `${m.name} ${g.best[m.name]}${m.unit ? ` ${m.unit}` : ""} (baseline ${m.baseline}, target ${m.target}, ${progressPct(m, g.best[m.name])}%)`)
+		.map(m =>
+			m.hold
+				? `${m.name} ${g.best[m.name]}${m.unit ? ` ${m.unit}` : ""} (hold at ${m.baseline} ±${(m.noise * 100).toFixed(1)}%)`
+				: `${m.name} ${g.best[m.name]}${m.unit ? ` ${m.unit}` : ""} (baseline ${m.baseline}, target ${m.target}, ${progressPct(m, g.best[m.name])}%)`,
+		)
 		.join("; ");
 }
 
@@ -224,7 +230,7 @@ export function describe(e: Entry): string {
 		case "goal":
 			return `${g} started: "${e.intent}" (heartbeat ${Math.round(e.cfg.beat_s / 60)}m, judge after ${e.cfg.poke_max} stale beats)`;
 		case "card":
-			return `${g} scorecard: ${e.metrics.map(m => `${m.name} ${m.baseline}→${m.target}${m.unit ? ` ${m.unit}` : ""} (±${(m.noise * 100).toFixed(1)}%)`).join(", ")}`;
+			return `${g} scorecard: ${e.metrics.map(m => `${m.name} ${m.baseline}→${m.hold ? "hold" : m.target}${m.unit ? ` ${m.unit}` : ""} (±${(m.noise * 100).toFixed(1)}%)`).join(", ")}`;
 		case "exp":
 			return `${g} ${e.id} registered: ${e.lever}, predicts ${e.prediction}`;
 		case "result":

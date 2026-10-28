@@ -507,7 +507,8 @@ export default async function climb(pi: ExtensionAPI) {
 					name: S.str("snake_case metric name"),
 					cmd: S.str("Shell command printing the value as its last number"),
 					dir: S.enum(["up", "down"], "Which direction is better"),
-					target: S.num("Ambitious target value"),
+					target: S.opt(S.num("Ambitious target value (omit for hold metrics)")),
+					hold: S.opt(S.bool("Constraint, not a goal (e.g. 'no slower'): must not regress beyond noise; no target")),
 					unit: S.opt(S.str("Unit label, e.g. ms")),
 					noise: S.opt(S.num("Relative change treated as noise; default 0.02")),
 					samples: S.opt(S.num("Runs per measurement, median taken; default 1, max 9")),
@@ -537,16 +538,19 @@ export default async function climb(pi: ExtensionAPI) {
 			const names = new Set<string>();
 			for (const m of p.metrics) {
 				if (!/^[a-z][a-z0-9_]*$/.test(m.name) || names.has(m.name)) throw new Error(`Metric names must be unique snake_case: "${m.name}".`);
+				if (!m.hold && typeof m.target !== "number") throw new Error(`${m.name} needs a target, or hold: true if it is a constraint like "no slower".`);
 				names.add(m.name);
 			}
+			if (p.metrics.every(m => m.hold)) throw new Error("At least one metric must have a target to climb; hold metrics only guard.");
 			const d = await dirty(root);
 			if (d) throw new Error(`Working tree is dirty; commit or stash first so baselines are measured on a commit:\n${d}`);
 			const metrics: L.Metric[] = p.metrics.map(m => ({
 				name: m.name,
 				cmd: m.cmd,
 				dir: m.dir,
-				target: m.target,
+				target: m.target ?? Number.NaN,
 				unit: m.unit,
+				hold: m.hold || undefined,
 				noise: m.noise ?? 0.01,
 				samples: Math.min(9, Math.max(1, Math.round(m.samples ?? 1))),
 				timeout_s: m.timeout_s ?? 600,
@@ -567,7 +571,8 @@ export default async function climb(pi: ExtensionAPI) {
 			const warnings: string[] = [];
 			for (const m of metrics) {
 				m.baseline = values[m.name];
-				if (L.met(m, m.baseline)) throw new Error(`${m.name} already meets its target (${m.baseline}, ${m.dir} ${m.target}); set an ambitious target.`);
+				if (m.hold) m.target = m.baseline;
+				else if (L.met(m, m.baseline)) throw new Error(`${m.name} already meets its target (${m.baseline}, ${m.dir} ${m.target}); set an ambitious target.`);
 				const xs = samples[m.name];
 				const spread = (Math.max(...xs) - Math.min(...xs)) / (Math.abs(m.baseline) || 1);
 				m.noise = Math.max(m.noise, 2 * spread);
@@ -580,7 +585,8 @@ export default async function climb(pi: ExtensionAPI) {
 			append(root, { ts: L.now(), kind: "card", goal: g.id, metrics, guard: p.guard, frozen, head: h, parked: p.parked, axioms: p.axioms });
 			refresh(ctx, root);
 			const lines = metrics.map(
-				m => `- ${m.name} = ${m.baseline}${m.unit ? ` ${m.unit}` : ""} → target ${m.target} (${m.dir} is better, noise ±${(m.noise * 100).toFixed(1)}%)`,
+				m =>
+					`- ${m.name} = ${m.baseline}${m.unit ? ` ${m.unit}` : ""} → ${m.hold ? "hold (must not regress)" : `target ${m.target}`} (${m.dir} is better, noise ±${(m.noise * 100).toFixed(1)}%)`,
 			);
 			return ok(
 				[
@@ -916,7 +922,7 @@ interface GoalParam {
 	goal?: string;
 }
 interface ScorecardParams extends GoalParam {
-	metrics: { name: string; cmd: string; dir: L.Dir; target: number; unit?: string; noise?: number; samples?: number; timeout_s?: number }[];
+	metrics: { name: string; cmd: string; dir: L.Dir; target?: number; hold?: boolean; unit?: string; noise?: number; samples?: number; timeout_s?: number }[];
 	guard?: string;
 	frozen?: string[];
 	parked?: string[];
@@ -944,6 +950,7 @@ interface Builder {
 	obj(props: Record<string, Schema>): Schema;
 	str(desc: string): Schema;
 	num(desc: string): Schema;
+	bool(desc: string): Schema;
 	arr(item: Schema, desc: string): Schema;
 	enum(values: string[], desc: string): Schema;
 	opt(s: Schema): Schema;
@@ -957,6 +964,7 @@ async function schemas(pi: ExtensionAPI): Promise<Builder> {
 			obj: p => z.object(p),
 			str: d => z.string().describe(d),
 			num: d => z.number().describe(d),
+			bool: d => z.boolean().describe(d),
 			arr: (i, d) => z.array(i).describe(d),
 			enum: (v, d) => z.enum(v).describe(d),
 			opt: s => s.optional(),
@@ -967,6 +975,7 @@ async function schemas(pi: ExtensionAPI): Promise<Builder> {
 		obj: p => T.Object(p),
 		str: d => T.String({ description: d }),
 		num: d => T.Number({ description: d }),
+		bool: d => T.Boolean({ description: d }),
 		arr: (i, d) => T.Array(i, { description: d }),
 		enum: (v, d) => T.Union(v.map(x => T.Literal(x)), { description: d }),
 		opt: s => T.Optional(s),

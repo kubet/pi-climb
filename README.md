@@ -38,7 +38,7 @@ The agent drives the loop through tools:
 1. **Research, itemized:** `climb_probe` registers each candidate metric. The extension runs it and records the number, and each probe counts as progress before a scorecard exists.
 2. **Climb:** `climb_scorecard` → `climb_experiment` → commit → `climb_measure`, plus `climb_judge` and `climb_status`.
 
-Metrics are whatever the agent defines: any command that prints a number, such as runtime, memory, test count, bundle size, or itemized findings (`grep -c '^- ' findings.md`).
+Metrics are whatever the agent defines: any command that prints a number, such as runtime, memory, test count, bundle size, or itemized findings (`grep -c '^- ' findings.md`). A metric with `hold: true` is a constraint ("no slower"): it has no target, and any regression beyond noise drops the experiment.
 
 **omp vs upstream pi:** on omp, the stop hook keeps the agent working and the judge is an independent side turn. Upstream pi has neither, so the heartbeat drives the loop and the agent's own diagnosis stands in for the judge.
 
