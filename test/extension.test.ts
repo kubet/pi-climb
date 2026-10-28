@@ -308,4 +308,26 @@ describe("climb extension", () => {
 		await expect(sub.tool("climb_experiment", { lever: "a", hypothesis: "", prediction: "" })).rejects.toThrow("main worker");
 		expect(await sub.emit("session_stop")).toBeUndefined();
 	});
+
+	test("external tracking: every ledger event reaches an http webhook or a command sink", async () => {
+		const got: { text: string; entry: L.Entry }[] = [];
+		const server = Bun.serve({ port: 0, fetch: async req => (got.push(await req.json()), new Response("ok")) });
+		try {
+			process.env.CLIMB_SINK = `http://localhost:${server.port}/hook`;
+			await x.cmd("pause");
+			await until(() => got.length > 0);
+			expect(got[0]).toMatchObject({ text: "[climb] paused", entry: { kind: "pause" } });
+
+			const log = path.join(dir, "..", `sink-${path.basename(dir)}.log`);
+			process.env.CLIMB_SINK = `cat >> ${log}`;
+			await x.cmd("resume");
+			await until(() => fs.existsSync(log) && fs.readFileSync(log, "utf8").includes("resumed"));
+			const line = JSON.parse(fs.readFileSync(log, "utf8").trim().split("\n").at(-1)!);
+			expect(line).toMatchObject({ text: "[climb] resumed", repo: path.basename(dir), entry: { kind: "resume" } });
+			fs.rmSync(log, { force: true });
+		} finally {
+			delete process.env.CLIMB_SINK;
+			server.stop(true);
+		}
+	});
 });

@@ -33,6 +33,19 @@ Requires a git repo with at least one commit.
 
 The agent drives the loop through tools: `climb_scorecard` → `climb_experiment` → commit → `climb_measure`, plus `climb_judge` and `climb_status`.
 
+## Tracking
+
+- **Self:** `.climb/oracle.jsonl` holds every decision as JSON. `/climb` shows a sparkline, velocity and ETA, and the status line shows live progress.
+- **External in:** a metric is any command that prints a number, so it can `curl` Prometheus, CI or an API.
+- **External out:** set `CLIMB_SINK` and every ledger event goes out as `{text, content, repo, entry}`:
+
+```bash
+CLIMB_SINK=https://hooks.slack.com/services/...  omp   # http(s): JSON POST (Slack/Discord read text/content)
+CLIMB_SINK='cat >> ~/climb.log'                  omp   # anything else: shell command, JSON on stdin
+```
+
+Other extensions can subscribe with `pi.events.on("climb", …)`.
+
 ## Develop
 
 ```bash

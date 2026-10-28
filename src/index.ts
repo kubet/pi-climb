@@ -9,6 +9,7 @@
 //     busy, forced at 2x as a watchdog; poke_max stale beats -> a separate
 //     judge model call diagnoses the stall and redirects the worker
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as L from "./ledger";
@@ -173,6 +174,40 @@ export default async function climb(pi: ExtensionAPI) {
 		return { sha: await head(root) };
 	}
 
+	// --- ledger writes + external tracking -----------------------------------------
+
+	// Every ledger event also goes out: omp's event bus (channel "climb") for other
+	// extensions, and CLIMB_SINK if set — an http(s) URL gets a JSON POST (Slack/
+	// Discord webhooks read text/content), anything else is a shell command fed
+	// the JSON on stdin. Fire-and-forget: tracking never blocks or breaks the climb.
+	function append(root: string, ...entries: L.Entry[]): void {
+		L.append(root, ...entries);
+		for (const entry of entries) publish(root, entry);
+	}
+
+	function publish(root: string, entry: L.Entry): void {
+		const text = X.describe(entry);
+		const payload = { text, content: text, repo: path.basename(root), entry };
+		try {
+			pi.events?.emit("climb", payload);
+		} catch {}
+		const sink = process.env.CLIMB_SINK?.trim();
+		if (!sink) return;
+		const body = JSON.stringify(payload);
+		if (/^https?:\/\//.test(sink)) {
+			void fetch(sink, { method: "POST", headers: { "content-type": "application/json" }, body }).catch(e =>
+				pi.logger?.warn?.("climb sink failed", { error: String(e) }),
+			);
+			return;
+		}
+		try {
+			const child = spawn("bash", ["-c", sink], { cwd: root, stdio: ["pipe", "ignore", "ignore"] });
+			child.on("error", () => {});
+			child.stdin.on("error", () => {});
+			child.stdin.end(`${body}\n`);
+		} catch {}
+	}
+
 	// --- state + delivery --------------------------------------------------------
 
 	const load = (root: string) => L.fold(L.read(root));
@@ -297,12 +332,12 @@ export default async function climb(pi: ExtensionAPI) {
 		const progress = L.keptSinceBeat(g) || L.improves(g, values);
 		// A judge verdict restarts the count, so the judge runs once per stall, not every beat.
 		const stale = progress ? 0 : (L.judgedSinceBeat(g) ? 0 : (g.lastBeat?.stale ?? 0)) + 1;
-		L.append(root, { ts: L.now(), kind: "beat", goal: g.id, head: h, values, progress, stale, note });
+		append(root, { ts: L.now(), kind: "beat", goal: g.id, head: h, values, progress, stale, note });
 
 		const after = load(root).goals.get(g.id)!;
 		if (paused || L.stuck(after)) return;
 		if (stale >= g.cfg.poke_max && !after.stallPending) {
-			L.append(root, { ts: L.now(), kind: "stall", goal: g.id, stale });
+			append(root, { ts: L.now(), kind: "stall", goal: g.id, stale });
 			void judge(ctx, root, g.id);
 			return;
 		}
@@ -330,7 +365,7 @@ export default async function climb(pi: ExtensionAPI) {
 				reply = (await ctx.runEphemeralTurn({ promptText, tools: false })).replyText;
 			}
 			const j = X.parseJudge(reply);
-			L.append(root, { ts: L.now(), kind: "judge", goal: id, by: "judge", ...j });
+			append(root, { ts: L.now(), kind: "judge", goal: id, by: "judge", ...j });
 			const msg = `[climb JUDGE ${id}] ${j.verdict.toUpperCase()}: ${j.diagnosis}\nNEXT: ${j.next}`;
 			if (j.verdict === "stuck") ctx.ui?.notify?.(`climb ${id} is STUCK and needs you: ${j.diagnosis}`, "warning");
 			deliver(ctx, msg, j.verdict !== "stuck");
@@ -512,7 +547,7 @@ export default async function climb(pi: ExtensionAPI) {
 			const tracked = new Set((await git(root, "ls-files")).stdout.split("\n").filter(Boolean));
 			const frozen = [...new Set([...(p.frozen ?? []), ...[...metrics.map(m => m.cmd), p.guard ?? ""].flatMap(c => X.instrumentFiles(c, tracked))])];
 			const h = await head(root);
-			L.append(root, { ts: L.now(), kind: "card", goal: g.id, metrics, guard: p.guard, frozen, head: h, parked: p.parked, axioms: p.axioms });
+			append(root, { ts: L.now(), kind: "card", goal: g.id, metrics, guard: p.guard, frozen, head: h, parked: p.parked, axioms: p.axioms });
 			refresh(ctx, root);
 			const lines = metrics.map(
 				m => `- ${m.name} = ${m.baseline}${m.unit ? ` ${m.unit}` : ""} → target ${m.target} (${m.dir} is better, noise ±${(m.noise * 100).toFixed(1)}%)`,
@@ -563,7 +598,7 @@ export default async function climb(pi: ExtensionAPI) {
 			const control = await measure(root, g.card.metrics, signal);
 			if (control.errors.length) throw new Error(`Control measurement failed at ${base.slice(0, 8)}:\n${control.errors.join("\n")}`);
 			const id = `x${g.nextExp}`;
-			L.append(root, { ts: L.now(), kind: "exp", goal: g.id, id, lever: p.lever, hypothesis: p.hypothesis, prediction: p.prediction, base, ref: control.values });
+			append(root, { ts: L.now(), kind: "exp", goal: g.id, id, lever: p.lever, hypothesis: p.hypothesis, prediction: p.prediction, base, ref: control.values });
 			refresh(ctx, root);
 			const ref = Object.entries(control.values).map(([k, v]) => `${k}=${v}`).join(", ");
 			return ok(`Registered ${id} on ${g.id}. Control at ${base.slice(0, 8)}: ${ref}. Implement it and commit (any number of commits), then call climb_measure. Everything after ${base.slice(0, 8)} is this experiment; if it is dropped the extension reverts it.`);
@@ -611,13 +646,13 @@ export default async function climb(pi: ExtensionAPI) {
 				if (rv.sha) reverted = rv.sha;
 				else reason += ` — auto-revert failed (${rv.err}); restore by hand: git revert --no-commit ${exp.base.slice(0, 8)}..HEAD && git commit`;
 			}
-			L.append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: h, values, verdict: kept ? "kept" : "dropped", reason: reason!, reverted });
+			append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: h, values, verdict: kept ? "kept" : "dropped", reason: reason!, reverted });
 			let won = kept && g.card.metrics.every(m => L.met(m, values[m.name]));
 			if (won) {
 				// "Done" is never claimed from a single draw: confirm with fresh samples.
 				const c = await measure(root, g.card.metrics, signal, samples);
 				won = !c.errors.length && g.card.metrics.every(m => L.met(m, c.values[m.name]));
-				if (won) L.append(root, { ts: L.now(), kind: "done", goal: g.id, result: "achieved", values: c.values });
+				if (won) append(root, { ts: L.now(), kind: "done", goal: g.id, result: "achieved", values: c.values });
 			}
 			const st = refresh(ctx, root);
 			let text = kept ? `KEPT ${exp.id}: ${reason}.` : `DROPPED ${exp.id}: ${reason}.${reverted ? ` Reverted in ${reverted.slice(0, 8)}.` : ""}`;
@@ -652,7 +687,7 @@ export default async function climb(pi: ExtensionAPI) {
 			holder(root, ctx);
 			const g = pick(load(root), p.goal, x => x.stallPending || x.streak >= X.DROP_STREAK);
 			const escalate = p.verdict === "stuck" && typeof ctx.runEphemeralTurn === "function";
-			L.append(root, { ts: L.now(), kind: "judge", goal: g.id, by: "worker", verdict: escalate ? "pivot" : p.verdict, diagnosis: p.diagnosis, next: p.next });
+			append(root, { ts: L.now(), kind: "judge", goal: g.id, by: "worker", verdict: escalate ? "pivot" : p.verdict, diagnosis: p.diagnosis, next: p.next });
 			if (escalate) {
 				void judge(ctx, root, g.id);
 				return ok("Recorded. 'stuck' is decided by the independent judge, now reviewing; keep working meanwhile.");
@@ -714,12 +749,12 @@ export default async function climb(pi: ExtensionAPI) {
 				return;
 			}
 			if (words.length === 1 && (sub === "pause" || sub === "stop")) {
-				L.append(root, { ts: L.now(), kind: "pause", goal: "*" });
+				append(root, { ts: L.now(), kind: "pause", goal: "*" });
 				refresh(ctx, root);
 				return ctx.ui.notify("climb paused: no heartbeats, no stop-blocking. /climb resume to continue.", "info");
 			}
 			if (words.length === 1 && sub === "resume") {
-				L.append(root, { ts: L.now(), kind: "resume", goal: "*" });
+				append(root, { ts: L.now(), kind: "resume", goal: "*" });
 				lease(root, ctx, true);
 				ensureTimer(ctx);
 				const now = refresh(ctx, root);
@@ -730,7 +765,7 @@ export default async function climb(pi: ExtensionAPI) {
 				const g = one(words[1]);
 				if (!g) return;
 				const won = !!g.card && g.card.metrics.every(m => L.met(m, g.best[m.name]));
-				L.append(root, { ts: L.now(), kind: "done", goal: g.id, result: won ? "achieved" : "abandoned", values: g.best });
+				append(root, { ts: L.now(), kind: "done", goal: g.id, result: won ? "achieved" : "abandoned", values: g.best });
 				const now = refresh(ctx, root);
 				if (!L.active(now).length) stopTimer(ctx);
 				return ctx.ui.notify(`climb ${g.id} closed (${won ? "achieved" : "abandoned"}).`, "info");
@@ -763,8 +798,8 @@ export default async function climb(pi: ExtensionAPI) {
 			if (!(await head(root))) return ctx.ui.notify("climb needs at least one commit.", "error");
 			await ensureExcluded(root);
 			const id = X.slug(intent, new Set(st.goals.keys()));
-			L.append(root, { ts: L.now(), kind: "goal", goal: id, intent, cfg: { poke_max, beat_s } });
-			if (st.paused) L.append(root, { ts: L.now(), kind: "resume", goal: "*" });
+			append(root, { ts: L.now(), kind: "goal", goal: id, intent, cfg: { poke_max, beat_s } });
+			if (st.paused) append(root, { ts: L.now(), kind: "resume", goal: "*" });
 			lease(root, ctx, true);
 			ensureTimer(ctx);
 			const g = refresh(ctx, root).goals.get(id)!;

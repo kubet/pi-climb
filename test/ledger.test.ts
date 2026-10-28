@@ -48,6 +48,17 @@ describe("logic", () => {
 		expect(X.parseJudge("garbage").verdict).toBe("continue");
 	});
 
+	test("instrument detection freezes executed scripts, not the data being optimized", () => {
+		const t = new Set(["bench.py", "work.txt", "scripts/m.sh", "tests/a.py", "solve.py", "test_primes.py"]);
+		expect(X.instrumentFiles("python3 bench.py --n 3", t)).toEqual(["bench.py"]);
+		expect(X.instrumentFiles("env -u PYTHONOPTIMIZE python3 test_primes.py", t)).toEqual(["test_primes.py"]);
+		expect(X.instrumentFiles("./scripts/m.sh | tail -1", t)).toEqual(["scripts/m.sh"]);
+		expect(X.instrumentFiles("pytest -q tests/", t)).toEqual(["tests/"]);
+		expect(X.instrumentFiles("cat work.txt", t)).toEqual([]);
+		expect(X.instrumentFiles("wc -l < solve.py", t)).toEqual([]);
+		expect(X.instrumentFiles("test -s work.txt", t)).toEqual([]);
+	});
+
 	test("slug and durations", () => {
 		expect(X.slug("Make the API 2x faster!!", new Set())).toBe("g-make-the-api-2x");
 		expect(X.slug("x", new Set(["g-x"]))).toBe("g-x-2");

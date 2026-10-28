@@ -185,9 +185,10 @@ export function instrumentFiles(cmd: string, tracked: Set<string>): string[] {
 	const out = new Set<string>();
 	for (const seg of cmd.split(/&&|\|\||[;|\n]/)) {
 		const toks = seg.trim().split(/[\s"'`()]+/).filter(t => t && !/^\w+=/.test(t) && !["time", "env", "exec", "nice"].includes(t));
-		const run = toks.length > 0 && RUNNERS.test(toks[0]);
+		const runner = toks.findIndex(t => RUNNERS.test(t)); // `env -u X python3 t.py` still counts
 		for (const [i, tok] of toks.entries()) {
-			if (tok.startsWith("-") || (!run && !(i === 0 && tok.startsWith("./")))) continue;
+			const executed = (runner >= 0 && i > runner) || (i === 0 && tok.startsWith("./"));
+			if (tok.startsWith("-") || !executed) continue;
 			const t = tok.replace(/^\.\//, "").replace(/\/+$/, "");
 			if (tracked.has(t)) out.add(t);
 			else if ([...tracked].some(f => f.startsWith(`${t}/`))) out.add(`${t}/`);
@@ -202,6 +203,34 @@ export function borderline(metrics: Metric[], ref: Values, values: Values): bool
 		const g = Math.abs(gain(m, ref[m.name], values[m.name]));
 		return g > m.noise && g < 2 * m.noise;
 	});
+}
+
+/** One information-dense line per ledger event, for external trackers. */
+export function describe(e: Entry): string {
+	const g = `[climb ${e.goal}]`;
+	switch (e.kind) {
+		case "goal":
+			return `${g} started: "${e.intent}" (heartbeat ${Math.round(e.cfg.beat_s / 60)}m, judge after ${e.cfg.poke_max} stale beats)`;
+		case "card":
+			return `${g} scorecard: ${e.metrics.map(m => `${m.name} ${m.baseline}→${m.target}${m.unit ? ` ${m.unit}` : ""} (±${(m.noise * 100).toFixed(1)}%)`).join(", ")}`;
+		case "exp":
+			return `${g} ${e.id} registered: ${e.lever}, predicts ${e.prediction}`;
+		case "result":
+			return `${g} ${e.verdict.toUpperCase()} ${e.exp}: ${e.reason}`;
+		case "beat":
+			return `${g} heartbeat: ${e.progress ? "progress" : `no progress (stale ${e.stale})`}${e.note ? ` · ${e.note}` : ""}`;
+		case "stall":
+			return `${g} STALL after ${e.stale} heartbeats without progress; judge called`;
+		case "judge":
+			return `${g} judge (${e.by}): ${e.verdict.toUpperCase()} — ${e.diagnosis} → ${e.next}`;
+		case "done":
+			return `${g} DONE (${e.result}): ${Object.entries(e.values).map(([k, v]) => `${k}=${v}`).join(", ")}`;
+		case "pause":
+		case "resume":
+			return `[climb] ${e.kind}d`;
+		case "rollup":
+			return `${g} rolled up ${e.n} heartbeats`;
+	}
 }
 
 export function researchBrief(g: Goal): string {
