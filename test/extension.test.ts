@@ -874,7 +874,8 @@ describe("evidence and export", () => {
 		expect(win.baseline_commit).toMatch(/^[0-9a-f]{40}$/);
 		expect(loss).toMatchObject({ record_id: "g-shrink-work/x2", verdict: "dropped", qualification: { statistical_win: false } });
 		const page = fs.readFileSync(path.join(d, ".climb/panel.html"), "utf8");
-		expect(page).toContain("g-shrink-work/x1");
+		expect(page).toContain("x1 · halve");
+		expect(page).toContain("✓ kept");
 		expect(page).toContain("<svg class=\"spark\"");
 		expect(page).toContain("Where the time went");
 		await z.cmd(`export ${path.join(d, "out.json")}`);

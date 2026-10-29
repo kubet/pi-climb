@@ -666,7 +666,7 @@ export default async function climb(pi: ExtensionAPI) {
 		// The same evidence, readable: .climb/panel.html (open it in a browser).
 		try {
 			const page = path.join(root, L.DIR, "panel.html");
-			fs.writeFileSync(`${page}.${process.pid}.tmp`, P.render(load(root), out, efficiency(root)));
+			fs.writeFileSync(`${page}.${process.pid}.tmp`, P.render(load(root), out, T.summary(T.read(root), L.read(root), L.clock.ms()), L.clock.ms()));
 			fs.renameSync(`${page}.${process.pid}.tmp`, page);
 		} catch (e) {
 			pi.logger?.warn?.("climb panel failed", { error: String(e) });

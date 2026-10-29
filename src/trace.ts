@@ -158,72 +158,89 @@ const medianOf = (xs: number[]) => {
 
 /** Where the climb's time went over the last `windowMs`: tool time, waste, flaky
  *  instruments, cache savings, throughput. Short enough for a judge prompt. */
-export function stats(traces: Trace[], ledger: Entry[], nowMs: number, windowMs = 86_400_000): string {
+/** Where a climb's time went over the last `windowMs`, as numbers: the text summary and the panel both read it. */
+export function summary(traces: Trace[], ledger: Entry[], nowMs: number, windowMs = 86_400_000) {
 	const since = nowMs - windowMs;
 	const t = traces.filter(x => epoch(x.ts) >= since);
 	const tools = t.filter((x): x is ToolT => x.kind === "tool");
 	const runs = t.filter((x): x is RunT => x.kind === "run");
 	const reuse = t.filter((x): x is ReuseT => x.kind === "reuse");
 	const judges = t.filter((x): x is JudgeT => x.kind === "judge");
-	if (!tools.length && !runs.length) return "";
-	const out: string[] = [`efficiency, traced over the last ${dur(Math.min(windowMs, nowMs - Math.min(...t.map(x => epoch(x.ts)))))}:`];
-
 	const byTool = new Map<string, number>();
-	for (const x of tools) byTool.set(x.tool, (byTool.get(x.tool) ?? 0) + x.ms);
-	const total = sum(tools.map(x => x.ms));
-	out.push(`- climb tools ${dur(total)}: ${[...byTool].filter(([, v]) => v >= 1000).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k.replace("climb_", "")} ${dur(v)}`).join(", ")}`);
-
+	for (const x of tools) byTool.set(x.tool.replace("climb_", ""), (byTool.get(x.tool.replace("climb_", "")) ?? 0) + x.ms);
 	const failed = tools.filter(x => !x.ok);
-	if (failed.length) {
-		const why = new Map<string, { n: number; ms: number }>();
-		for (const x of failed) {
-			const k = `${x.tool.replace("climb_", "")}: ${refusal(x.error ?? "")}`;
-			const w = why.get(k) ?? { n: 0, ms: 0 };
-			w.n++;
-			w.ms += x.ms;
-			why.set(k, w);
-		}
-		const parts = [...why].sort((a, b) => b[1].ms - a[1].ms).map(([k, w]) => `${k} ×${w.n} (${dur(w.ms)})`);
-		out.push(`- wasted ${dur(sum(failed.map(x => x.ms)))} in ${failed.length} refused/failed calls: ${parts.slice(0, 5).join("; ")}`);
+	const why = new Map<string, { n: number; ms: number }>();
+	for (const x of failed) {
+		const k = `${x.tool.replace("climb_", "")}: ${refusal(x.error ?? "")}`;
+		const w = why.get(k) ?? { n: 0, ms: 0 };
+		w.n++;
+		w.ms += x.ms;
+		why.set(k, w);
 	}
-
 	const metered = runs.filter(x => x.metric);
-	if (metered.length) {
-		const bad = metered.filter(x => x.code !== 0);
-		const retried = metered.filter(x => x.retry);
-		const per = new Map<string, { n: number; bad: number; ms: number[] }>();
-		for (const x of metered) {
-			const p = per.get(x.metric!) ?? { n: 0, bad: 0, ms: [] };
-			p.n++;
-			if (x.code !== 0) p.bad++;
-			else p.ms.push(x.ms);
-			per.set(x.metric!, p);
-		}
-		const flaky = [...per].filter(([, p]) => p.bad).sort((a, b) => b[1].bad / b[1].n - a[1].bad / a[1].n);
-		const slow = [...per].sort((a, b) => medianOf(b[1].ms) - medianOf(a[1].ms)).slice(0, 3);
-		const saved = sum(reuse.map(r => r.runs * medianOf(per.get(r.metric)?.ms ?? [0])));
-		out.push(
-			`- runs ${metered.length} (${dur(sum(metered.map(x => x.ms)))}): ${bad.length} failed${retried.length ? `, ${retried.filter(x => x.code === 0).length}/${retried.length} retries recovered` : ""}${flaky.length ? ` · flaky: ${flaky.slice(0, 3).map(([k, p]) => `${k} ${p.bad}/${p.n}`).join(", ")}` : ""} · per run: ${slow.map(([k, p]) => `${k} ${dur(medianOf(p.ms))}`).join(", ")}${reuse.length ? ` · reuse saved ~${dur(saved)} (${sum(reuse.map(r => r.runs))} runs)` : ""}`,
-		);
+	const per = new Map<string, { n: number; bad: number; ms: number[] }>();
+	for (const x of metered) {
+		const p = per.get(x.metric!) ?? { n: 0, bad: 0, ms: [] };
+		p.n++;
+		if (x.code !== 0) p.bad++;
+		else p.ms.push(x.ms);
+		per.set(x.metric!, p);
 	}
-
-	// The guard runs once per decided candidate: on a fast metric it is most of an experiment's cost.
+	const retried = metered.filter(x => x.retry);
 	const guards = runs.filter(x => x.phase === "guard");
-	if (guards.length)
-		out.push(`- guard ${guards.length}× (median ${dur(medianOf(guards.map(x => x.ms)))}, ${guards.filter(x => x.code !== 0).length} failed); guard passes on a tree are reused for 30 minutes`);
-
 	const results = ledger.filter((e): e is ResultE => e.kind === "result" && epoch(e.ts) >= since);
-	if (results.length) {
-		const exps = new Map(ledger.filter((e): e is ExpE => e.kind === "exp").map(e => [`${e.goal}|${e.id}`, e]));
-		const cycles = results.map(r => exps.get(`${r.goal}|${r.exp}`)).map((e, i) => (e ? epoch(results[i].ts) - epoch(e.ts) : 0)).filter(Boolean);
-		const kept = results.filter(r => r.verdict === "kept");
-		const hours = Math.max(1 / 60, (nowMs - Math.max(since, Math.min(...t.map(x => epoch(x.ts)), ...results.map(r => epoch(r.ts))))) / 3_600_000);
-		const abandoned = results.filter(r => r.reason.startsWith("abandoned:")).length;
+	const exps = new Map(ledger.filter((e): e is ExpE => e.kind === "exp").map(e => [`${e.goal}|${e.id}`, e]));
+	const cycles = results.map(r => exps.get(`${r.goal}|${r.exp}`)).map((e, i) => (e ? epoch(results[i].ts) - epoch(e.ts) : 0)).filter(Boolean);
+	const firstResult = results.length ? Math.max(since, Math.min(...results.map(r => epoch(r.ts)))) : nowMs;
+	const hours = Math.max(1 / 60, (nowMs - Math.max(since, Math.min(nowMs, ...t.map(x => epoch(x.ts)), firstResult))) / 3_600_000);
+	return {
+		traced: t.length > 0,
+		tracedMs: t.length ? Math.min(windowMs, nowMs - Math.min(...t.map(x => epoch(x.ts)))) : 0,
+		toolMs: sum(tools.map(x => x.ms)),
+		byTool: [...byTool].filter(([, v]) => v >= 1000).sort((a, b) => b[1] - a[1]),
+		wastedMs: sum(failed.map(x => x.ms)),
+		wasted: [...why].map(([what, w]) => ({ what, ...w })).sort((a, b) => b.ms - a.ms),
+		refused: failed.length,
+		runs: metered.length,
+		runMs: sum(metered.map(x => x.ms)),
+		failedRuns: metered.filter(x => x.code !== 0).length,
+		retries: retried.length,
+		recovered: retried.filter(x => x.code === 0).length,
+		flaky: [...per].filter(([, p]) => p.bad).map(([metric, p]) => ({ metric, bad: p.bad, n: p.n })).sort((a, b) => b.bad / b.n - a.bad / a.n),
+		perRun: [...per].map(([metric, p]) => ({ metric, ms: medianOf(p.ms) })).sort((a, b) => b.ms - a.ms),
+		reusedRuns: sum(reuse.map(r => r.runs)),
+		savedMs: sum(reuse.map(r => r.runs * medianOf(per.get(r.metric)?.ms ?? [0]))),
+		guard: { n: guards.length, failed: guards.filter(x => x.code !== 0).length, medianMs: medianOf(guards.map(x => x.ms)) },
+		experiments: {
+			n: results.length,
+			kept: results.filter(r => r.verdict === "kept").length,
+			byProof: results.filter(r => r.proof).length,
+			abandoned: results.filter(r => r.reason.startsWith("abandoned:")).length,
+			perHour: results.length / hours,
+			medianCycleMs: medianOf(cycles),
+			windowMs: nowMs - firstResult,
+		},
+		judge: { n: judges.length, failed: judges.filter(j => !j.ok).length, medianMs: medianOf(judges.map(j => j.ms)) },
+	};
+}
+
+/** The same, as a few lines of text: for /climb, climb_status and the judge's prompt. */
+export function stats(traces: Trace[], ledger: Entry[], nowMs: number, windowMs = 86_400_000): string {
+	const s = summary(traces, ledger, nowMs, windowMs);
+	if (!s.traced) return "";
+	const out = [`efficiency, traced over the last ${dur(s.tracedMs)}:`];
+	out.push(`- climb tools ${dur(s.toolMs)}: ${s.byTool.map(([k, v]) => `${k} ${dur(v)}`).join(", ")}`);
+	if (s.refused) out.push(`- wasted ${dur(s.wastedMs)} in ${s.refused} refused/failed calls: ${s.wasted.slice(0, 5).map(w => `${w.what} ×${w.n} (${dur(w.ms)})`).join("; ")}`);
+	if (s.runs)
 		out.push(
-			`- experiments decided in the last ${dur(nowMs - Math.max(since, Math.min(...results.map(r => epoch(r.ts)))))}: ${results.length} (${(results.length / hours).toFixed(1)}/h, median ${dur(medianOf(cycles))} from registration to verdict): ${kept.length} kept${kept.some(r => r.proof) ? ` (${kept.filter(r => r.proof).length} by proof)` : ""}, ${results.length - kept.length} dropped${abandoned ? ` (${abandoned} abandoned unmeasured)` : ""}`,
+			`- runs ${s.runs} (${dur(s.runMs)}): ${s.failedRuns} failed${s.retries ? `, ${s.recovered}/${s.retries} retries recovered` : ""}${s.flaky.length ? ` · flaky: ${s.flaky.slice(0, 3).map(f => `${f.metric} ${f.bad}/${f.n}`).join(", ")}` : ""} · per run: ${s.perRun.slice(0, 3).map(p => `${p.metric} ${dur(p.ms)}`).join(", ")}${s.reusedRuns ? ` · reuse saved ~${dur(s.savedMs)} (${s.reusedRuns} runs)` : ""}`,
 		);
-	}
-	if (judges.length)
-		out.push(`- judge ${judges.length}× (median ${dur(medianOf(judges.map(j => j.ms)))})${judges.some(j => !j.ok) ? `, ${judges.filter(j => !j.ok).length} failed` : ""}`);
+	if (s.guard.n) out.push(`- guard ${s.guard.n}× (median ${dur(s.guard.medianMs)}, ${s.guard.failed} failed); guard passes on a tree are reused for 30 minutes`);
+	const e = s.experiments;
+	if (e.n)
+		out.push(
+			`- experiments decided in the last ${dur(e.windowMs)}: ${e.n} (${e.perHour.toFixed(1)}/h, median ${dur(e.medianCycleMs)} from registration to verdict): ${e.kept} kept${e.byProof ? ` (${e.byProof} by proof)` : ""}, ${e.n - e.kept} dropped${e.abandoned ? ` (${e.abandoned} abandoned unmeasured)` : ""}`,
+		);
+	if (s.judge.n) out.push(`- judge ${s.judge.n}× (median ${dur(s.judge.medianMs)})${s.judge.failed ? `, ${s.judge.failed} failed` : ""}`);
 	return out.join("\n");
 }
