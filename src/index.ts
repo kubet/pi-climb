@@ -1109,7 +1109,13 @@ export default async function climb(pi: ExtensionAPI) {
 				const way = L.gain(m, m.baseline, m.target);
 				const s = X.samplesFor(xs, m.baseline, way / 3) ?? X.samplesFor(xs, m.baseline, way);
 				const cost = s ? price(m, s) : "";
-				const fix = `${s && s > m.samples ? `Samples: ${s} brings it to ${pct(X.noiseOf(xs, m.baseline, s))}${cost ? ` (${cost})` : ""}` : "More samples will not fix it"}; or steady the command (fixed inputs, warm-up, no sentinel penalties).`;
+				// The worst value repeating exactly while the rest vary looks like a cap, or a penalty for a failed case:
+				// medians of more runs only mix the two populations.
+				const worst = m.dir === "down" ? Math.max(...xs) : Math.min(...xs);
+				const capped = xs.filter(x => x === worst).length >= 2 && xs.some(x => Math.abs(x - worst) > Math.abs(worst) * 0.3);
+				const fix = capped
+					? `${worst} repeats exactly as the worst value: if it is a cap or a penalty for a failed case, more samples will not steady it. Count those failures in a metric of their own (target 0) and measure the rest without the penalty.`
+					: `${s && s > m.samples ? `Samples: ${s} brings it to ${pct(X.noiseOf(xs, m.baseline, s))}${cost ? ` (${cost})` : ""}` : "More samples will not fix it"}; or steady the command (fixed inputs, warm-up, no sentinel penalties).`;
 				if (m.noise >= way)
 					return { problem: `${m.name}: noise ${pct(m.noise)} (${aa}) is as large as the whole way to the target (${pct(way)}), so no result could be told apart from luck. ${fix}` };
 				if (m.noise > way / 3) return { warning: `${m.name}: each kept step must beat ${pct(m.noise)}, ${Math.round((m.noise / way) * 100)}% of the way to target (${aa}). ${fix}` };

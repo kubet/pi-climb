@@ -623,6 +623,14 @@ describe("lessons from a live run", () => {
 		expect(await z.tool("climb_measure", {})).toContain("no metric beat noise");
 	});
 
+	test("a worst value that repeats exactly (a cap or penalty) is named instead of advising more samples", async () => {
+		const cmd = "n=$(cat .git/capn 2>/dev/null || echo 0); echo $((n+1)) > .git/capn; [ $n -eq 2 ] && echo 28252.5 || echo 75000";
+		const err = z.tool("climb_scorecard", { metrics: [{ name: "p90", cmd, dir: "down", target: 1500, noise: 0.1 }] });
+		await expect(err).rejects.toThrow("75000 repeats exactly as the worst value");
+		await expect(err).rejects.not.toThrow("Samples:");
+		await run("rm -f .git/capn");
+	});
+
 	test("instrument outside the repo is flagged", async () => {
 		const ext = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "climb-ext-")), "bench.sh");
 		fs.writeFileSync(ext, "echo 100\n");
