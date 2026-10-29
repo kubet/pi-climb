@@ -46,6 +46,8 @@ export const ENVS = /(^|\/)(\.venv|venv|\.tox|\.nox|\.direnv)(\/|$)/;
 
 /** A linked folder (or its first level, scoped packages included) holding a symlink into the repo's own
  *  tracked code, like a workspace package in node_modules, would run the candidate's code on the base side. */
+// The links' real paths, resolved once per list: checking each of n links against all n is otherwise n² realpaths.
+const sharedOf = new WeakMap<string[], string[]>();
 export function leaksIntoRepo(root: string, rel: string, linked: string[]): boolean {
 	const real = (p: string) => {
 		try {
@@ -55,10 +57,11 @@ export function leaksIntoRepo(root: string, rel: string, linked: string[]): bool
 		}
 	};
 	const top = real(root);
-	const shared = linked.map(l => real(path.join(root, l)));
+	let shared = sharedOf.get(linked);
+	if (!shared) sharedOf.set(linked, (shared = linked.map(l => real(path.join(root, l)))));
 	const leaks = (p: string) => {
 		const r = real(p);
-		return r.startsWith(top + path.sep) && !shared.some(x => r === x || r.startsWith(x + path.sep));
+		return r.startsWith(top + path.sep) && !shared!.some(x => r === x || r.startsWith(x + path.sep));
 	};
 	const src = path.join(root, rel);
 	const isLink = (p: string) => {
