@@ -1009,28 +1009,34 @@ export default async function climb(pi: ExtensionAPI) {
 					throw new Error("Name the check's file in the proof (e.g. 'bun test test/x.test.ts' or 'pytest tests/t.py::case') so it can be frozen; a runner that discovers its own tests freezes nothing.");
 				proof = { cmd: p.proof, files: await hashes(root, scripts) };
 			}
-			const control = await measureTree(root, g.card.metrics, m => m.samples, { phase: "control", goal: g.id }, signal, say);
-			if (control.errors.length) throw new Error(`Control measurement failed at ${base.slice(0, 8)}:\n${control.errors.join("\n")}`);
 			// Commits made outside an experiment (a .gitignore, a failed revert) are adopted
 			// only if they pass the guard and regress nothing against the last measured baseline:
-			// they must never quietly lower the bar.
-			let adopted = "";
+			// they must never quietly lower the bar. The guard runs first: it is the cheap refusal.
+			let unmeasured: string | undefined;
 			if (g.baseRef) {
 				const [want, have] = await Promise.all([tree(root, g.baseRef), tree(root)]);
 				if (want && want !== have) {
-					const short = g.baseRef.slice(0, 8);
+					unmeasured = g.baseRef.slice(0, 8);
 					// A committed failing test that is this experiment's proof is meant to break the guard.
 					const changed = (await git(root, "diff", "--name-only", `${g.baseRef}..HEAD`)).stdout.split("\n").filter(Boolean);
 					const onlyProof = !!proof && changed.length > 0 && changed.every(f => f in proof!.files);
 					const gerr = onlyProof ? undefined : await guard(root, g.card.guard, g.id, signal);
-					if (gerr) throw new Error(`Commits since the last measured baseline ${short} break the guard: ${gerr}. Fix or revert them before experimenting.`);
-					const worse = g.baseValues ? X.regressions(g.card.metrics, g.baseValues, control.values) : [];
-					if (worse.length)
+					if (gerr)
 						throw new Error(
-							`Commits since the last measured baseline ${short} regressed ${worse.map(m => `${m.name} ${g.baseValues![m.name]}→${control.values[m.name]}`).join(", ")}. Revert them (git revert) or register them as an experiment; unmeasured regressions cannot lower the bar.`,
+							`Commits since the last measured baseline ${unmeasured} break the guard: ${gerr}. Fix or revert them before experimenting${proof ? "" : "; if a failing test there is this experiment's check, pass it as proof"}.`,
 						);
-					adopted = ` Adopted commits since ${short}: guard passes, no regression.`;
 				}
+			}
+			const control = await measureTree(root, g.card.metrics, m => m.samples, { phase: "control", goal: g.id }, signal, say);
+			if (control.errors.length) throw new Error(`Control measurement failed at ${base.slice(0, 8)}:\n${control.errors.join("\n")}`);
+			let adopted = "";
+			if (unmeasured) {
+				const worse = g.baseValues ? X.regressions(g.card.metrics, g.baseValues, control.values) : [];
+				if (worse.length)
+					throw new Error(
+						`Commits since the last measured baseline ${unmeasured} regressed ${worse.map(m => `${m.name} ${g.baseValues![m.name]}→${control.values[m.name]}`).join(", ")}. Revert them (git revert) or register them as an experiment; unmeasured regressions cannot lower the bar. If another part's kept change caused it, that is a trade-off between parts: re-baseline this part with climb_scorecard to accept it.`,
+					);
+				adopted = ` Adopted commits since ${unmeasured}: guard passes, no regression.`;
 			}
 			const id = `x${g.nextExp}`;
 			append(root, { ts: L.now(), kind: "exp", goal: g.id, id, lever: p.lever, hypothesis: p.hypothesis, prediction: p.prediction, base, ref: control.values, proof, runs: control.samples, env: ENV.hash });

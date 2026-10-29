@@ -715,6 +715,15 @@ describe("review findings", () => {
 		expect(await z.tool("climb_measure", {})).toContain("KEPT x1 by proof");
 	});
 
+	test("commits that break the guard are refused before any control is measured", async () => {
+		const runs = () => T.read(d).filter(t => t.kind === "run" && t.phase === "control").length;
+		const before = runs();
+		await run("printf 'exit 1\\n' > checks/broken.sh && git add checks && git commit -qm 'broken check'");
+		await expect(z.tool("climb_experiment", { lever: "anything", hypothesis: "", prediction: "" })).rejects.toThrow("pass it as proof");
+		expect(runs()).toBe(before);
+		await run("git rm -q checks/broken.sh && git commit -qm 'drop broken check'");
+	});
+
 	test("a proof that cannot run at measure decides nothing", async () => {
 		// Outside checks/, so the guard suite does not run it.
 		await run("mkdir -p extra && printf 'test -f fixed2.txt || exit 1\\nmissing-tool-xyz\\n' > extra/two.sh");
