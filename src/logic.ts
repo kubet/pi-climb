@@ -246,9 +246,11 @@ function section(st: State, g: Goal, nowMs: number): string[] {
 		);
 		const levers = [...g.levers.entries()].map(([k, l]) => `${k} ${l.kept}/${l.tried}`);
 		if (levers.length) out.push(`  levers (kept/tried): ${levers.join(", ")}`);
-		out.push(`  last progress ${ago(g.lastProgress, nowMs)} · stale ${g.lastBeat?.stale ?? 0}/${g.cfg.poke_max} · beat every ${Math.round(g.cfg.beat_s / 60)}m, last ${ago(g.lastBeat?.ts, nowMs)}`);
+		// Parts share their root's heartbeat; only a root has one of its own.
+		out.push(`  last progress ${ago(g.lastProgress, nowMs)}${g.parent ? "" : ` · stale ${g.lastBeat?.stale ?? 0}/${g.cfg.poke_max} · beat every ${Math.round(g.cfg.beat_s / 60)}m, last ${ago(g.lastBeat?.ts, nowMs)}`}`);
 		const d = g.diagnosis;
-		if (d) out.push(`  last diagnosis (${d.by}, ${ago(d.ts, nowMs)}): ${d.verdict} — ${d.diagnosis} → ${d.next}`);
+		if (g.reviewed && !g.done) out.push(`  held by the acceptance review (${ago(g.reviewed.ts, nowMs)}): ${g.reviewed.diagnosis} → ${g.reviewed.next}`);
+		if (d && d !== g.reviewed) out.push(`  last diagnosis (${d.by}, ${ago(d.ts, nowMs)}): ${d.verdict} — ${d.diagnosis} → ${d.next}`);
 		if (g.card.parked?.length) out.push(`  parked: ${g.card.parked.join(", ")}`);
 	}
 	return out;
