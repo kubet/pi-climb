@@ -10,7 +10,7 @@ const CAP = 20_000;
 
 /** What a run measured: a scorecard's smoke/A/A runs, an experiment's control, its result
  *  (plus a borderline re-check and the confirmation of "achieved"), the guard, a proof, a probe. */
-export type Phase = "smoke" | "aa" | "control" | "result" | "recheck" | "confirm" | "guard" | "proof" | "probe";
+export type Phase = "smoke" | "aa" | "control" | "result" | "recheck" | "paired" | "confirm" | "guard" | "proof" | "probe";
 
 interface Base {
 	ts: string;

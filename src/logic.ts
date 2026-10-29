@@ -78,6 +78,29 @@ export function noiseOf(xs: number[], baseline: number, samples: number): number
 /** Decision noise from a relative per-run standard deviation (a median is ~1.25x noisier than a mean). */
 export const noiseFromSd = (sdRel: number, samples: number) => 2 * Math.SQRT2 * ((samples >= 3 ? 1.2533 : 1) / Math.sqrt(samples)) * sdRel;
 
+/** Control and candidate measured back to back (A B, B A, ...) cancel drift: decide on the median paired
+ *  gain, with noise from the spread of the pairs themselves (floor 1%). */
+export function pairedVerdict(metrics: Metric[], pairs: Record<string, [number, number][]>) {
+	const stats: Record<string, { gain: number; noise: number; n: number }> = {};
+	for (const m of metrics) {
+		const ps = pairs[m.name] ?? [];
+		if (!ps.length) continue;
+		const gains = ps.map(([a, b]) => gain(m, a, b));
+		const n = gains.length;
+		const mean = gains.reduce((s, x) => s + x, 0) / n;
+		const sd = n > 1 ? Math.sqrt(gains.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1)) : 0;
+		stats[m.name] = { gain: median(gains), noise: Math.max(0.01, (2 * 1.2533 * sd) / Math.sqrt(n)), n };
+	}
+	const fmt = (k: string) => `${k} ${stats[k].gain >= 0 ? "+" : ""}${(stats[k].gain * 100).toFixed(1)}% ±${(stats[k].noise * 100).toFixed(1)}%`;
+	const names = Object.keys(stats);
+	const regressed = names.filter(k => stats[k].gain < -stats[k].noise);
+	const improved = metrics.filter(m => !m.hold && stats[m.name] && stats[m.name].gain > stats[m.name].noise).map(m => m.name);
+	const head = `paired with the base, interleaved (${Math.max(...names.map(k => stats[k].n))} pairs)`;
+	if (regressed.length) return { kept: false, regressed: true, reason: `regressed, ${head}: ${regressed.map(fmt).join(", ")}`, stats };
+	if (!improved.length) return { kept: false, regressed: false, reason: `no metric beat noise, ${head}: ${names.map(fmt).join(", ")}`, stats };
+	return { kept: true, regressed: false, reason: `${head}: ${improved.map(fmt).join(", ")}`, stats };
+}
+
 /** Fewest samples (≤ 9) that bring a metric's noise under `need`. */
 export function samplesFor(xs: number[], baseline: number, need: number): number | undefined {
 	for (let s = 1; s <= 9; s++) if (noiseOf(xs, baseline, s) < need) return s;

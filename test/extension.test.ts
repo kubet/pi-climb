@@ -952,3 +952,38 @@ describe("drift", () => {
 		}
 	});
 });
+
+// The fix benchmaxx's exam uses: rate control and candidate in interleaved blocks (A B, B A) so drift cancels.
+describe("paired measurement", () => {
+	test("interleaving the base and the candidate cancels drift: no false regression, and a real gain survives", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-paired-"));
+		const ctr = path.join(os.tmpdir(), `climb-paired-ctr-${process.pid}`);
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		// Every run reads 10 higher than the one before: the machine keeps getting slower.
+		const cmd = `n=$(cat ${ctr} 2>/dev/null || echo 0); echo $((n+1)) > ${ctr}; echo $(( $(cat work.txt) + n * 10 ))`;
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo x > README.md && git add -A && git commit -qm init");
+			const z = host(d, "main", "paired");
+			await z.load();
+			await z.cmd("faster");
+			await z.tool("climb_scorecard", { metrics: [{ name: "ms", cmd, dir: "down", target: 10, noise: 0.05, samples: 3 }] });
+			await z.tool("climb_experiment", { lever: "noop", hypothesis: "", prediction: "" });
+			await run("echo y >> README.md && git commit -qam noop");
+			const noop = await z.tool("climb_measure", {});
+			expect(noop).toContain("paired with the base, interleaved");
+			expect(noop).not.toContain("regressed");
+			await z.tool("climb_experiment", { lever: "halve", hypothesis: "", prediction: "" });
+			await run("echo 50 > work.txt && git commit -qam halve");
+			const halve = await z.tool("climb_measure", {});
+			expect(halve).toContain("KEPT x2");
+			expect(halve).toContain("paired with the base");
+			const result = L.read(d).filter(e => e.kind === "result").at(-1) as L.ResultE;
+			expect(Object.values(result.paired ?? {})[0]?.length).toBeGreaterThanOrEqual(2);
+			expect(fs.readdirSync(os.tmpdir()).some(f => f.startsWith("climb-base-"))).toBe(false); // worktrees cleaned up
+			expect((await run("git worktree list")).stdout.trim().split("\n")).toHaveLength(1);
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+			fs.rmSync(ctr, { force: true });
+		}
+	});
+});

@@ -84,6 +84,8 @@ export interface ResultE extends Base {
 	proof?: boolean;
 	/** The candidate's raw runs per metric (values holds their medians). */
 	runs?: Record<string, number[]>;
+	/** When decided on interleaved base/candidate pairs: [base, candidate] per pair, per metric. */
+	paired?: Record<string, [number, number][]>;
 	gates?: Gates;
 	/** Env hash at measurement. */
 	env?: string;

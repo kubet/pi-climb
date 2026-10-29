@@ -7,6 +7,11 @@ import { type CardE, type Entry, type ExpE, type ResultE, gain } from "./ledger"
 
 export const SCHEMA = "climb.export/1";
 
+const medianOf = (xs: number[]) => {
+	const s = [...xs].sort((a, b) => a - b);
+	return s.length % 2 ? s[s.length >> 1] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
+};
+
 export interface Row {
 	record_id: string;
 	metric_id: string;
@@ -23,6 +28,9 @@ export interface Row {
 	raw_after: number[] | null;
 	reference_samples: number;
 	candidate_samples: number;
+	/** Interleaved base/candidate pairs, when the decision was paired: candidate/base per pair, median. */
+	median_paired_ratio: number | null;
+	complete_pairs: number | null;
 	baseline_commit: string;
 	candidate_commit: string;
 	noise: number;
@@ -90,7 +98,12 @@ function row(r: ResultE, exp: ExpE, card: CardE, m: CardE["metrics"][number], li
 	const before = exp.ref[m.name];
 	const after = r.values[m.name];
 	const g = before !== undefined && after !== undefined ? gain(m, before, after) : 0;
-	const limits = [`single machine A/B on ${card.env?.host ?? "an unrecorded host"}; control measured at registration, candidate after its commit`];
+	const pairs = r.paired?.[m.name];
+	const limits = [
+		pairs?.length
+			? `single machine; decided on ${pairs.length} interleaved base/candidate pairs on ${card.env?.host ?? "an unrecorded host"}`
+			: `single machine A/B on ${card.env?.host ?? "an unrecorded host"}; control measured at registration, candidate after its commit`,
+	];
 	if (m.hold) limits.push("constraint metric: guards against regressions, never a gain");
 	if (r.gates?.instrument === "changed") limits.push("instrument changed during the experiment: not comparable");
 	if (exp.env && r.env && exp.env !== r.env) limits.push("environment changed between control and candidate");
@@ -112,6 +125,8 @@ function row(r: ResultE, exp: ExpE, card: CardE, m: CardE["metrics"][number], li
 		raw_after: r.runs?.[m.name] ?? null,
 		reference_samples: exp.runs?.[m.name]?.length ?? m.samples,
 		candidate_samples: r.runs?.[m.name]?.length ?? (after === undefined ? 0 : m.samples),
+		median_paired_ratio: pairs?.length ? medianOf(pairs.map(([a, b]) => b / (a || 1))) : null,
+		complete_pairs: pairs?.length ?? null,
 		baseline_commit: exp.base,
 		candidate_commit: r.head,
 		noise: m.noise,

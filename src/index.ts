@@ -251,6 +251,69 @@ export default async function climb(pi: ExtensionAPI) {
 			ctx.ui?.setStatus?.("climb", `⛰ ${what}: ${text}`);
 		};
 
+	/** Runs fn in a throwaway worktree of `sha`, outside the repo (benchmarks that scan the repo must not
+	 *  find it), with every untracked and ignored path of the repo linked in: dependencies, env files and
+	 *  data are not in the commit. Undefined when the worktree cannot be made. */
+	async function withBase<R>(root: string, sha: string, fn: (dir: string) => Promise<R>): Promise<R | undefined> {
+		const holder = fs.mkdtempSync(path.join(os.tmpdir(), "climb-base-"));
+		const dir = path.join(holder, "tree");
+		const links: string[] = [];
+		try {
+			const add = await git(root, "worktree", "add", "--detach", "--force", dir, sha);
+			if (add.code !== 0) return undefined;
+			const listed = await Promise.all([
+				git(root, "ls-files", "--others", "--exclude-standard", "--directory"),
+				git(root, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"),
+			]);
+			const extra = new Set(listed.flatMap(r => r.stdout.split("\n")).map(l => l.replace(/\/+$/, "")).filter(l => l && l !== L.DIR && !l.startsWith(`${L.DIR}/`)));
+			for (const rel of extra) {
+				const target = path.join(dir, rel);
+				if (fs.existsSync(target)) continue;
+				fs.mkdirSync(path.dirname(target), { recursive: true });
+				fs.symlinkSync(path.join(root, rel), target);
+				links.push(target);
+			}
+			return await fn(dir);
+		} finally {
+			for (const l of links) fs.rmSync(l, { force: true }); // unlink first: removal must never reach into the repo
+			await git(root, "worktree", "remove", "--force", dir);
+			await git(root, "worktree", "prune");
+			fs.rmSync(holder, { recursive: true, force: true });
+		}
+	}
+
+	/** Base and candidate measured interleaved (A B, B A, ...): drift between the two sides cancels.
+	 *  Undefined if the base cannot be checked out or a run fails (the caller falls back). */
+	async function paired(root: string, base: string, metrics: L.Metric[], goal: string, signal?: AbortSignal, progress?: Progress) {
+		const [baseTree, candTree] = await Promise.all([tree(root, base), tree(root)]);
+		try {
+			return await withBase(root, base, async dir => {
+				const out: Record<string, [number, number][]> = {};
+				for (const m of metrics) {
+					const n = Math.max(2, Math.min(4, m.samples + 1));
+					const ps: [number, number][] = [];
+					for (let i = 0; i < n; i++) {
+						const v: { a?: number; b?: number } = {};
+						for (const side of i % 2 ? (["b", "a"] as const) : (["a", "b"] as const)) {
+							progress?.(`${m.name} pair ${i + 1}/${n}, ${side === "a" ? "base" : "candidate"}`);
+							const r = await run(side === "a" ? dir : root, m.cmd, m.timeout_s * 1000, { phase: "paired", goal, metric: m.name, tree: side === "a" ? baseTree : candTree }, signal);
+							if (signal?.aborted) throw new Error("Measurement interrupted; nothing was decided and the experiment stays open.");
+							const x = r.code === 0 ? X.parseNumber(r.stdout) : undefined;
+							if (x === undefined || !Number.isFinite(x)) return undefined;
+							v[side] = x;
+						}
+						ps.push([v.a!, v.b!]);
+					}
+					out[m.name] = ps;
+				}
+				return out;
+			});
+		} finally {
+			await restore(root);
+			progress?.("");
+		}
+	}
+
 	// A proof is a fast deterministic check: it fails at the base and passes once the change works.
 	const PROOF_MS = 120_000;
 	async function proofRuns(root: string, cmd: string, goal: string, signal?: AbortSignal): Promise<{ passed: number; out: string; broken?: string }> {
@@ -1084,12 +1147,22 @@ export default async function climb(pi: ExtensionAPI) {
 				const since = cardSince(root, g);
 				const reference = Object.fromEntries(g.card.metrics.map(m => [m.name, T.treeMedian(traces, g.id, m.name, baseTree, since) ?? g.baseValues?.[m.name]])) as L.Values;
 				const lenient = effective(root, g, traces).metrics.map(m => ({ ...m, noise: 2 * m.noise }));
-				const worse = X.regressions(lenient, reference, control.values);
+				let worse = X.regressions(lenient, reference, control.values);
+				// Before refusing, measure the baseline and HEAD interleaved: drift between then and now cancels.
+				let checked = "";
+				if (worse.length) {
+					const pairs = await paired(root, g.baseRef!, worse, g.id, signal, t => say(t && `paired check of the commits since ${unmeasured}: ${t}`));
+					if (pairs) {
+						const pv = X.pairedVerdict(worse, pairs);
+						worse = worse.filter(m => pv.stats[m.name] && pv.stats[m.name].gain < -pv.stats[m.name].noise);
+						checked = ` A paired check (base and HEAD interleaved) found ${worse.length ? "a real regression" : "drift, not a regression"}: ${pv.reason.replace(/^[^:]*: /, "")}.`;
+					}
+				}
 				if (worse.length)
-					throw new Error(
+					throw new Error(`${checked ? `${checked.trim()} ` : ""}` +
 						`Commits since the last measured baseline ${unmeasured} regressed ${worse.map(m => `${m.name} ${+reference[m.name].toPrecision(6)}→${+control.values[m.name].toPrecision(6)} (beyond twice its ±${(m.noise * 50).toFixed(1)}% noise)`).join(", ")}. Revert them (git revert) or register them as an experiment; unmeasured regressions cannot lower the bar. If another part's kept change caused it, that is a trade-off between parts: re-baseline this part with climb_scorecard to accept it.`,
 					);
-				adopted = ` Adopted commits since ${unmeasured}: guard passes, no regression.`;
+				adopted = ` Adopted commits since ${unmeasured}: guard passes, no regression.${checked}`;
 			}
 			const id = `x${g.nextExp}`;
 			append(root, { ts: L.now(), kind: "exp", goal: g.id, id, lever: p.lever, hypothesis: p.hypothesis, prediction: p.prediction, base, ref: control.values, proof, runs: control.samples, env: ENV.hash });
@@ -1152,13 +1225,17 @@ export default async function climb(pi: ExtensionAPI) {
 			const gates: L.Gates = { guard: !g.card.guard ? "none" : reason ? "fail" : "pass", instrument: moved.length ? "changed" : "same" };
 			if (moved.length && !reason) reason = `instrument changed (${moved.join(", ")}): the measurement is not comparable`;
 			let noted = "";
+			let pairs: Record<string, [number, number][]> | undefined;
 			if (!reason) {
 				const candidate = await tree(root);
 				const eff = effective(root, g);
 				let r = await measure(root, g.card.metrics, { phase: "result", goal: g.id, tree: candidate }, signal, {}, say);
-				// Within 2x noise either way: measure again before deciding, so noise
-				// neither keeps a lucky draw nor kills a real gain.
-				if (!r.errors.length && X.borderline(eff.metrics, exp.ref, r.values))
+				// Borderline, or a metric whose history shows drift: the control was measured at another
+				// time, so measure base and candidate interleaved and let drift cancel. If the base cannot
+				// be checked out, fall back to measuring the candidate again.
+				const unsure = !r.errors.length && (X.borderline(eff.metrics, exp.ref, r.values) || eff.notes.length > 0);
+				if (unsure) pairs = await paired(root, exp.base, g.card.metrics, g.id, signal, t => say(t && `paired with the base: ${t}`));
+				if (unsure && !pairs && X.borderline(eff.metrics, exp.ref, r.values))
 					r = await measure(root, g.card.metrics, { phase: "recheck", goal: g.id, tree: candidate }, signal, r.samples, t => say(t && `re-measure (borderline) ${t}`));
 				// A crashed instrument is not evidence against the change: decide nothing.
 				if (r.errors.length)
@@ -1166,7 +1243,7 @@ export default async function climb(pi: ExtensionAPI) {
 						`Measurement failed, even after retrying each failed run once; nothing was decided and ${exp.id} stays open:\n${r.errors.join("\n")}\nFlaky: call climb_measure again. Broken by your change: fix it, commit, measure again. Instrument broken: climb_measure with abandon, repair it, re-baseline with climb_scorecard.`,
 					);
 				({ values, samples } = r);
-				const v = X.verdict(eff.metrics, exp.ref, values);
+				const v = pairs ? X.pairedVerdict(g.card.metrics, pairs) : X.verdict(eff.metrics, exp.ref, values);
 				// Contention is the first suspect when a result moves: say when the two sides ran under different load.
 				const traces = T.read(root);
 				const since = L.epoch(exp.ts) - 3_600_000;
@@ -1210,7 +1287,7 @@ export default async function climb(pi: ExtensionAPI) {
 				if (rv.sha) reverted = rv.sha;
 				else reason += ` — auto-revert failed (${rv.err}); restore by hand: git revert --no-commit ${exp.base.slice(0, 8)}..HEAD && git commit`;
 			}
-			append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: h, values, verdict: kept ? "kept" : "dropped", reason: reason!, reverted, proof: byProof || undefined, runs: samples, gates, env: ENV.hash });
+			append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: h, values, verdict: kept ? "kept" : "dropped", reason: reason!, reverted, proof: byProof || undefined, runs: samples, paired: pairs, gates, env: ENV.hash });
 			let won = kept && g.card.metrics.every(m => L.met(m, values[m.name]));
 			if (won) {
 				// "Done" is never claimed from a single draw: confirm with fresh samples.
