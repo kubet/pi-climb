@@ -168,6 +168,12 @@ export function goalPct(st: State, g: Goal): number {
 /** A part with every target met that is still not achieved: what the acceptance review found missing (or an unconfirmed meet) is all that is left. */
 const finishing = (st: State, g: Goal) => !umbrella(st, g) && !!g.card && !g.done && g.card.metrics.every(m => m.hold || met(m, g.best[m.name]));
 
+/** "1/3": parts achieved of those still counted (abandoned parts are not). */
+const partsDone = (st: State, g: Goal) => {
+	const ps = parts(st, g).filter(c => c.done?.result !== "abandoned");
+	return `${ps.filter(c => c.done?.result === "achieved").length}/${ps.length}`;
+};
+
 /** The goal in a tree that holds the open experiment, if any. */
 export const openIn = (st: State, g: Goal) => subtree(st, g).find(x => x.open);
 
@@ -181,7 +187,7 @@ export function statusLine(st: State, nowMs = clock.ms()): string | undefined {
 		const flag = stuck(g) ? " STUCK" : g.stallPending ? " STALL" : "";
 		const busy = openIn(st, g);
 		const where = busy ? ` · ${busy.open!.id}${busy !== g ? ` on ${busy.id}` : ""}` : "";
-		return `${g.id} ${goalPct(st, g)}%${split ? ` · ${openParts(st, g).length} parts` : ""} · stale ${g.lastBeat?.stale ?? 0}/${g.cfg.poke_max}${where} · beat ${Math.ceil(due / 60)}m${flag}`;
+		return `${g.id} ${goalPct(st, g)}%${split ? ` · ${partsDone(st, g)} parts achieved` : ""} · stale ${g.lastBeat?.stale ?? 0}/${g.cfg.poke_max}${where} · beat ${Math.ceil(due / 60)}m${flag}`;
 	});
 	return `⛰ ${st.paused ? "PAUSED " : ""}${shown.join(" | ")}`;
 }
@@ -290,8 +296,13 @@ export function nextAction(st: State, g: Goal): string {
 		return `[climb ${g.id}] Experiment ${g.open.id} is open (lever "${g.open.lever}": ${g.open.hypothesis}). Finish it: implement, commit, then call climb_measure${tag}. State: ${cardSummary(g)}.`;
 	const tried = [...g.levers.entries()].map(([k, l]) => `${k} (${l.kept}/${l.tried} kept)`).join(", ");
 	const judged = g.diagnosis ? ` Last diagnosis (${g.diagnosis.by}): ${g.diagnosis.verdict} — ${g.diagnosis.next}.` : "";
-	if (finishing(st, g))
-		return `[climb ${g.id}] Every target is met, yet the goal is not achieved${tag}.${g.diagnosis ? ` Last diagnosis (${g.diagnosis.by}): ${g.diagnosis.diagnosis} → ${g.diagnosis.next}.` : ""} Put what is missing on the scorecard (climb_scorecard) or into a part (climb_split); a target met only once is confirmed by the next measurement.`;
+	if (finishing(st, g)) {
+		// The review's finding, not a later note (the worker's own included), says what is left.
+		const r = g.reviewed;
+		return r
+			? `[climb ${g.id}] Every target is met, yet the goal is not achieved${tag}. The acceptance review: ${r.diagnosis.replace(/^Every (target is met|part is achieved), but not the intent: /, "")} → ${r.next.replace(/[.\s]+$/, "")}. Put that check on the scorecard (climb_scorecard): one that already passes is welcome, and once every metric meets its target the review is asked again. Or give it a part (climb_split).`
+			: `[climb ${g.id}] Every target is met, yet the goal is not achieved${tag}: the targets were met once, not confirmed. The next measurement confirms them.${judged}`;
+	}
 	return `[climb ${g.id}] Keep climbing${tag}. State: ${cardSummary(g)}.${tried ? ` Levers tried: ${tried}.` : ""}${judged}${lessons(st, g)} Pick the lever with the highest expected gain on the metric furthest from target and call climb_experiment.`;
 }
 
@@ -486,7 +497,7 @@ export function parseReview(text: string): { achieved: boolean; unmet: string; n
 	return {
 		achieved: !/unmet|\bnot\b|\bno\b|missing|incomplete|unsatisfied/.test(v),
 		unmet: unmetLine || "unspecified",
-		next: field("NEXT") ?? "put the missing requirement on the scorecard",
+		next: (field("NEXT") ?? "put the missing requirement on the scorecard").replace(/[.\s]+$/, ""),
 	};
 }
 

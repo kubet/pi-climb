@@ -47,6 +47,7 @@ h1{font-size:22px;line-height:1.3;margin:0 0 6px;font-weight:600}h2{font-size:15
 .meter{height:8px;border-radius:4px;background:var(--track);overflow:hidden;margin-top:6px}.meter span{display:block;height:100%;background:var(--accent);border-radius:0 4px 4px 0}
 .meter.done span{background:var(--good)}
 .history{color:var(--muted);font-size:12px;margin:10px 0 0}
+.held{border-left:2px solid var(--warning);padding:2px 0 2px 10px;margin:12px 0 0;font-size:13px;color:var(--ink2)}.held b{color:var(--ink)}
 .spark polyline{fill:none;stroke:var(--accent);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
 .spark .target{stroke:var(--axis);stroke-width:1;stroke-dasharray:3 3}.spark .end{fill:var(--accent);stroke:var(--surface);stroke-width:2}.spark .hit{fill:transparent}
 .feed{padding:0;margin:0}.feed li{list-style:none;display:grid;grid-template-columns:128px 1fr;gap:2px 14px;padding:12px 18px;border-top:1px solid var(--grid)}.feed>li:first-child{border-top:0}
@@ -110,8 +111,13 @@ function stateChip(st: State, g: Goal): string {
 	if (g.judge?.verdict === "stuck" && g.progressSeq < g.judgeSeq) return `<span class="chip critical">✕ stuck · needs you</span>`;
 	const busy = openIn(st, g);
 	if (busy) return `<span class="chip neutral">● ${esc(busy.open!.id)} running</span>`;
+	if (g.reviewed) return `<span class="chip warning">⚠ targets met · review holds it</span>`;
 	return g.card ? `<span class="chip neutral">climbing</span>` : `<span class="chip neutral">researching</span>`;
 }
+
+/** What the acceptance review found missing, for a goal it holds open. */
+const finding = (g: Goal) => g.reviewed!.diagnosis.replace(/^Every (target is met|part is achieved), but not the intent: /, "");
+const held = (g: Goal) => (g.reviewed && !g.done ? `<p class="held"><b>Acceptance review:</b> ${esc(finding(g))} <b>Next:</b> ${esc(g.reviewed.next)}</p>` : "");
 
 function partCard(st: State, g: Goal): string {
 	const kids = parts(st, g);
@@ -120,7 +126,7 @@ function partCard(st: State, g: Goal): string {
 		: `<p class="history">${g.probes.length ? `Researching: ${g.probes.length} candidate metrics probed; latest ${esc(g.probes.slice(-3).map(p => `${p.name} ${num(p.value)}`).join(", "))}` : "Researching: no metric yet"}</p>`;
 	const kept = g.results.filter(r => r.verdict === "kept").length;
 	return `<section class="card"><div class="part-head"><h3>${esc(g.id)} ${stateChip(st, g)}</h3><span class="pct">${goalPct(st, g)}%</span></div>
-<p class="intent clamp clamp2" title="${esc(g.intent)}">${esc(g.intent)}</p>${body}
+<p class="intent clamp clamp2" title="${esc(g.intent)}">${esc(g.intent)}</p>${body}${held(g)}
 <p class="history">${g.results.length} experiments, ${kept} kept${kids.length ? ` · split into ${kids.length} parts` : ""}</p></section>`;
 }
 
@@ -205,7 +211,12 @@ function verdict(st: State, root: Goal, now: number): { headline: string; lede: 
 					: "Working, no recent win";
 	const headline = `${word} · ${goalPct(st, root)}% of targets${leaves.length ? ` · ${achieved} of ${leaves.length} parts achieved` : ""}`;
 	const lastText = last ? `Last win ${ago(last.r.ts, now)}: ${last.r.exp} on ${last.g.id}, ${last.r.reason.split(";")[0].replace(/\s*\(.*?\)/g, "").slice(0, 140)}.` : "No win yet.";
-	const nowText = busy ? ` Now: ${busy.open!.id} "${busy.open!.lever}" on ${busy.id}, open ${ago(busy.open!.ts, now).replace(" ago", "")}.` : "";
+	const waiting = tree.find(g => g.reviewed && !g.done);
+	const nowText = busy
+		? ` Now: ${busy.open!.id} "${busy.open!.lever}" on ${busy.id}, open ${ago(busy.open!.ts, now).replace(" ago", "")}.`
+		: waiting
+			? ` Now: ${waiting.id} meets every target; the acceptance review wants one more check first.`
+			: "";
 	return { headline, lede: `${lastText}${nowText}` };
 }
 

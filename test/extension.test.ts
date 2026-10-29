@@ -798,7 +798,7 @@ describe("decomposition and knowledge", () => {
 		await expect(z.tool("climb_scorecard", { metrics: [{ name: "x", cmd: "cat fast.txt", dir: "down", target: 1 }] })).rejects.toThrow("Several active goals");
 		await z.tool("climb_scorecard", { goal: "g-fast-responses", metrics: [{ name: "ms", cmd: "cat fast.txt", dir: "down", target: 50, noise: 0.05 }] });
 		await z.tool("climb_scorecard", { goal: "g-good-answers", metrics: [{ name: "score", cmd: "cat good.txt", dir: "up", target: 20, noise: 0.05 }] });
-		expect(X.statusLine(st())).toContain("g-make-it-fast-and 0% · 2 parts");
+		expect(X.statusLine(st())).toContain("g-make-it-fast-and 0% · 0/2 parts achieved");
 	});
 
 	test("knowledge is shared down the tree and repeated with the next step", async () => {
@@ -1078,7 +1078,8 @@ describe("acceptance review", () => {
 			const s = L.fold(L.read(d));
 			const next = X.nextAction(s, s.goals.get("g-make-it-fast-and")!);
 			expect(next).toContain("Next, g-fast-responses: [climb g-fast-responses] Every target is met, yet the goal is not achieved");
-			expect(next).toContain("run the delivery bench on the kept commit");
+			expect(next).toContain("The acceptance review: background reports were never checked → run the delivery bench on the kept commit");
+			expect(next).toContain("one that already passes is welcome");
 			expect(next).not.toContain("metric furthest from target");
 		} finally {
 			fs.rmSync(d, { recursive: true, force: true });
