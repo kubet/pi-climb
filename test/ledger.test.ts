@@ -103,6 +103,16 @@ describe("ledger fold", () => {
 		{ ts: iso(4e6, nowMs), kind: "card", goal: "g", metrics: [metric()] },
 	];
 
+	test("a later card keeps each metric's first baseline while its command is unchanged", () => {
+		const st = L.fold([
+			...base(),
+			{ ts: iso(3e6, nowMs), kind: "card", goal: "g", metrics: [metric({ baseline: 40, hold: true }), metric({ name: "other", baseline: 7 })] },
+			{ ts: iso(2e6, nowMs), kind: "card", goal: "g", metrics: [metric({ baseline: 30 }), metric({ name: "other", cmd: "echo 2", baseline: 5 })] },
+		]);
+		const g = st.goals.get("g")!;
+		expect(g.origin).toEqual({ ms: { value: 100, cmd: "echo 1" }, other: { value: 5, cmd: "echo 2" } });
+	});
+
 	test("results move best, open experiment closes, levers count", () => {
 		const st = L.fold([
 			...base(),

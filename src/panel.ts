@@ -101,7 +101,7 @@ function metricRow(g: Goal, m: Metric): string {
 			? ""
 			: `<div class="meter${reached ? " done" : ""}" role="img" aria-label="${progress}% of the way to target"><span style="width:${progress}%"></span></div>`;
 	return `<div class="m"><div class="name">${reached ? `<span class="chip good">✓ met</span> ` : ""}${esc(m.name)}${m.unit ? `<div class="unit">${esc(m.unit)}</div>` : ""}</div>
-<div><div class="nums">${num(m.baseline)} → <b>${num(best)}</b>${m.hold ? " · hold: must not regress" : ` / target ${num(m.target)} · ${progress}%`} · noise ±${(m.noise * 100).toFixed(m.noise < 0.1 ? 1 : 0)}%</div>${meter}</div>
+<div><div class="nums">${num(g.origin?.[m.name]?.cmd === m.cmd ? g.origin[m.name].value : m.baseline)} → <b>${num(best)}</b>${m.hold ? " · hold: must not regress" : ` / target ${num(m.target)} · ${progress}%`} · noise ±${(m.noise * 100).toFixed(m.noise < 0.1 ? 1 : 0)}%</div>${meter}</div>
 <div>${spark(g, m)}</div></div>`;
 }
 
@@ -211,13 +211,16 @@ function verdict(st: State, root: Goal, now: number): { headline: string; lede: 
 					: "Working, no recent win";
 	const headline = `${word} · ${goalPct(st, root)}% of targets${leaves.length ? ` · ${achieved} of ${leaves.length} parts achieved` : ""}`;
 	const lastText = last ? `Last win ${ago(last.r.ts, now)}: ${last.r.exp} on ${last.g.id}, ${last.r.reason.split(";")[0].replace(/\s*\(.*?\)/g, "").slice(0, 140)}.` : "No win yet.";
+	// A part closing is news the experiment feed does not carry.
+	const closed = tree.filter(g => g !== root && g.done?.result === "achieved").sort((a, b) => b.done!.ts.localeCompare(a.done!.ts))[0];
+	const closedText = closed && (!last || closed.done!.ts > last.r.ts) ? `${closed.id} achieved ${ago(closed.done!.ts, now)}. ` : "";
 	const waiting = tree.find(g => g.reviewed && !g.done);
 	const nowText = busy
 		? ` Now: ${busy.open!.id} "${busy.open!.lever}" on ${busy.id}, open ${ago(busy.open!.ts, now).replace(" ago", "")}.`
 		: waiting
 			? ` Now: ${waiting.id} meets every target; the acceptance review wants one more check first.`
 			: "";
-	return { headline, lede: `${lastText}${nowText}` };
+	return { headline, lede: `${closedText}${lastText}${nowText}` };
 }
 
 export function render(st: State, data: Data, s: Summary, nowMs: number): string {

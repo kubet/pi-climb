@@ -136,6 +136,8 @@ export interface Goal {
 	judge?: JudgeE;
 	/** Latest diagnosis from anyone, the worker included (display only). */
 	diagnosis?: JudgeE;
+	/** Each metric's first baseline on this goal (while its command is unchanged): a later card still shows the whole climb. */
+	origin?: Record<string, { value: number; cmd: string }>;
 	/** The acceptance review held this goal open since its current card: its met targets did not finish the intent. */
 	reviewed?: JudgeE;
 	/** Ledger line of the latest independent verdict; line order never ties, timestamps can. */
@@ -259,6 +261,8 @@ export function fold(entries: Entry[]): State {
 			case "card":
 				g.card = e;
 				g.reviewed = undefined;
+				g.origin ??= {};
+				for (const m of e.metrics) if (g.origin[m.name]?.cmd !== m.cmd) g.origin[m.name] = { value: m.baseline, cmd: m.cmd };
 				g.baseRef = e.head;
 				g.baseValues = Object.fromEntries(e.metrics.map(m => [m.name, m.baseline]));
 				g.best = {};
