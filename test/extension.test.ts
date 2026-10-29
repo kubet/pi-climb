@@ -1068,3 +1068,24 @@ describe("base worktree safety", () => {
 		}
 	});
 });
+
+describe("flaky guard", () => {
+	test("a guard that fails once and passes on a retry passes, and is called flaky", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-flakyguard-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "flakyguard");
+			await z.load();
+			await z.cmd("shrink");
+			// Fails on its first-ever run only.
+			const guard = "test -f .git/guard-ran || { touch .git/guard-ran; exit 1; }";
+			const out = await z.tool("climb_scorecard", { metrics: [{ name: "w", cmd: "cat work.txt", dir: "down", target: 10, noise: 0.05 }], guard });
+			expect(out).toContain("Scorecard set");
+			expect(out).toContain("guard failed once");
+			expect(out).toContain("it is flaky");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+});

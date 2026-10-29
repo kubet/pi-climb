@@ -191,9 +191,11 @@ export default async function climb(pi: ExtensionAPI) {
 		return paths;
 	}
 	const touched: string[] = [];
+	const notices: string[] = []; // said once, with the next tool result
 	const artifactNote = () => {
 		const t = [...new Set(touched.splice(0))];
-		return t.length ? `\nNote: measuring rewrote tracked files (${t.join(", ")}); restored. Untrack generated artifacts (git rm --cached) so they stop churning.` : "";
+		const said = [...new Set(notices.splice(0))].map(n => `\nNote: ${n}`).join("");
+		return (t.length ? `\nNote: measuring rewrote tracked files (${t.join(", ")}); restored. Untrack generated artifacts (git rm --cached) so they stop churning.` : "") + said;
 	};
 
 	async function ensureExcluded(root: string): Promise<void> {
@@ -470,8 +472,16 @@ export default async function climb(pi: ExtensionAPI) {
 		if (!cmd) return undefined;
 		const key = `${await tree(root)}\0${cmd}`;
 		if (L.clock.ms() - (guardPassed.get(key) ?? -Infinity) < FRESH_MS) return undefined;
-		const r = await run(root, cmd, 1_800_000, { phase: "guard", goal }, signal);
+		let r = await run(root, cmd, 1_800_000, { phase: "guard", goal }, signal);
 		await restore(root);
+		// A guard that fails once and passes on a retry is flaky, not a verdict: pass, and say so.
+		if (r.code !== 0 && !r.killed && !signal?.aborted) {
+			const first = r;
+			r = await run(root, cmd, 1_800_000, { phase: "guard", goal }, signal, true);
+			await restore(root);
+			if (r.code === 0)
+				notices.push(`The guard failed once (exit ${first.code}: ${tail(first.stderr || first.stdout).slice(-160)}) and passed on a retry: it is flaky. Keep network-bound or timing-sensitive checks out of the guard, or it will refuse good work.`);
+		}
 		if (signal?.aborted) throw new Error("Guard interrupted; nothing was decided and the experiment stays open.");
 		if (r.code === 0) guardPassed.set(key, L.clock.ms());
 		return r.code === 0 ? undefined : `guard failed (exit ${r.code}): ${tail(r.stderr || r.stdout)}`;
