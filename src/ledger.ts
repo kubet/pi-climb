@@ -341,6 +341,11 @@ export function fold(entries: Entry[]): State {
 				break;
 			case "done":
 				g.done = e;
+				// Achieving a goal is progress, even when no experiment was kept for it (a verification scorecard).
+				if (e.result === "achieved") {
+					g.lastProgress = e.ts;
+					g.progressSeq = g.lastKeptSeq = seq;
+				}
 				break;
 			case "learn":
 				g.learned.push(e);

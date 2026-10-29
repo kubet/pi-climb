@@ -130,6 +130,19 @@ describe("ledger fold", () => {
 		expect(X.nextAction(once, once.goals.get("g")!)).toContain("Keep climbing. State: ms 8");
 	});
 
+	test("a part achieved since the last beat is progress for the tree", () => {
+		const entries: L.Entry[] = [
+			{ ts: iso(9e6, nowMs), kind: "goal", goal: "r", intent: "voice", cfg: { poke_max: 3, beat_s: 1800 } },
+			{ ts: iso(8e6, nowMs), kind: "goal", goal: "a", parent: "r", intent: "a", cfg: { poke_max: 3, beat_s: 1800 } },
+			{ ts: iso(8e6, nowMs), kind: "goal", goal: "b", parent: "r", intent: "b", cfg: { poke_max: 3, beat_s: 1800 } },
+			{ ts: iso(7e6, nowMs), kind: "beat", goal: "r", head: "h", progress: false, stale: 0 },
+		];
+		const r = (e: L.Entry[]) => { const s = L.fold(e); return L.treeProgressSinceBeat(s, s.goals.get("r")!); };
+		expect(r(entries)).toBe(false);
+		expect(r([...entries, { ts: iso(6e6, nowMs), kind: "done", goal: "a", result: "achieved", values: {} }])).toBe(true);
+		expect(r([...entries, { ts: iso(6e6, nowMs), kind: "done", goal: "a", result: "abandoned", values: {} }])).toBe(false);
+	});
+
 	test("a later card keeps each metric's first baseline while its command is unchanged", () => {
 		const st = L.fold([
 			...base(),
