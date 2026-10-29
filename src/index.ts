@@ -226,10 +226,10 @@ export default async function climb(pi: ExtensionAPI) {
 
 	// A proof is a fast deterministic check: it fails at the base and passes once the change works.
 	const PROOF_MS = 120_000;
-	async function proofRuns(root: string, cmd: string, goal: string, signal?: AbortSignal): Promise<{ passed: number; out: string; killed: boolean }> {
+	async function proofRuns(root: string, cmd: string, goal: string, signal?: AbortSignal): Promise<{ passed: number; out: string; broken?: string }> {
 		let passed = 0;
 		let out = "";
-		let killed = false;
+		let broken: string | undefined; // the check could not run at all: timed out, or its command is missing
 		try {
 			for (let i = 0; i < 2; i++) {
 				const r = await run(root, cmd, PROOF_MS, { phase: "proof", goal }, signal);
@@ -237,13 +237,14 @@ export default async function climb(pi: ExtensionAPI) {
 				if (r.code === 0) passed++;
 				else {
 					out = tail(r.stderr || r.stdout);
-					killed ||= !!r.killed;
+					if (r.killed) broken = `timed out after ${PROOF_MS / 1000}s`;
+					else if (r.code === 126 || r.code === 127) broken = `could not start (exit ${r.code}): ${out}`;
 				}
 			}
 		} finally {
 			await restore(root);
 		}
-		return { passed, out, killed };
+		return { passed, out, broken };
 	}
 
 	async function hashes(root: string, files: string[]): Promise<Record<string, string>> {
@@ -533,15 +534,23 @@ export default async function climb(pi: ExtensionAPI) {
 			// Transports differ in what side turns accept (output caps, tool opt-out): degrade.
 			let reply: string | undefined;
 			let lastErr: unknown;
+			// A hung side turn must not hold the stall gate shut: one deadline across all attempts.
+			const deadline = Date.now() + JUDGE_MS;
 			for (const opts of [{ tools: false as const, maxTokens: 1500 }, { tools: false as const }, {}]) {
+				const left = deadline - Date.now();
+				if (left <= 0) break;
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				const attempt = Promise.resolve().then(() => turn({ promptText, ...opts }));
+				const late = new Promise<never>((_, no) => (timer = setTimeout(() => no(new Error(`judge timed out after ${JUDGE_MS / 60_000} minutes`)), left)));
+				attempt.catch(() => {}); // the loser of the race must not surface as an unhandled rejection
+				late.catch(() => {});
 				try {
-					// A hung side turn must not hold the stall gate shut forever.
-					let timer: ReturnType<typeof setTimeout> | undefined;
-					const late = new Promise<never>((_, no) => (timer = setTimeout(() => no(new Error("judge timed out after 5 minutes")), JUDGE_MS)));
-					reply = (await Promise.race([turn({ promptText, ...opts }), late]).finally(() => clearTimeout(timer))).replyText;
+					reply = (await Promise.race([attempt, late])).replyText;
 					break;
 				} catch (e) {
 					lastErr = e;
+				} finally {
+					clearTimeout(timer);
 				}
 			}
 			if (reply === undefined) {
@@ -574,10 +583,14 @@ export default async function climb(pi: ExtensionAPI) {
 		ctxRef = ctx;
 		const root = await repoRoot(ctx.cwd);
 		if (!root) return;
-		const goals = L.active(refresh(ctx, root));
+		const st = refresh(ctx, root);
+		const goals = L.active(st);
 		if (goals.length) ensureTimer(ctx);
 		// A restart can kill a judge mid-verdict: a pending stall must not wait on it forever.
-		if (lease(root, ctx) && hasJudge(ctx)) for (const g of goals) if (g.stallPending && !judging.has(g.id)) void judge(ctx, root, g.id, "stall left without a verdict (restart)");
+		// Only then is the lease touched: opening omp in an unrelated repo writes nothing.
+		const orphaned = goals.filter(g => g.stallPending && !judging.has(g.id));
+		if (!st.paused && orphaned.length && hasJudge(ctx) && lease(root, ctx))
+			for (const g of orphaned) void judge(ctx, root, g.id, "stall left without a verdict (restart)");
 	});
 
 	pi.on("turn_end", async (_e, ctx) => {
@@ -907,14 +920,19 @@ export default async function climb(pi: ExtensionAPI) {
 			const say = progressTo(ctx, root, onUpdate, `${g.id} x${g.nextExp} control`);
 			let proof: L.Proof | undefined;
 			if (p.proof) {
-				const missing = X.scriptPaths(p.proof).filter(f => !fs.existsSync(path.join(root, f)));
+				// Paths after `cd` are relative to somewhere else: not checked here.
+				const missing = /(^|[;&|(]\s*)cd\s/.test(p.proof) ? [] : X.scriptPaths(p.proof).filter(f => !fs.existsSync(path.join(root, f)));
 				if (missing.length) throw new Error(`The proof runs ${missing.join(", ")}, which does not exist yet. Write the failing check first, then register.`);
 				say("proof must fail at base");
 				const pr = await proofRuns(root, p.proof, g.id, signal);
-				if (pr.killed) throw new Error(`The proof timed out (${PROOF_MS / 1000}s); a proof must be a fast check.`);
+				if (pr.broken) throw new Error(`The proof ${pr.broken}: a proof must be a fast check that runs here and fails for the defect's reason.`);
 				if (pr.passed) throw new Error(`The proof passed ${pr.passed}/2 runs at ${base.slice(0, 8)}: it must fail before the change, or it proves nothing.`);
 				const files = new Set([...(await git(root, "ls-files", "--cached", "--others", "--exclude-standard")).stdout.split("\n").filter(Boolean)]);
 				const scripts = [...new Set([...X.instrumentFiles(p.proof, files).filter(f => !f.endsWith("/")), ...X.scriptPaths(p.proof)])];
+				// A runner that finds its own tests (bun test -t x, npm run check, pytest -k x) freezes nothing:
+				// the worker could edit the check until it passes.
+				if (!scripts.length && X.indirectRunner(p.proof))
+					throw new Error("Name the check's file in the proof (e.g. 'bun test test/x.test.ts' or 'pytest tests/t.py::case') so it can be frozen; a runner that discovers its own tests freezes nothing.");
 				proof = { cmd: p.proof, files: await hashes(root, scripts) };
 			}
 			const control = await measureTree(root, g.card.metrics, m => m.samples, { phase: "control", goal: g.id }, signal, say);
@@ -927,7 +945,10 @@ export default async function climb(pi: ExtensionAPI) {
 				const [want, have] = await Promise.all([tree(root, g.baseRef), tree(root)]);
 				if (want && want !== have) {
 					const short = g.baseRef.slice(0, 8);
-					const gerr = await guard(root, g.card.guard, g.id, signal);
+					// A committed failing test that is this experiment's proof is meant to break the guard.
+					const changed = (await git(root, "diff", "--name-only", `${g.baseRef}..HEAD`)).stdout.split("\n").filter(Boolean);
+					const onlyProof = !!proof && changed.length > 0 && changed.every(f => f in proof!.files);
+					const gerr = onlyProof ? undefined : await guard(root, g.card.guard, g.id, signal);
 					if (gerr) throw new Error(`Commits since the last measured baseline ${short} break the guard: ${gerr}. Fix or revert them before experimenting.`);
 					const worse = g.baseValues ? X.regressions(g.card.metrics, g.baseValues, control.values) : [];
 					if (worse.length)
@@ -968,7 +989,7 @@ export default async function climb(pi: ExtensionAPI) {
 			if (!exp || !g.card) throw new Error(`No open experiment on ${g.id}; register one with climb_experiment.`);
 			const d = await dirty(root);
 			if (d) throw new Error(`Commit your change first; climb measures commits, never a dirty tree:\n${d}`);
-			if (p.abandon !== undefined) {
+			if (typeof p.abandon === "string") {
 				const at = (await head(root)) ?? exp.base;
 				let reason = `abandoned: ${p.abandon || "no reason given"}`;
 				let reverted: string | undefined;
@@ -1014,6 +1035,8 @@ export default async function climb(pi: ExtensionAPI) {
 					if (!failed) {
 						say("proof");
 						const pr = await proofRuns(root, exp.proof.cmd, g.id, signal);
+						// A check that cannot run is not evidence against the change: decide nothing.
+						if (pr.broken) throw new Error(`The proof ${pr.broken}; nothing was decided and ${exp.id} stays open. Free the machine or fix the environment, then climb_measure again (or abandon).`);
 						if (pr.passed < 2) failed = `proof still fails (${pr.passed}/2 runs passed): ${pr.out}`;
 					}
 					if (failed && kept)

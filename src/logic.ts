@@ -220,13 +220,17 @@ const RUNNERS = /^(python[\d.]*|node|bun|deno|bash|sh|zsh|ruby|perl|php|pytest|j
 /** Tokens a command executes: arguments after an interpreter or test runner, or ./path.
  *  `first` marks the script position itself (right after the runner), as opposed to
  *  later arguments, which may be inline code. */
-function executed(cmd: string): { tok: string; first: boolean }[] {
-	const out: { tok: string; first: boolean }[] = [];
+function executed(cmd: string): { tok: string; first: boolean; afterFlag: boolean }[] {
+	const out: { tok: string; first: boolean; afterFlag: boolean }[] = [];
 	for (const seg of cmd.split(/&&|\|\||[;|\n]/)) {
 		const toks = seg.trim().split(/[\s"'`()]+/).filter(t => t && !/^\w+=/.test(t) && !["time", "env", "exec", "nice"].includes(t));
 		const runner = toks.findIndex(t => RUNNERS.test(t)); // `env -u X python3 t.py` still counts
-		for (const [i, tok] of toks.entries())
-			if (!tok.startsWith("-") && ((runner >= 0 && i > runner) || (i === 0 && tok.startsWith("./")))) out.push({ tok, first: i === runner + 1 || i === 0 });
+		for (const [i, raw] of toks.entries()) {
+			if (raw.startsWith("-") || raw.includes("://")) continue;
+			const tok = raw.replace(/::.*$/, ""); // pytest node ids: tests/t.py::case
+			if ((runner >= 0 && i > runner) || (i === 0 && tok.startsWith("./")))
+				out.push({ tok, first: i === runner + 1 || i === 0, afterFlag: i > 0 && /^-/.test(toks[i - 1]) && !toks[i - 1].includes("=") });
+		}
 	}
 	return out;
 }
@@ -249,8 +253,12 @@ export function instrumentFiles(cmd: string, tracked: Set<string>): string[] {
  *  extension, in script position or written with a directory (not `console.log` in inline code). */
 export const scriptPaths = (cmd: string) =>
 	executed(cmd)
-		.filter(({ tok, first }) => /\.[A-Za-z]\w{0,4}$/.test(tok) && !tok.startsWith("/") && (first || tok.includes("/")))
+		.filter(({ tok, first, afterFlag }) => /\.[A-Za-z]\w{0,4}$/.test(tok) && !tok.startsWith("/") && !afterFlag && (first || tok.includes("/")))
 		.map(({ tok }) => tok.replace(/^\.\//, ""));
+
+/** A command whose runner discovers what to run itself (test filters, package scripts, make). */
+export const indirectRunner = (cmd: string) =>
+	/\b(bun|npm|pnpm|yarn)\s+(test|run)\b|\b(pytest|jest|vitest|make|just)\b|\b(go|cargo)\s+test\b|\bpython3?\s+-m\s+(pytest|unittest)\b/.test(cmd);
 
 /** Absolute paths a command mentions (`/x`, `--flag=/x`): candidates for an instrument outside the repo. */
 export const absolutePaths = (cmd: string) => [...new Set(cmd.split(/[\s"'`()=,;|&<>]+/).filter(t => /^\/[^/]/.test(t)))];

@@ -39,6 +39,7 @@ function host(cwd: string, kind: "main" | "sub" = "main", sid = "s1") {
 	const h = {
 		idle: true,
 		judge: "VERDICT: pivot\nDIAGNOSIS: same idea repeated\nNEXT: try a different algorithm",
+		judgeThrows: false,
 		timerFn: undefined as undefined | (() => void),
 	};
 	const pi = {
@@ -58,7 +59,10 @@ function host(cwd: string, kind: "main" | "sub" = "main", sid = "s1") {
 		sessionManager: { getSessionId: () => sid },
 		isIdle: () => h.idle,
 		ui: { notify: (t: string) => notes.push(t), setStatus: () => {} },
-		runEphemeralTurn: async () => ({ replyText: h.judge }),
+		runEphemeralTurn: () => {
+			if (h.judgeThrows) throw new Error("side turn refused synchronously");
+			return Promise.resolve({ replyText: h.judge });
+		},
 		setInterval: (fn: () => void) => ((h.timerFn = fn), 1),
 		clearTimer: () => {},
 	};
@@ -678,5 +682,66 @@ describe("lessons from the night", () => {
 		expect(await count("c")).toBe(4);
 		expect(await z.tool("climb_scorecard", { metrics: [{ name: "work", cmd: c, dir: "down", target: 10 }] })).toContain("work = 50");
 		expect(await count("c")).toBe(5);
+	});
+});
+
+// Found by an independent review of the two live-run commits.
+describe("review findings", () => {
+	let d: string;
+	let z: ReturnType<typeof host>;
+	const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+	const last = (kind: string) => L.read(d).filter(e => e.kind === kind).at(-1);
+
+	beforeAll(async () => {
+		d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-review-"));
+		await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && mkdir checks && echo 'exit 0' > checks/base.sh && git add -A && git commit -qm init");
+		z = host(d, "main", "review");
+		await z.load();
+	});
+	afterAll(() => fs.rmSync(d, { recursive: true, force: true }));
+
+	test("opening omp in a repo without a climb writes nothing into it", async () => {
+		await z.emit("session_start");
+		expect(fs.existsSync(path.join(d, ".climb"))).toBe(false);
+	});
+
+	test("a committed failing test can be the proof, though the guard suite runs it", async () => {
+		await z.cmd("shrink work");
+		await z.tool("climb_scorecard", { metrics: [{ name: "work", cmd: "cat work.txt", dir: "down", target: 10, noise: 0.05 }], guard: "for f in checks/*.sh; do bash $f || exit 1; done" });
+		await run("printf 'test -f fixed.txt\\n' > checks/fixed.sh && git add checks && git commit -qm 'failing check'");
+		expect(await z.tool("climb_experiment", { lever: "fix", hypothesis: "", prediction: "", proof: "bash checks/fixed.sh" })).toContain("Registered x1");
+		await run("touch fixed.txt && git add fixed.txt && git commit -qm fix");
+		expect(await z.tool("climb_measure", {})).toContain("KEPT x1 by proof");
+	});
+
+	test("a proof that cannot run at measure decides nothing", async () => {
+		// Outside checks/, so the guard suite does not run it.
+		await run("mkdir -p extra && printf 'test -f fixed2.txt || exit 1\\nmissing-tool-xyz\\n' > extra/two.sh");
+		await z.tool("climb_experiment", { lever: "fix2", hypothesis: "", prediction: "", proof: "bash extra/two.sh" });
+		await run("touch fixed2.txt && git add fixed2.txt && git commit -qm fix2");
+		await expect(z.tool("climb_measure", { abandon: null })).rejects.toThrow("x2 stays open"); // null is not abandon
+		expect(last("result")).toMatchObject({ exp: "x1" });
+		await z.tool("climb_measure", { abandon: "check needs a tool this machine lacks" });
+	});
+
+	test("a proof must name the file a self-discovering runner would run", async () => {
+		await expect(z.tool("climb_experiment", { lever: "f", hypothesis: "", prediction: "", proof: "bun test -t handoff" })).rejects.toThrow("Name the check's file");
+		expect(X.scriptPaths("pytest tests/t.py::test_x && curl https://x.io/a.json --out build/out.txt")).toEqual(["tests/t.py"]);
+	});
+
+	test("a paused climb stays asleep across a restart, even with a stall pending", async () => {
+		L.append(d, { ts: L.now(), kind: "stall", goal: "g-shrink-work", stale: 3 }, { ts: L.now(), kind: "pause", goal: "*" });
+		const sent = z.sent.length;
+		await z.emit("session_start");
+		await Bun.sleep(50);
+		expect(z.sent.length).toBe(sent);
+		L.append(d, { ts: L.now(), kind: "resume", goal: "*" });
+	});
+
+	test("a judge that throws synchronously leaves the worker a way forward, not a crash", async () => {
+		z.h.judgeThrows = true;
+		await z.cmd("judge");
+		expect(z.sent.at(-1)?.m.content).toContain("The independent judge failed");
+		z.h.judgeThrows = false;
 	});
 });
