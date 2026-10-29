@@ -41,6 +41,8 @@ function host(cwd: string, kind: "main" | "sub" = "main", sid = "s1") {
 		idle: true,
 		judge: "VERDICT: pivot\nDIAGNOSIS: same idea repeated\nNEXT: try a different algorithm",
 		judgeThrows: false,
+		/** Replies for the next side turns, in order; then judge. */
+		replies: [] as string[],
 		timerFn: undefined as undefined | (() => void),
 	};
 	const pi = {
@@ -62,7 +64,7 @@ function host(cwd: string, kind: "main" | "sub" = "main", sid = "s1") {
 		ui: { notify: (t: string) => notes.push(t), setStatus: () => {} },
 		runEphemeralTurn: () => {
 			if (h.judgeThrows) throw new Error("side turn refused synchronously");
-			return Promise.resolve({ replyText: h.judge });
+			return Promise.resolve({ replyText: h.replies?.shift() ?? h.judge });
 		},
 		setInterval: (fn: () => void) => ((h.timerFn = fn), 1),
 		clearTimer: () => {},
@@ -1054,6 +1056,42 @@ describe("acceptance review", () => {
 			const out = await z.tool("climb_scorecard", { metrics: [w, lost] });
 			expect(out).toContain("GOAL ACHIEVED: g-shrink-work-without-losing");
 			expect(L.fold(L.read(d)).goals.get("g-shrink-work-without-losing")!.done?.result).toBe("achieved");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
+	test("a split goal whose parts are all achieved but whose review says no is told what is missing, not to climb its old scorecard", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-root-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > a.txt && echo 10 > b.txt && echo 50 > old.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "accept-root");
+			await z.load();
+			await z.cmd("make it fast and good");
+			const root = "g-make-it-fast-and";
+			await z.tool("climb_scorecard", { metrics: [{ name: "old", cmd: "cat old.txt", dir: "down", target: 5, noise: 0.05 }] });
+			await z.tool("climb_split", { parts: [{ intent: "fast responses" }, { intent: "good answers" }] });
+			await z.tool("climb_scorecard", { goal: "g-fast-responses", metrics: [{ name: "ms", cmd: "cat a.txt", dir: "down", target: 50, noise: 0.05 }] });
+			await z.tool("climb_scorecard", { goal: "g-good-answers", metrics: [{ name: "score", cmd: "cat b.txt", dir: "up", target: 20, noise: 0.05 }] });
+			const yes = "VERDICT: achieved\nUNMET: none\nNEXT: none";
+			z.h.judge = yes;
+			await z.tool("climb_experiment", { goal: "g-fast-responses", lever: "halve", hypothesis: "", prediction: "" });
+			await run("echo 40 > a.txt && git commit -qam halve");
+			expect(await z.tool("climb_measure", { goal: "g-fast-responses" })).toContain("GOAL ACHIEVED: g-fast-responses");
+			z.h.replies = [yes, "VERDICT: unmet\nUNMET: nobody listened to a real call\nNEXT: add a part that grades a real call."];
+			await z.tool("climb_experiment", { goal: "g-good-answers", lever: "double", hypothesis: "", prediction: "" });
+			await run("echo 25 > b.txt && git commit -qam double");
+			expect(await z.tool("climb_measure", { goal: "g-good-answers" })).toContain("GOAL ACHIEVED: g-good-answers");
+			const s = L.fold(L.read(d));
+			expect(s.goals.get(root)!.done).toBeUndefined();
+			const next = X.nextAction(s, s.goals.get(root)!);
+			expect(next).toContain("Every part is achieved, yet the goal is not achieved");
+			expect(next).toContain("nobody listened to a real call → add a part that grades a real call. Put");
+			expect(next).not.toContain("Keep climbing");
+			z.h.judge = yes;
+			await z.tool("climb_split", { goal: root, parts: [{ intent: "grade a real call" }, { intent: "keep reports" }] });
+			expect(X.nextAction(L.fold(L.read(d)), L.fold(L.read(d)).goals.get(root)!)).toContain("Split into parts: g-grade-a-real-call");
 		} finally {
 			fs.rmSync(d, { recursive: true, force: true });
 		}

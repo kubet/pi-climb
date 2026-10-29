@@ -165,8 +165,10 @@ export function goalPct(st: State, g: Goal): number {
 	return Math.min(...(goals.length ? goals : g.card.metrics).map(m => progressPct(m, g.best[m.name])));
 }
 
-/** A part with every target met that is still not achieved: what the acceptance review found missing (or an unconfirmed meet) is all that is left. */
-const finishing = (st: State, g: Goal) => !umbrella(st, g) && !!g.card && !g.done && g.card.metrics.every(m => m.hold || met(m, g.best[m.name]));
+/** Every target met (or, for a split goal, every part achieved) and still not achieved: what the acceptance
+ *  review found missing (or an unconfirmed meet) is all that is left. A split goal's old scorecard is history. */
+const finishing = (st: State, g: Goal) =>
+	!umbrella(st, g) && !g.done && (parts(st, g).length ? !!g.reviewed : !!g.card && g.card.metrics.every(m => m.hold || met(m, g.best[m.name])));
 
 /** "1/3": parts achieved of those still counted (abandoned parts are not). */
 const partsDone = (st: State, g: Goal) => {
@@ -302,7 +304,7 @@ export function nextAction(st: State, g: Goal): string {
 		// The review's finding, not a later note (the worker's own included), says what is left.
 		const r = g.reviewed;
 		return r
-			? `[climb ${g.id}] Every target is met, yet the goal is not achieved${tag}. The acceptance review: ${r.diagnosis.replace(/^Every (target is met|part is achieved), but not the intent: /, "")} → ${r.next.replace(/[.\s]+$/, "")}. Put that check on the scorecard (climb_scorecard): one that already passes is welcome, and once every metric meets its target the review is asked again. Or give it a part (climb_split).`
+			? `[climb ${g.id}] ${parts(st, g).length ? "Every part is achieved" : "Every target is met"}, yet the goal is not achieved${tag}. The acceptance review: ${r.diagnosis.replace(/^Every (target is met|part is achieved), but not the intent: /, "")} → ${r.next.replace(/[.\s]+$/, "")}. Put that check on the scorecard (climb_scorecard): one that already passes is welcome, and once every metric meets its target the review is asked again. Or give it a part (climb_split).`
 			: `[climb ${g.id}] Every target is met, yet the goal is not achieved${tag}: the targets were met once, not confirmed. The next measurement confirms them.${judged}`;
 	}
 	return `[climb ${g.id}] Keep climbing${tag}. State: ${cardSummary(g)}.${tried ? ` Levers tried: ${tried}.` : ""}${judged}${lessons(st, g)} Pick the lever with the highest expected gain on the metric furthest from target and call climb_experiment.`;

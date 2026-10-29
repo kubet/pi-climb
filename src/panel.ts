@@ -111,7 +111,7 @@ function stateChip(st: State, g: Goal): string {
 	if (g.judge?.verdict === "stuck" && g.progressSeq < g.judgeSeq) return `<span class="chip critical">✕ stuck · needs you</span>`;
 	const busy = openIn(st, g);
 	if (busy) return `<span class="chip neutral">● ${esc(busy.open!.id)} running</span>`;
-	if (g.reviewed) return `<span class="chip warning">⚠ targets met · review holds it</span>`;
+	if (g.reviewed) return `<span class="chip warning">⚠ ${parts(st, g).length ? "parts achieved" : "targets met"} · review holds it</span>`;
 	return g.card ? `<span class="chip neutral">climbing</span>` : `<span class="chip neutral">researching</span>`;
 }
 
@@ -218,7 +218,7 @@ function verdict(st: State, root: Goal, now: number): { headline: string; lede: 
 	const nowText = busy
 		? ` Now: ${busy.open!.id} "${busy.open!.lever}" on ${busy.id}, open ${ago(busy.open!.ts, now).replace(" ago", "")}.`
 		: waiting
-			? ` Now: ${waiting.id} meets every target; the acceptance review wants one more check first.`
+			? ` Now: ${waiting.id} ${parts(st, waiting).length ? "has every part achieved" : "meets every target"}; the acceptance review wants more first: ${waiting.reviewed!.next}.`
 			: "";
 	return { headline, lede: `${closedText}${lastText}${nowText}` };
 }

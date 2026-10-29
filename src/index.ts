@@ -1150,7 +1150,7 @@ export default async function climb(pi: ExtensionAPI) {
 			if (g.reviewed && metrics.every(m => L.met(m, m.baseline))) {
 				say("acceptance review: every metric meets its target here; is the intent met?");
 				const { unmet, closedUp } = await accept(ctx, root, g, Object.fromEntries(metrics.map(m => [m.name, m.baseline])));
-				if (!unmet) await writeExport(root);
+				await writeExport(root);
 				const st = refresh(ctx, root);
 				verdict = unmet ? unmetText(unmet) : achievedText(st, ctx, st.goals.get(g.id) ?? g, closedUp);
 			} else refresh(ctx, root);
