@@ -82,6 +82,7 @@ export function refusal(error: string): string {
 		[/already meets its target/, "target already met"],
 		[/Fix these metric commands|Control measurement failed|Measurement failed/, "a metric command crashed"],
 		[/guard must pass/, "guard failed"],
+		[/since the last measured baseline/, "unmeasured commits refused"],
 		[/dropped in a row/, "drop-streak gate"],
 		[/judge is reviewing|STALLED/, "stall gate"],
 		[/a probe, not a scorecard metric/, "prediction rests on a probe"],
@@ -121,7 +122,7 @@ export function stats(traces: Trace[], ledger: Entry[], nowMs: number, windowMs 
 	const reuse = t.filter((x): x is ReuseT => x.kind === "reuse");
 	const judges = t.filter((x): x is JudgeT => x.kind === "judge");
 	if (!tools.length && !runs.length) return "efficiency: nothing traced yet";
-	const out: string[] = [`efficiency, last ${dur(Math.min(windowMs, nowMs - Math.min(...t.map(x => epoch(x.ts)))))}:`];
+	const out: string[] = [`efficiency, traced over the last ${dur(Math.min(windowMs, nowMs - Math.min(...t.map(x => epoch(x.ts)))))}:`];
 
 	const byTool = new Map<string, number>();
 	for (const x of tools) byTool.set(x.tool, (byTool.get(x.tool) ?? 0) + x.ms);
@@ -168,8 +169,9 @@ export function stats(traces: Trace[], ledger: Entry[], nowMs: number, windowMs 
 		const cycles = results.map(r => exps.get(`${r.goal}|${r.exp}`)).map((e, i) => (e ? epoch(results[i].ts) - epoch(e.ts) : 0)).filter(Boolean);
 		const kept = results.filter(r => r.verdict === "kept");
 		const hours = Math.max(1 / 60, (nowMs - Math.max(since, Math.min(...t.map(x => epoch(x.ts)), ...results.map(r => epoch(r.ts))))) / 3_600_000);
+		const abandoned = results.filter(r => r.reason.startsWith("abandoned:")).length;
 		out.push(
-			`- experiments ${results.length} (${(results.length / hours).toFixed(1)}/h, median ${dur(medianOf(cycles))} from registration to verdict): ${kept.length} kept${kept.some(r => r.proof) ? ` (${kept.filter(r => r.proof).length} by proof)` : ""}, ${results.length - kept.length} dropped`,
+			`- experiments decided in the last ${dur(nowMs - Math.max(since, Math.min(...results.map(r => epoch(r.ts)))))}: ${results.length} (${(results.length / hours).toFixed(1)}/h, median ${dur(medianOf(cycles))} from registration to verdict): ${kept.length} kept${kept.some(r => r.proof) ? ` (${kept.filter(r => r.proof).length} by proof)` : ""}, ${results.length - kept.length} dropped${abandoned ? ` (${abandoned} abandoned unmeasured)` : ""}`,
 		);
 	}
 	if (judges.length)

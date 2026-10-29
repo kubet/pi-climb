@@ -171,7 +171,12 @@ export default async function climb(pi: ExtensionAPI) {
 					r = await run(root, m.cmd, m.timeout_s * 1000, { ...tag, metric: m.name }, signal, true);
 				}
 				// An operator interrupt is not a verdict: nothing is decided or reverted.
-				if (signal?.aborted) throw new Error("Measurement interrupted; nothing was decided and the experiment stays open.");
+				if (signal?.aborted)
+					throw new Error(
+						["control", "aa", "smoke"].includes(tag.phase)
+							? "Measurement interrupted; nothing was registered."
+							: "Measurement interrupted; nothing was decided and the experiment stays open.",
+					);
 				if (r.code !== 0) {
 					errors.push(`${m.name}: exit ${r.code}${r.killed ? " (killed/timeout)" : ""}: ${tail(r.stderr || r.stdout)}`);
 					break;

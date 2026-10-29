@@ -192,8 +192,9 @@ function section(st: State, g: Goal, nowMs: number): string[] {
 		}
 		const kept = g.results.filter(r => r.verdict === "kept").length;
 		const proved = g.results.filter(r => r.proof).length;
+		const abandoned = g.results.filter(r => r.reason.startsWith("abandoned:")).length;
 		out.push(
-			`  experiments: ${g.results.length} (${kept} kept${proved ? `, ${proved} of them by proof` : ""}, ${g.results.length - kept} dropped)${g.open ? ` · open ${g.open.id} "${g.open.lever}"` : ""}`,
+			`  experiments: ${g.results.length} (${kept} kept${proved ? `, ${proved} of them by proof` : ""}, ${g.results.length - kept} dropped${abandoned ? `, ${abandoned} of them abandoned unmeasured` : ""})${g.open ? ` · open ${g.open.id} "${g.open.lever}"` : ""}`,
 		);
 		const levers = [...g.levers.entries()].map(([k, l]) => `${k} ${l.kept}/${l.tried}`);
 		if (levers.length) out.push(`  levers (kept/tried): ${levers.join(", ")}`);
