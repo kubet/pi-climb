@@ -25,7 +25,7 @@ const LEDGER_GUARD = "The climb ledger (.climb/) is append-only and owned by the
 
 type Ctx = ExtensionContext;
 type Progress = (text: string) => void;
-type Tag = { phase: T.Phase; goal?: string; metric?: string };
+type Tag = { phase: T.Phase; goal?: string; metric?: string; tree?: string };
 type Update = (partial: { content: { type: "text"; text: string }[] }) => void;
 // Instruments outside the repo worth warning about; system tools are not instruments.
 /** A positive number, or the default: strict-schema providers send 0 or null for "not given". */
@@ -231,7 +231,7 @@ export default async function climb(pi: ExtensionAPI) {
 		}
 		// The plan's metrics count only the runs still needed: `stop` judges the real metric.
 		const byName = new Map(metrics.map(m => [m.name, m]));
-		const r = await measure(root, plan, tag, signal, prior, progress, stop && ((m, xs) => stop(byName.get(m.name)!, xs)));
+		const r = await measure(root, plan, { ...tag, tree: t }, signal, prior, progress, stop && ((m, xs) => stop(byName.get(m.name)!, xs)));
 		// Good runs are kept even when a later run of the same metric crashed: a retry only tops up.
 		for (const m of plan) {
 			const key = `${t}\0${m.cmd}`;
@@ -459,6 +459,29 @@ export default async function climb(pi: ExtensionAPI) {
 	}
 
 	const efficiency = (root: string) => T.stats(T.read(root), L.read(root), L.clock.ms());
+
+	/** Where a scorecard's history starts: runs since then (its own A/A included) measure its metrics. */
+	function cardSince(root: string, g: L.Goal): number {
+		const cards = L.read(root).filter((e): e is L.CardE => e.kind === "card" && e.goal === g.id);
+		const cur = cards.at(-1);
+		const prev = cards.at(-2);
+		return Math.max(prev ? L.epoch(prev.ts) : L.epoch(g.created), cur ? L.epoch(cur.ts) - 2 * 3_600_000 : 0);
+	}
+
+	/** The scorecard with each metric's noise raised to what its run history shows: back-to-back A/A
+	 *  runs see one calm moment, while runs of unchanged code across hours also see drift and load. */
+	function effective(root: string, g: L.Goal, traces = T.read(root)): { metrics: L.Metric[]; notes: string[] } {
+		const since = cardSince(root, g);
+		const notes: string[] = [];
+		const metrics = g.card!.metrics.map(m => {
+			const p = T.pooledSd(traces, g.id, m.name, since);
+			const n = p ? X.noiseFromSd(p.sd, m.samples) : 0;
+			if (n <= m.noise) return m;
+			notes.push(`${m.name} noise re-estimated at ±${(n * 100).toFixed(1)}% from ${p!.runs} runs of ${p!.trees} unchanged trees (the scorecard's A/A said ±${(m.noise * 100).toFixed(1)}%)`);
+			return { ...m, noise: n };
+		});
+		return { metrics, notes };
+	}
 
 	/** .climb/export.json: the ledger as evidence rows (benchmaxx schema), rewritten after every decision. */
 	async function writeExport(root: string, file = path.join(root, L.DIR, "export.json")): Promise<{ file: string; rows: number; findings: number }> {
@@ -1036,10 +1059,17 @@ export default async function climb(pi: ExtensionAPI) {
 			if (control.errors.length) throw new Error(`Control measurement failed at ${base.slice(0, 8)}:\n${control.errors.join("\n")}`);
 			let adopted = "";
 			if (unmeasured) {
-				const worse = g.baseValues ? X.regressions(g.card.metrics, g.baseValues, control.values) : [];
+				// Judge against everything measured on the baseline tree, not one window of it, and with a
+				// higher bar: this is a sanity check on commits outside experiments, and drift is not a regression.
+				const traces = T.read(root);
+				const baseTree = (await tree(root, g.baseRef!)) ?? "";
+				const since = cardSince(root, g);
+				const reference = Object.fromEntries(g.card.metrics.map(m => [m.name, T.treeMedian(traces, g.id, m.name, baseTree, since) ?? g.baseValues?.[m.name]])) as L.Values;
+				const lenient = effective(root, g, traces).metrics.map(m => ({ ...m, noise: 2 * m.noise }));
+				const worse = X.regressions(lenient, reference, control.values);
 				if (worse.length)
 					throw new Error(
-						`Commits since the last measured baseline ${unmeasured} regressed ${worse.map(m => `${m.name} ${g.baseValues![m.name]}→${control.values[m.name]}`).join(", ")}. Revert them (git revert) or register them as an experiment; unmeasured regressions cannot lower the bar. If another part's kept change caused it, that is a trade-off between parts: re-baseline this part with climb_scorecard to accept it.`,
+						`Commits since the last measured baseline ${unmeasured} regressed ${worse.map(m => `${m.name} ${+reference[m.name].toPrecision(6)}→${+control.values[m.name].toPrecision(6)} (beyond twice its ±${(m.noise * 50).toFixed(1)}% noise)`).join(", ")}. Revert them (git revert) or register them as an experiment; unmeasured regressions cannot lower the bar. If another part's kept change caused it, that is a trade-off between parts: re-baseline this part with climb_scorecard to accept it.`,
 					);
 				adopted = ` Adopted commits since ${unmeasured}: guard passes, no regression.`;
 			}
@@ -1101,18 +1131,31 @@ export default async function climb(pi: ExtensionAPI) {
 			const moved = await instrumentChanged(root, g.card, exp.base);
 			const gates: L.Gates = { guard: !g.card.guard ? "none" : reason ? "fail" : "pass", instrument: moved.length ? "changed" : "same" };
 			if (moved.length && !reason) reason = `instrument changed (${moved.join(", ")}): the measurement is not comparable`;
+			let noted = "";
 			if (!reason) {
-				let r = await measure(root, g.card.metrics, { phase: "result", goal: g.id }, signal, {}, say);
+				const candidate = await tree(root);
+				const eff = effective(root, g);
+				let r = await measure(root, g.card.metrics, { phase: "result", goal: g.id, tree: candidate }, signal, {}, say);
 				// Within 2x noise either way: measure again before deciding, so noise
 				// neither keeps a lucky draw nor kills a real gain.
-				if (!r.errors.length && X.borderline(g.card.metrics, exp.ref, r.values)) r = await measure(root, g.card.metrics, { phase: "recheck", goal: g.id }, signal, r.samples, t => say(t && `re-measure (borderline) ${t}`));
+				if (!r.errors.length && X.borderline(eff.metrics, exp.ref, r.values))
+					r = await measure(root, g.card.metrics, { phase: "recheck", goal: g.id, tree: candidate }, signal, r.samples, t => say(t && `re-measure (borderline) ${t}`));
 				// A crashed instrument is not evidence against the change: decide nothing.
 				if (r.errors.length)
 					throw new Error(
 						`Measurement failed, even after retrying each failed run once; nothing was decided and ${exp.id} stays open:\n${r.errors.join("\n")}\nFlaky: call climb_measure again. Broken by your change: fix it, commit, measure again. Instrument broken: climb_measure with abandon, repair it, re-baseline with climb_scorecard.`,
 					);
 				({ values, samples } = r);
-				const v = X.verdict(g.card.metrics, exp.ref, values);
+				const v = X.verdict(eff.metrics, exp.ref, values);
+				// Contention is the first suspect when a result moves: say when the two sides ran under different load.
+				const traces = T.read(root);
+				const since = L.epoch(exp.ts) - 3_600_000;
+				const baseTree = (await tree(root, exp.base)) ?? "";
+				const loadBefore = T.loadOf(traces, g.id, baseTree, ["control", "aa", "smoke"], since);
+				const loadAfter = candidate ? T.loadOf(traces, g.id, candidate, ["result", "recheck"], since) : undefined;
+				if (loadBefore !== undefined && loadAfter !== undefined && Math.max(loadBefore, loadAfter) > 1 && Math.max(loadBefore, loadAfter) > 2 * Math.min(loadBefore, loadAfter))
+					noted += ` Note: the ${loadAfter > loadBefore ? "candidate" : "control"} ran under heavier load (${loadAfter} vs ${loadBefore} load average).`;
+				if (eff.notes.length) noted += ` Note: ${eff.notes.join("; ")}.`;
 				({ kept, reason } = v);
 				// A registered proof is the experiment's own claim: it must hold for any keep, and
 				// when nothing regressed it keeps a fix the scorecard is too coarse to see.
@@ -1140,6 +1183,7 @@ export default async function climb(pi: ExtensionAPI) {
 					if (!failed) gates.proof = "pass";
 				}
 			}
+			if (noted) reason = `${reason}${noted}`;
 			let reverted: string | undefined;
 			if (!kept) {
 				const rv = await revert(root, exp, reason!);

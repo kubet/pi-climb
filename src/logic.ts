@@ -69,9 +69,11 @@ export function noiseOf(xs: number[], baseline: number, samples: number): number
 	if (n < 2) return 0;
 	const mean = xs.reduce((s, x) => s + x, 0) / n;
 	const sd = Math.sqrt(xs.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1));
-	const se = (samples >= 3 ? 1.2533 : 1) / Math.sqrt(samples); // a median is ~1.25x noisier than a mean
-	return (2 * Math.SQRT2 * se * sd) / (Math.abs(baseline) || 1);
+	return noiseFromSd(sd / (Math.abs(baseline) || 1), samples);
 }
+
+/** Decision noise from a relative per-run standard deviation (a median is ~1.25x noisier than a mean). */
+export const noiseFromSd = (sdRel: number, samples: number) => 2 * Math.SQRT2 * ((samples >= 3 ? 1.2533 : 1) / Math.sqrt(samples)) * sdRel;
 
 /** Fewest samples (≤ 9) that bring a metric's noise under `need`. */
 export function samplesFor(xs: number[], baseline: number, need: number): number | undefined {

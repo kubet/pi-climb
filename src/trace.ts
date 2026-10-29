@@ -20,6 +20,8 @@ export interface RunT extends Base {
 	kind: "run";
 	phase: Phase;
 	metric?: string;
+	/** Git tree measured: runs of one tree, at any time, are A/A data for its metric. */
+	tree?: string;
 	ms: number;
 	code: number;
 	value?: number;
@@ -101,6 +103,43 @@ export const dur = (ms: number) => {
 	return ms < 1000 ? `${Math.round(ms)}ms` : ms < 60_000 ? `${Math.round(ms / 1000)}s` : m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
 };
 const sum = (xs: number[]) => xs.reduce((s, x) => s + x, 0);
+
+const good = (traces: Trace[], goal: string, metric: string, sinceMs: number) =>
+	traces.filter((x): x is RunT & { value: number } => x.kind === "run" && x.goal === goal && x.metric === metric && x.code === 0 && typeof x.value === "number" && epoch(x.ts) >= sinceMs);
+
+/** Relative per-run spread pooled over every tree measured since `sinceMs`. Back-to-back A/A runs
+ *  catch one calm moment; runs of the same code across hours also catch drift and load. */
+export function pooledSd(traces: Trace[], goal: string, metric: string, sinceMs: number): { sd: number; runs: number; trees: number } | undefined {
+	const byTree = new Map<string, number[]>();
+	for (const r of good(traces, goal, metric, sinceMs)) if (r.tree) byTree.set(r.tree, [...(byTree.get(r.tree) ?? []), r.value]);
+	let ss = 0;
+	let dof = 0;
+	let runs = 0;
+	let trees = 0;
+	for (const xs of byTree.values()) {
+		const mean = sum(xs) / xs.length;
+		if (xs.length < 2 || !mean) continue;
+		ss += xs.reduce((s, x) => s + ((x - mean) / mean) ** 2, 0);
+		dof += xs.length - 1;
+		runs += xs.length;
+		trees++;
+	}
+	return dof >= 4 ? { sd: Math.sqrt(ss / dof), runs, trees } : undefined;
+}
+
+/** Median of every good run of one tree since `sinceMs`: a steadier reference than a single window. */
+export function treeMedian(traces: Trace[], goal: string, metric: string, tree: string, sinceMs: number): number | undefined {
+	const xs = good(traces, goal, metric, sinceMs).filter(r => r.tree === tree).map(r => r.value);
+	return xs.length ? medianOf(xs) : undefined;
+}
+
+/** Median load of a tree's good runs in some phases since `sinceMs`. */
+export function loadOf(traces: Trace[], goal: string, tree: string, phases: Phase[], sinceMs: number): number | undefined {
+	const xs = traces
+		.filter((x): x is RunT => x.kind === "run" && x.goal === goal && x.tree === tree && phases.includes(x.phase) && typeof x.load === "number" && epoch(x.ts) >= sinceMs)
+		.map(x => x.load!);
+	return xs.length ? medianOf(xs) : undefined;
+}
 
 /** Typical duration of one good run of a metric, from recent traces. */
 export function runMs(traces: Trace[], goal: string, metric: string): number | undefined {

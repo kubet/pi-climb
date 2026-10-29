@@ -903,3 +903,36 @@ describe("decomposition without an independent judge", () => {
 		}
 	});
 });
+
+// Live: retrieval latency on unchanged code read 778 ms in a calm window and 946-1487 ms an hour later
+// under load; a 3-run A/A said ±17%, and a test-only commit was refused as a "regression".
+describe("drift", () => {
+	test("noise is re-learned from all runs of unchanged code, and adoption is judged against that history", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-drift-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		const clock = L.clock.ms;
+		let shift = 0;
+		L.clock.ms = () => clock() + shift;
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > .git/level && echo x > README.md && git add -A && git commit -qm init");
+			const z = host(d, "main", "drift");
+			await z.load();
+			await z.cmd("faster");
+			await z.tool("climb_scorecard", { metrics: [{ name: "ms", cmd: "cat .git/level", dir: "down", target: 10, noise: 0.05, samples: 3 }] });
+			// The world gets slower: the same tree now reads 130 (no cache: 31 minutes later).
+			await run("echo 130 > .git/level");
+			shift = 31 * 60_000;
+			await z.tool("climb_experiment", { lever: "noop", hypothesis: "", prediction: "" });
+			await run("echo y >> README.md && git commit -qam noop");
+			const out = await z.tool("climb_measure", {});
+			expect(out).toContain("noise re-estimated at");
+			// A docs-only commit outside any experiment, measured in an even slower window.
+			await run("echo z >> README.md && git commit -qam docs && echo 160 > .git/level");
+			shift = 62 * 60_000;
+			expect(await z.tool("climb_experiment", { lever: "next", hypothesis: "", prediction: "" })).toContain("Adopted commits");
+		} finally {
+			L.clock.ms = clock;
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+});
