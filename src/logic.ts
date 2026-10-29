@@ -165,10 +165,9 @@ export function goalPct(st: State, g: Goal): number {
 	return Math.min(...(goals.length ? goals : g.card.metrics).map(m => progressPct(m, g.best[m.name])));
 }
 
-/** Every target met (or, for a split goal, every part achieved) and still not achieved: what the acceptance
- *  review found missing (or an unconfirmed meet) is all that is left. A split goal's old scorecard is history. */
-const finishing = (st: State, g: Goal) =>
-	!umbrella(st, g) && !g.done && (parts(st, g).length ? !!g.reviewed : !!g.card && g.card.metrics.every(m => m.hold || met(m, g.best[m.name])));
+/** Held open by the acceptance review with every target met (or every part achieved): what the review
+ *  found missing is all that is left. A split goal's old scorecard is history. */
+const finishing = (st: State, g: Goal) => !umbrella(st, g) && !g.done && !g.open && !!g.reviewed;
 
 /** "1/3": parts achieved of those still counted (abandoned parts are not). */
 const partsDone = (st: State, g: Goal) => {
@@ -184,12 +183,13 @@ export function statusLine(st: State, nowMs = clock.ms()): string | undefined {
 	if (!goals.length) return undefined;
 	const shown = goals.map(g => {
 		const split = umbrella(st, g);
-		if (!g.card && !split) return `${g.id}: researching (${g.probes.filter(p => p.value !== undefined).length} probes)`;
+		const ps = parts(st, g).length;
+		if (!g.card && !ps) return `${g.id}: researching (${g.probes.filter(p => p.value !== undefined).length} probes)`;
 		const due = g.lastBeat ? Math.max(0, g.cfg.beat_s - (nowMs - epoch(g.lastBeat.ts)) / 1000) : g.cfg.beat_s;
 		const flag = stuck(g) ? " STUCK" : g.stallPending ? " STALL" : "";
 		const busy = openIn(st, g);
 		const where = busy ? ` · ${busy.open!.id}${busy !== g ? ` on ${busy.id}` : ""}` : "";
-		return `${g.id} ${goalPct(st, g)}%${split ? ` · ${partsDone(st, g)} parts achieved` : ""} · stale ${g.lastBeat?.stale ?? 0}/${g.cfg.poke_max}${where} · beat ${Math.ceil(due / 60)}m${flag}`;
+		return `${g.id} ${goalPct(st, g)}%${ps ? ` · ${partsDone(st, g)} parts achieved` : ""}${g.reviewed && !split ? " · review holds it" : ""} · stale ${g.lastBeat?.stale ?? 0}/${g.cfg.poke_max}${where} · beat ${Math.ceil(due / 60)}m${flag}`;
 	});
 	return `⛰ ${st.paused ? "PAUSED " : ""}${shown.join(" | ")}`;
 }
@@ -221,7 +221,8 @@ function section(st: State, g: Goal, nowMs: number): string[] {
 		// A split goal climbs through its parts; its own scorecard is history from before the split.
 		if (g.card && umbrella(st, g)) out.push("  scorecard before the split (history; the parts below carry the climb):");
 		if (!g.card) {
-			if (umbrella(st, g) && !g.probes.length) return out;
+			if (g.reviewed && !g.done && !umbrella(st, g)) out.push(`  held by the acceptance review (${ago(g.reviewed.ts, nowMs)}): ${g.reviewed.diagnosis} → ${g.reviewed.next}`);
+			if (parts(st, g).length && !g.probes.length) return out;
 			out.push(`researching: ${g.probes.length} research items probed`);
 			for (const p of g.probes.slice(-8)) out.push(`  · ${p.name} = ${p.value ?? `failed (${p.error})`}${p.note ? ` — ${p.note}` : ""}`);
 			return out;
@@ -291,6 +292,14 @@ export function nextAction(st: State, g: Goal): string {
 		const list = ps.map(p => `${p.id} (${p.card || umbrella(st, p) ? `${goalPct(st, p)}%` : "researching"}${openIn(st, p) ? `, ${openIn(st, p)!.open!.id} open` : ""})`).join(", ");
 		return `[climb ${g.id}] Split into parts: ${list}. Next, ${next.id}: ${nextAction(st, next)}`;
 	}
+	if (finishing(st, g)) {
+		// The review's finding, not a later note (the worker's own included), says what is left.
+		const r = g.reviewed!;
+		const what = `${r.diagnosis.replace(/^Every (target is met|part is achieved), but not the intent: /, "")} → ${r.next.replace(/[.\s]+$/, "")}`;
+		return parts(st, g).length
+			? `[climb ${g.id}] Every part is achieved, yet the goal is not achieved${tag}. The acceptance review: ${what}. Give that a part of its own (climb_split; one more part is fine), or put that check on a scorecard for ${g.id} (climb_scorecard): one that already passes is welcome, and once every metric meets its target the review is asked again.`
+			: `[climb ${g.id}] Every target is met, yet the goal is not achieved${tag}. The acceptance review: ${what}. Put that check on the scorecard next to the current metrics (climb_scorecard): one that already passes is welcome, and once every metric meets its target the review is asked again.`;
+	}
 	if (!g.card) {
 		const n = g.probes.filter(p => p.value !== undefined).length;
 		const judged = g.judge ? ` Judge (${g.judge.verdict}): ${g.judge.diagnosis} → ${g.judge.next}.` : "";
@@ -300,13 +309,6 @@ export function nextAction(st: State, g: Goal): string {
 		return `[climb ${g.id}] Experiment ${g.open.id} is open (lever "${g.open.lever}": ${g.open.hypothesis}). Finish it: implement, commit, then call climb_measure${tag}. State: ${cardSummary(g)}.`;
 	const tried = [...g.levers.entries()].map(([k, l]) => `${k} (${l.kept}/${l.tried} kept)`).join(", ");
 	const judged = g.diagnosis ? ` Last diagnosis (${g.diagnosis.by}): ${g.diagnosis.verdict} — ${g.diagnosis.next}.` : "";
-	if (finishing(st, g)) {
-		// The review's finding, not a later note (the worker's own included), says what is left.
-		const r = g.reviewed;
-		return r
-			? `[climb ${g.id}] ${parts(st, g).length ? "Every part is achieved" : "Every target is met"}, yet the goal is not achieved${tag}. The acceptance review: ${r.diagnosis.replace(/^Every (target is met|part is achieved), but not the intent: /, "")} → ${r.next.replace(/[.\s]+$/, "")}. Put that check on the scorecard (climb_scorecard): one that already passes is welcome, and once every metric meets its target the review is asked again. Or give it a part (climb_split).`
-			: `[climb ${g.id}] Every target is met, yet the goal is not achieved${tag}: the targets were met once, not confirmed. The next measurement confirms them.${judged}`;
-	}
 	return `[climb ${g.id}] Keep climbing${tag}. State: ${cardSummary(g)}.${tried ? ` Levers tried: ${tried}.` : ""}${judged}${lessons(st, g)} Pick the lever with the highest expected gain on the metric furthest from target and call climb_experiment.`;
 }
 

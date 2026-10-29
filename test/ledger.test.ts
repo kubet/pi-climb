@@ -103,6 +103,33 @@ describe("ledger fold", () => {
 		{ ts: iso(4e6, nowMs), kind: "card", goal: "g", metrics: [metric()] },
 	];
 
+	test("review holds: a split goal without a card of its own, re-ask cards, unconfirmed meets", () => {
+		const review = (goal: string, t: number): L.Entry => ({ ts: iso(t, nowMs), kind: "judge", goal, by: "judge", review: true, verdict: "continue", diagnosis: "Every part is achieved, but not the intent: no real call", next: "grade a real call" });
+		const tree = L.fold([
+			{ ts: iso(9e6, nowMs), kind: "goal", goal: "r", intent: "voice", cfg: { poke_max: 3, beat_s: 1800 } },
+			{ ts: iso(8e6, nowMs), kind: "goal", goal: "a", parent: "r", intent: "a", cfg: { poke_max: 3, beat_s: 1800 } },
+			{ ts: iso(8e6, nowMs), kind: "goal", goal: "b", parent: "r", intent: "b", cfg: { poke_max: 3, beat_s: 1800 } },
+			{ ts: iso(7e6, nowMs), kind: "done", goal: "a", result: "achieved", values: {} },
+			{ ts: iso(6e6, nowMs), kind: "done", goal: "b", result: "achieved", values: {} },
+			review("r", 5e6),
+		]);
+		const next = X.nextAction(tree, tree.goals.get("r")!);
+		expect(next).toContain("Every part is achieved, yet the goal is not achieved. The acceptance review: no real call → grade a real call.");
+		expect(next).not.toContain("Researching");
+		expect(X.report(tree, nowMs)).toContain("held by the acceptance review");
+		// A re-ask card keeps the hold (a crash mid-review can ask again); any other card ends it.
+		const held = (card: Partial<L.CardE>) => L.fold([...base(), review("g", 3.5e6), { ts: iso(3e6, nowMs), kind: "card", goal: "g", metrics: [metric()], ...card } as L.Entry]).goals.get("g")!.reviewed;
+		expect(held({ reask: true })).toBeDefined();
+		expect(held({})).toBeUndefined();
+		// Targets met once and not confirmed: keep climbing, with the state.
+		const once = L.fold([
+			...base(),
+			{ ts: iso(3e6, nowMs), kind: "exp", goal: "g", id: "x1", lever: "c", hypothesis: "", prediction: "", base: "a", ref: { ms: 100 } },
+			{ ts: iso(2e6, nowMs), kind: "result", goal: "g", exp: "x1", head: "b", values: { ms: 8 }, verdict: "kept", reason: "" },
+		]);
+		expect(X.nextAction(once, once.goals.get("g")!)).toContain("Keep climbing. State: ms 8");
+	});
+
 	test("a later card keeps each metric's first baseline while its command is unchanged", () => {
 		const st = L.fold([
 			...base(),

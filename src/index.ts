@@ -571,6 +571,7 @@ export default async function climb(pi: ExtensionAPI) {
 			const ps = L.parts(st, parent);
 			if (!ps.every(c => c.done?.result === "achieved")) break;
 			const r = await review(ctx, root, parent);
+			if (!r && parent.reviewed) break;
 			if (r && !r.achieved) {
 				append(root, { ts: L.now(), kind: "judge", goal: parent.id, by: "judge", review: true, verdict: "continue", diagnosis: `Every part is achieved, but not the intent: ${r.unmet}`, next: r.next });
 				break;
@@ -586,6 +587,9 @@ export default async function climb(pi: ExtensionAPI) {
 	 *  maybe its parents); otherwise what is missing is recorded and the goal stays open. */
 	async function accept(ctx: Ctx, root: string, g: L.Goal, values: L.Values): Promise<{ unmet?: { unmet: string; next: string }; closedUp: string[] }> {
 		const r = await review(ctx, root, g);
+		// A review that cannot run does not hold a goal open, unless it already held this one: then only it can release it.
+		if (!r && g.reviewed)
+			return { unmet: { unmet: "the acceptance review could not run this time, and it held this goal before, so the goal stays open", next: "ask it again: climb_scorecard with the same checks" }, closedUp: [] };
 		if (r && !r.achieved) {
 			append(root, { ts: L.now(), kind: "judge", goal: g.id, by: "judge", review: true, verdict: "continue", diagnosis: `Every target is met, but not the intent: ${r.unmet}`, next: r.next });
 			return { unmet: r, closedUp: [] };
@@ -594,7 +598,7 @@ export default async function climb(pi: ExtensionAPI) {
 		return { closedUp: await rollUp(ctx, root, g.id) };
 	}
 	const unmetText = (u: { unmet: string; next: string }) =>
-		`EVERY TARGET MET, BUT THE INTENT IS NOT DONE (acceptance review): ${u.unmet}\nNEXT: ${u.next}. Put what is missing on the scorecard (climb_scorecard; a check that already passes is welcome: when every metric meets its target there, the review is asked again) or into a part (climb_split).`;
+		`EVERY TARGET MET, BUT THE INTENT IS NOT DONE (acceptance review): ${u.unmet}\nNEXT: ${u.next}. Put what is missing on the scorecard next to the current metrics (climb_scorecard; a check that already passes is welcome: when every metric meets its target there, the review is asked again).`;
 	function achievedText(st: L.State, ctx: Ctx, g: L.Goal, closedUp: string[]): string {
 		let text = `GOAL ACHIEVED: ${g.id}, every target met.${g.card?.parked?.length ? ` Parked metrics remain: ${g.card.parked.join(", ")}.` : ""}${closedUp.length ? ` That completes ${closedUp.join(" and ")}: every part achieved.` : ""}`;
 		const rest = L.roots(st);
@@ -1048,6 +1052,11 @@ export default async function climb(pi: ExtensionAPI) {
 				if (!m.hold && typeof m.target !== "number") throw new Error(`${m.name} needs a target, or hold: true if it is a constraint like "no slower".`);
 				names.add(m.name);
 			}
+			// The review is asked about the whole goal: what the held card met must still be on the card, and still met.
+			const held = g.reviewed && g.card && !L.parts(st0, g).length ? g.card : undefined;
+			const dropped = held?.metrics.filter(o => !p.metrics!.some(m => m.name === o.name && m.cmd === o.cmd)) ?? [];
+			if (dropped.length)
+				throw new Error(`Keep ${dropped.map(m => m.name).join(", ")} on the scorecard (same command; hold: true is fine): the acceptance review is asked about the whole goal, so what was met must be shown still met at HEAD.`);
 			if (p.metrics.every(m => m.hold))
 				throw new Error(
 					g.reviewed
@@ -1150,12 +1159,22 @@ export default async function climb(pi: ExtensionAPI) {
 			const frozenNow = new Set(X.touchedFrozen(blobs.map(b => b.file), frozen));
 			const instrument = sha([...commands, ...blobs.filter(b => frozenNow.has(b.file)).map(b => `${b.file} ${b.blob}`)].join("\n")).slice(0, 16);
 			const h = await head(root);
-			append(root, { ts: L.now(), kind: "card", goal: g.id, metrics, guard: p.guard, frozen, head: h, parked: p.parked, axioms: p.axioms, instrument, env: ENV });
-			// Verifications the review asked for, all passing: the A/A runs are the confirmation, and the review decides again.
+			// Verifications the review asked for, all passing (and the held card's metrics still at their old targets):
+			// the A/A runs are the confirmation, and the review decides again.
+			const baselines = Object.fromEntries(metrics.map(m => [m.name, m.baseline]));
+			const allMet = metrics.every(m => L.met(m, m.baseline));
+			// Everything on the card met, but a metric the review saw met has slipped since: nothing here could climb it back.
+			const slipped = held?.metrics.filter(o => !L.met(o, baselines[o.name])) ?? [];
+			if (g.reviewed && allMet && slipped.length)
+				throw new Error(
+					`${slipped.map(o => `${o.name} is ${baselines[o.name]} at HEAD, ${o.hold ? `a regression from ${o.baseline}` : `short of its target ${o.target}`}`).join("; ")}: a commit since the review undid it. Put it on the scorecard with its target to climb it back, or restore it first.\n${cached}`,
+				);
+			const reask = !!g.reviewed && allMet;
+			append(root, { ts: L.now(), kind: "card", goal: g.id, metrics, guard: p.guard, frozen, head: h, parked: p.parked, axioms: p.axioms, instrument, env: ENV, reask: reask || undefined });
 			let verdict = "Next: call climb_experiment with your highest-expected-gain lever.";
-			if (g.reviewed && metrics.every(m => L.met(m, m.baseline))) {
+			if (reask) {
 				say("acceptance review: every metric meets its target here; is the intent met?");
-				const { unmet, closedUp } = await accept(ctx, root, g, Object.fromEntries(metrics.map(m => [m.name, m.baseline])));
+				const { unmet, closedUp } = await accept(ctx, root, g, baselines);
 				await writeExport(root);
 				const st = refresh(ctx, root);
 				verdict = unmet ? unmetText(unmet) : achievedText(st, ctx, st.goals.get(g.id) ?? g, closedUp);
@@ -1575,7 +1594,8 @@ export default async function climb(pi: ExtensionAPI) {
 			const open = L.openParts(st, g).length;
 			const intents = (p.parts ?? []).map(x => x.intent?.trim()).filter(Boolean);
 			if (intents.length !== (p.parts ?? []).length || new Set(intents).size !== intents.length) throw new Error("Each part needs its own non-empty intent.");
-			if (!intents.length || (!open && intents.length < 2) || open + intents.length > X.MAX_PARTS)
+			// A goal splits into at least two parts; one already split may add a single part.
+			if (!intents.length || (!L.parts(st, g).length && intents.length < 2) || open + intents.length > X.MAX_PARTS)
 				throw new Error(`A split makes 2-${X.MAX_PARTS} parts (${g.id} has ${open} open). Focus: fewer, sharper parts.`);
 			const taken = new Set(st.goals.keys());
 			const ids = intents.map(intent => {

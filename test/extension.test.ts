@@ -1032,7 +1032,9 @@ describe("acceptance review", () => {
 			expect(out).toContain("the unicode bug was never on the scorecard");
 			const g = L.fold(L.read(d)).goals.get("g-shrink-work-and-fix")!;
 			expect(g.done).toBeUndefined();
-			expect(g.judge?.next).toBe("add a part for the unicode bug");
+			expect(g.reviewed?.next).toBe("add a part for the unicode bug");
+			// A review hold is not a stall verdict: it must not reset the stall, streak or STUCK gates.
+			expect(g.judge).toBeUndefined();
 			z.h.judge = "VERDICT: achieved\nUNMET: none\nNEXT: none";
 			await z.tool("climb_scorecard", { metrics: [{ name: "w", cmd: "cat work.txt", dir: "down", target: 30, noise: 0.05 }] });
 			await z.tool("climb_experiment", { lever: "again", hypothesis: "", prediction: "" });
@@ -1059,7 +1061,17 @@ describe("acceptance review", () => {
 			await z.tool("climb_experiment", { lever: "halve", hypothesis: "", prediction: "" });
 			await run("echo 40 > work.txt && git commit -qam halve");
 			expect(await z.tool("climb_measure", {})).toContain("THE INTENT IS NOT DONE");
-			await expect(z.tool("climb_scorecard", { metrics: [{ ...lost, hold: true }] })).rejects.toThrow("Give that check a target");
+			await expect(z.tool("climb_scorecard", { metrics: [{ ...w, hold: true }, { ...lost, hold: true }] })).rejects.toThrow("Give that check a target");
+			// The review is asked about the whole goal: the held card's metrics stay, and must still meet their old targets.
+			await expect(z.tool("climb_scorecard", { metrics: [lost] })).rejects.toThrow("Keep w on the scorecard");
+			await run("echo 100 > work.txt && git commit -qam 'outside regression'");
+			await expect(z.tool("climb_scorecard", { metrics: [{ ...w, hold: true }, lost] })).rejects.toThrow("w is 100 at HEAD, short of its target 50");
+			await run("echo 40 > work.txt && git commit -qam 'restore'");
+			// A review that cannot run does not release a goal it held; the re-ask card keeps the hold.
+			z.h.judgeThrows = true;
+			expect(await z.tool("climb_scorecard", { metrics: [w, lost] })).toContain("could not run this time");
+			expect(L.fold(L.read(d)).goals.get("g-shrink-work-without-losing")!.done).toBeUndefined();
+			z.h.judgeThrows = false;
 			z.h.judge = "VERDICT: achieved\nUNMET: none\nNEXT: none";
 			const out = await z.tool("climb_scorecard", { metrics: [w, lost] });
 			expect(out).toContain("GOAL ACHIEVED: g-shrink-work-without-losing");
@@ -1095,10 +1107,11 @@ describe("acceptance review", () => {
 			expect(s.goals.get(root)!.done).toBeUndefined();
 			const next = X.nextAction(s, s.goals.get(root)!);
 			expect(next).toContain("Every part is achieved, yet the goal is not achieved");
-			expect(next).toContain("nobody listened to a real call → add a part that grades a real call. Put");
+			expect(next).toContain("nobody listened to a real call → add a part that grades a real call. Give that a part");
 			expect(next).not.toContain("Keep climbing");
+			expect(X.statusLine(s)).toContain("2/2 parts achieved · review holds it");
 			z.h.judge = yes;
-			await z.tool("climb_split", { goal: root, parts: [{ intent: "grade a real call" }, { intent: "keep reports" }] });
+			await z.tool("climb_split", { goal: root, parts: [{ intent: "grade a real call" }] });
 			expect(X.nextAction(L.fold(L.read(d)), L.fold(L.read(d)).goals.get(root)!)).toContain("Split into parts: g-grade-a-real-call");
 		} finally {
 			fs.rmSync(d, { recursive: true, force: true });

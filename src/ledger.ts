@@ -48,6 +48,8 @@ export interface CardE extends Base {
 	instrument?: string;
 	/** The machine the baselines were measured on. */
 	env?: Env;
+	/** Passing checks put to the acceptance review again: the hold it answers stands until the review does. */
+	reask?: true;
 }
 export interface Env { host: string; os: string; arch: string; cpus: number; cpu: string; mem_gb: number; runtime: string; hash: string }
 /** How each gate came out, so a result can be audited without parsing its reason. */
@@ -260,7 +262,7 @@ export function fold(entries: Entry[]): State {
 		switch (e.kind) {
 			case "card":
 				g.card = e;
-				g.reviewed = undefined;
+				if (!e.reask) g.reviewed = undefined;
 				g.origin ??= {};
 				for (const m of e.metrics) if (g.origin[m.name]?.cmd !== m.cmd) g.origin[m.name] = { value: m.baseline, cmd: m.cmd };
 				g.baseRef = e.head;
@@ -322,8 +324,12 @@ export function fold(entries: Entry[]): State {
 				break;
 			case "judge":
 				g.diagnosis = e;
-				// (Ledgers from before the flag say so in the diagnosis.)
-				if (e.review || (e.by === "judge" && /^Every (target is met|part is achieved), but not the intent/.test(e.diagnosis))) g.reviewed = e;
+				// An acceptance review that holds a goal is not a stall verdict: the worker can ask for one, so it
+				// must not release a stall, reset the drop streak or clear STUCK. (Older ledgers say so in the diagnosis.)
+				if (e.review || (e.by === "judge" && /^Every (target is met|part is achieved), but not the intent/.test(e.diagnosis))) {
+					g.reviewed = e;
+					break;
+				}
 				// A worker grading its own work is recorded but never releases a stall, resets the
 				// stale count or opens the grid-search gate: only an independent verdict does.
 				// ("fallback" is a worker diagnosis accepted because the host has no independent judge.)
