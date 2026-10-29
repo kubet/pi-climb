@@ -207,3 +207,19 @@ describe("acceptance review", () => {
 		expect(X.parseReview("garbled").achieved).toBe(true);
 	});
 });
+
+describe("paired verdict", () => {
+	test("pairs decide the uncertain metrics; the sure ones keep their plain comparison", () => {
+		const ms = metric({ name: "ms", noise: 0.3 });
+		const err = metric({ name: "err", noise: 0.05 });
+		// ms drifted: plainly -40%, but paired back to back it is +20% every time.
+		const pairs = { ms: [[100, 80], [130, 104], [160, 128]] as [number, number][] };
+		const v = X.pairedVerdict([ms, err], pairs, { ref: { ms: 100, err: 10 }, values: { ms: 140, err: 10 } });
+		expect(v.kept).toBe(true);
+		expect(v.reason).toContain("3 pairs for ms");
+		expect(v.stats.err).toMatchObject({ gain: 0, n: 0 });
+		const worse = X.pairedVerdict([ms, err], pairs, { ref: { ms: 100, err: 10 }, values: { ms: 140, err: 20 } });
+		expect(worse).toMatchObject({ kept: false, regressed: true });
+		expect(worse.reason).toContain("err -100.0% ±5.0% (unpaired)");
+	});
+});

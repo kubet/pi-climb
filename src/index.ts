@@ -1276,9 +1276,10 @@ export default async function climb(pi: ExtensionAPI) {
 				// Borderline, or a metric whose history shows drift: the control was measured at another
 				// time, so measure base and candidate interleaved and let drift cancel. If the base cannot
 				// be checked out, fall back to measuring the candidate again.
-				const unsure = !r.errors.length && (X.borderline(eff.metrics, exp.ref, r.values) || eff.notes.length > 0);
-				if (unsure) pairs = await paired(root, exp.base, g.card.metrics, g.id, signal, t => say(t && `paired with the base: ${t}`));
-				if (unsure && !pairs && X.borderline(eff.metrics, exp.ref, r.values))
+				// Only the uncertain metrics pay for pairs: borderline here, or drifting in their history.
+				const uncertain = r.errors.length ? [] : g.card.metrics.filter((m, i) => X.borderline([eff.metrics[i]], exp.ref, r.values) || eff.metrics[i].noise > m.noise);
+				if (uncertain.length) pairs = await paired(root, exp.base, uncertain, g.id, signal, t => say(t && `paired with the base: ${t}`));
+				if (uncertain.length && !pairs && X.borderline(eff.metrics, exp.ref, r.values))
 					r = await measure(root, g.card.metrics, { phase: "recheck", goal: g.id, tree: candidate }, signal, r.samples, t => say(t && `re-measure (borderline) ${t}`));
 				// A crashed instrument is not evidence against the change: decide nothing.
 				if (r.errors.length)
@@ -1286,7 +1287,7 @@ export default async function climb(pi: ExtensionAPI) {
 						`Measurement failed, even after retrying each failed run once; nothing was decided and ${exp.id} stays open:\n${r.errors.join("\n")}\nFlaky: call climb_measure again. Broken by your change: fix it, commit, measure again. Instrument broken: climb_measure with abandon, repair it, re-baseline with climb_scorecard.`,
 					);
 				({ values, samples } = r);
-				const v = pairs ? X.pairedVerdict(g.card.metrics, pairs) : X.verdict(eff.metrics, exp.ref, values);
+				const v = pairs ? X.pairedVerdict(eff.metrics, pairs, { ref: exp.ref, values }) : X.verdict(eff.metrics, exp.ref, values);
 				// Contention is the first suspect when a result moves: say when the two sides ran under different load.
 				const traces = T.read(root);
 				const since = L.epoch(exp.ts) - 3_600_000;

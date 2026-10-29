@@ -80,22 +80,27 @@ export const noiseFromSd = (sdRel: number, samples: number) => 2 * Math.SQRT2 * 
 
 /** Control and candidate measured back to back (A B, B A, ...) cancel drift: decide on the median paired
  *  gain, with noise from the spread of the pairs themselves (floor 1%). */
-export function pairedVerdict(metrics: Metric[], pairs: Record<string, [number, number][]>) {
+export function pairedVerdict(metrics: Metric[], pairs: Record<string, [number, number][]>, plain?: { ref: Values; values: Values }) {
 	const stats: Record<string, { gain: number; noise: number; n: number }> = {};
 	for (const m of metrics) {
 		const ps = pairs[m.name] ?? [];
-		if (!ps.length) continue;
+		// Metrics that were sure enough not to need pairs keep their plain comparison.
+		if (!ps.length) {
+			if (plain && plain.ref[m.name] !== undefined && plain.values[m.name] !== undefined)
+				stats[m.name] = { gain: gain(m, plain.ref[m.name], plain.values[m.name]), noise: m.noise, n: 0 };
+			continue;
+		}
 		const gains = ps.map(([a, b]) => gain(m, a, b));
 		const n = gains.length;
 		const mean = gains.reduce((s, x) => s + x, 0) / n;
 		const sd = n > 1 ? Math.sqrt(gains.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1)) : 0;
 		stats[m.name] = { gain: median(gains), noise: Math.max(0.01, (2 * 1.2533 * sd) / Math.sqrt(n)), n };
 	}
-	const fmt = (k: string) => `${k} ${stats[k].gain >= 0 ? "+" : ""}${(stats[k].gain * 100).toFixed(1)}% ±${(stats[k].noise * 100).toFixed(1)}%`;
+	const fmt = (k: string) => `${k} ${stats[k].gain >= 0 ? "+" : ""}${(stats[k].gain * 100).toFixed(1)}% ±${(stats[k].noise * 100).toFixed(1)}%${stats[k].n ? "" : " (unpaired)"}`;
 	const names = Object.keys(stats);
 	const regressed = names.filter(k => stats[k].gain < -stats[k].noise);
 	const improved = metrics.filter(m => !m.hold && stats[m.name] && stats[m.name].gain > stats[m.name].noise).map(m => m.name);
-	const head = `paired with the base, interleaved (${Math.max(...names.map(k => stats[k].n))} pairs)`;
+	const head = `paired with the base, interleaved (${Math.max(...names.map(k => stats[k].n))} pairs for ${names.filter(k => stats[k].n).join(", ")})`;
 	if (regressed.length) return { kept: false, regressed: true, reason: `regressed, ${head}: ${regressed.map(fmt).join(", ")}`, stats };
 	if (!improved.length) return { kept: false, regressed: false, reason: `no metric beat noise, ${head}: ${names.map(fmt).join(", ")}`, stats };
 	return { kept: true, regressed: false, reason: `${head}: ${improved.map(fmt).join(", ")}`, stats };
