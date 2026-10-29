@@ -1132,7 +1132,7 @@ export default async function climb(pi: ExtensionAPI) {
 				// A temp dir (a session scratchpad, /tmp) is wiped on reboot or by cleanup: then every measurement breaks at once.
 				const temp = outside.filter(f => f.startsWith(os.tmpdir()) || /^\/(private\/)?(tmp|var\/folders)\//.test(f));
 				warnings.push(
-					`Instrument outside the repo, so climb cannot freeze or version it: ${outside.join(", ")}. A change there moves the metric invisibly.${temp.length ? ` ${temp.join(", ")} ${temp.length > 1 ? "are" : "is"} in a temp directory, cleared on reboot or cleanup: every measurement breaks then. Move ${temp.length > 1 ? "them" : "it"} into the repo or a stable path.` : ""}`,
+					`Instrument outside the repo, so climb cannot freeze or version it: ${outside.join(", ")}. A change there moves the metric invisibly.${temp.length ? ` ${temp.length === outside.length ? (temp.length > 1 ? "They are" : "It is") : `${temp.join(", ")} ${temp.length > 1 ? "are" : "is"}`} in a temp directory, cleared on reboot or cleanup: every measurement breaks then. Move ${temp.length > 1 ? "them" : "it"} into the repo or a stable path.` : ""}`,
 				);
 			}
 			if (reused.length) warnings.push(`Reused A/A runs of this commit for ${reused.join(", ")}.`);
