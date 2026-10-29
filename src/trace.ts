@@ -202,6 +202,11 @@ export function stats(traces: Trace[], ledger: Entry[], nowMs: number, windowMs 
 		);
 	}
 
+	// The guard runs once per decided candidate: on a fast metric it is most of an experiment's cost.
+	const guards = runs.filter(x => x.phase === "guard");
+	if (guards.length)
+		out.push(`- guard ${guards.length}× (median ${dur(medianOf(guards.map(x => x.ms)))}, ${guards.filter(x => x.code !== 0).length} failed); guard passes on a tree are reused for 30 minutes`);
+
 	const results = ledger.filter((e): e is ResultE => e.kind === "result" && epoch(e.ts) >= since);
 	if (results.length) {
 		const exps = new Map(ledger.filter((e): e is ExpE => e.kind === "exp").map(e => [`${e.goal}|${e.id}`, e]));

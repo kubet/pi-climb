@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import * as L from "../src/ledger";
 import * as X from "../src/logic";
+import * as T from "../src/trace";
 
 const metric = (o: Partial<L.Metric> = {}): L.Metric => ({
 	name: "ms",
@@ -221,5 +222,22 @@ describe("paired verdict", () => {
 		const worse = X.pairedVerdict([ms, err], pairs, { ref: { ms: 100, err: 10 }, values: { ms: 140, err: 20 } });
 		expect(worse).toMatchObject({ kept: false, regressed: true });
 		expect(worse.reason).toContain("err -100.0% ±5.0% (unpaired)");
+	});
+});
+
+describe("efficiency summary", () => {
+	test("reports guard cost next to metric runs", () => {
+		const now = Date.parse("2026-10-29T12:00:00Z");
+		const ts = (m: number) => new Date(now - m * 60_000).toISOString();
+		const traces: T.Trace[] = [
+			{ ts: ts(30), kind: "run", phase: "guard", goal: "g", ms: 67_000, code: 0 },
+			{ ts: ts(20), kind: "run", phase: "guard", goal: "g", ms: 4_700, code: 0 },
+			{ ts: ts(20), kind: "run", phase: "guard", goal: "g", ms: 5_100, code: 1 },
+			{ ts: ts(19), kind: "run", phase: "result", goal: "g", metric: "ms", ms: 1_000, code: 0, value: 10 },
+			{ ts: ts(18), kind: "tool", goal: "g", tool: "climb_measure", ms: 8_000, ok: true },
+		];
+		const s = T.stats(traces, [], now);
+		expect(s).toContain("guard 3× (median 5s, 1 failed)");
+		expect(s).toContain("climb tools 8s");
 	});
 });
