@@ -94,7 +94,7 @@ export interface BeatE extends Base { kind: "beat"; head: string; values?: Value
 export interface StallE extends Base { kind: "stall"; stale: number }
 /** A research item: a candidate metric the extension ran during research. */
 export interface ProbeE extends Base { kind: "probe"; name: string; cmd: string; value?: number; error?: string; note?: string }
-export interface JudgeE extends Base { kind: "judge"; by: "judge" | "worker" | "human" | "fallback"; verdict: Verdict; diagnosis: string; next: string }
+export interface JudgeE extends Base { kind: "judge"; by: "judge" | "worker" | "human" | "fallback"; verdict: Verdict; diagnosis: string; next: string; /** the acceptance review held the goal open */ review?: true }
 export interface DoneE extends Base { kind: "done"; result: "achieved" | "abandoned"; values: Values }
 export interface PauseE extends Base { kind: "pause" | "resume" }
 export interface RollupE extends Base { kind: "rollup"; cd: number; n: number; from: string; to: string; progress: number; stale: number; values?: Values }
@@ -136,6 +136,8 @@ export interface Goal {
 	judge?: JudgeE;
 	/** Latest diagnosis from anyone, the worker included (display only). */
 	diagnosis?: JudgeE;
+	/** The acceptance review held this goal open since its current card: its met targets did not finish the intent. */
+	reviewed?: JudgeE;
 	/** Ledger line of the latest independent verdict; line order never ties, timestamps can. */
 	judgeSeq: number;
 	lastKeptSeq: number;
@@ -256,6 +258,7 @@ export function fold(entries: Entry[]): State {
 		switch (e.kind) {
 			case "card":
 				g.card = e;
+				g.reviewed = undefined;
 				g.baseRef = e.head;
 				g.baseValues = Object.fromEntries(e.metrics.map(m => [m.name, m.baseline]));
 				g.best = {};
@@ -315,6 +318,8 @@ export function fold(entries: Entry[]): State {
 				break;
 			case "judge":
 				g.diagnosis = e;
+				// (Ledgers from before the flag say so in the diagnosis.)
+				if (e.review || (e.by === "judge" && /^Every (target is met|part is achieved), but not the intent/.test(e.diagnosis))) g.reviewed = e;
 				// A worker grading its own work is recorded but never releases a stall, resets the
 				// stale count or opens the grid-search gate: only an independent verdict does.
 				// ("fallback" is a worker diagnosis accepted because the host has no independent judge.)

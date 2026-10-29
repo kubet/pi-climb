@@ -572,7 +572,7 @@ export default async function climb(pi: ExtensionAPI) {
 			if (!ps.every(c => c.done?.result === "achieved")) break;
 			const r = await review(ctx, root, parent);
 			if (r && !r.achieved) {
-				append(root, { ts: L.now(), kind: "judge", goal: parent.id, by: "judge", verdict: "continue", diagnosis: `Every part is achieved, but not the intent: ${r.unmet}`, next: r.next });
+				append(root, { ts: L.now(), kind: "judge", goal: parent.id, by: "judge", review: true, verdict: "continue", diagnosis: `Every part is achieved, but not the intent: ${r.unmet}`, next: r.next });
 				break;
 			}
 			append(root, { ts: L.now(), kind: "done", goal: parent.id, result: "achieved", values: {} });
@@ -580,6 +580,28 @@ export default async function climb(pi: ExtensionAPI) {
 			st = load(root);
 		}
 		return closed;
+	}
+
+	/** Every target met and confirmed: the acceptance review decides. Achieved closes the goal (and
+	 *  maybe its parents); otherwise what is missing is recorded and the goal stays open. */
+	async function accept(ctx: Ctx, root: string, g: L.Goal, values: L.Values): Promise<{ unmet?: { unmet: string; next: string }; closedUp: string[] }> {
+		const r = await review(ctx, root, g);
+		if (r && !r.achieved) {
+			append(root, { ts: L.now(), kind: "judge", goal: g.id, by: "judge", review: true, verdict: "continue", diagnosis: `Every target is met, but not the intent: ${r.unmet}`, next: r.next });
+			return { unmet: r, closedUp: [] };
+		}
+		append(root, { ts: L.now(), kind: "done", goal: g.id, result: "achieved", values });
+		return { closedUp: await rollUp(ctx, root, g.id) };
+	}
+	const unmetText = (u: { unmet: string; next: string }) =>
+		`EVERY TARGET MET, BUT THE INTENT IS NOT DONE (acceptance review): ${u.unmet}\nNEXT: ${u.next}. Put what is missing on the scorecard (climb_scorecard; a check that already passes is welcome: when every metric meets its target there, the review is asked again) or into a part (climb_split).`;
+	function achievedText(st: L.State, ctx: Ctx, g: L.Goal, closedUp: string[]): string {
+		let text = `GOAL ACHIEVED: ${g.id}, every target met.${g.card?.parked?.length ? ` Parked metrics remain: ${g.card.parked.join(", ")}.` : ""}${closedUp.length ? ` That completes ${closedUp.join(" and ")}: every part achieved.` : ""}`;
+		const rest = L.roots(st);
+		if (rest.length) text += `\n${rest.map(r => X.nextAction(st, r)).join("\n")}`;
+		ctx.ui?.notify?.(`climb ${g.id} achieved`, "info");
+		if (!L.active(st).length) stopTimer(ctx);
+		return text;
 	}
 
 	function refresh(ctx: Ctx, root: string): L.State {
@@ -1026,7 +1048,12 @@ export default async function climb(pi: ExtensionAPI) {
 				if (!m.hold && typeof m.target !== "number") throw new Error(`${m.name} needs a target, or hold: true if it is a constraint like "no slower".`);
 				names.add(m.name);
 			}
-			if (p.metrics.every(m => m.hold)) throw new Error("At least one metric must have a target to climb; hold metrics only guard.");
+			if (p.metrics.every(m => m.hold))
+				throw new Error(
+					g.reviewed
+						? `Hold metrics only guard against regressions, so they cannot show what the acceptance review asked for (${g.reviewed.next}). Give that check a target (e.g. failures, down, target 0): one that already passes is welcome here, and when every metric meets its target the review is asked again.`
+						: "At least one metric must have a target to climb; hold metrics only guard.",
+				);
 			const d = await dirty(root);
 			if (d) throw new Error(`Working tree is dirty; commit or stash first so baselines are measured on a commit:\n${d}`);
 			const metrics: L.Metric[] = p.metrics.map(m => ({
@@ -1075,8 +1102,9 @@ export default async function climb(pi: ExtensionAPI) {
 					m.target = m.baseline;
 					return m.noise > 0.5 ? { warning: `${m.name} only catches regressions beyond ${pct(m.noise)} (${aa}).` } : {};
 				}
+				// Once the acceptance review held the goal open, a check that already passes is what it asked for.
 				if (L.met(m, m.baseline))
-					return { problem: `${m.name} already meets its target (${m.baseline}, ${m.dir} ${m.target}): set an ambitious target, or hold: true if it is a constraint to keep.` };
+					return g.reviewed ? {} : { problem: `${m.name} already meets its target (${m.baseline}, ${m.dir} ${m.target}): set an ambitious target, or hold: true if it is a constraint to keep.` };
 				// The bar every kept step must clear, against the whole way to the target.
 				const way = L.gain(m, m.baseline, m.target);
 				const s = X.samplesFor(xs, m.baseline, way / 3) ?? X.samplesFor(xs, m.baseline, way);
@@ -1112,7 +1140,15 @@ export default async function climb(pi: ExtensionAPI) {
 			const instrument = sha([...commands, ...blobs.filter(b => frozenNow.has(b.file)).map(b => `${b.file} ${b.blob}`)].join("\n")).slice(0, 16);
 			const h = await head(root);
 			append(root, { ts: L.now(), kind: "card", goal: g.id, metrics, guard: p.guard, frozen, head: h, parked: p.parked, axioms: p.axioms, instrument, env: ENV });
-			refresh(ctx, root);
+			// Verifications the review asked for, all passing: the A/A runs are the confirmation, and the review decides again.
+			let verdict = "Next: call climb_experiment with your highest-expected-gain lever.";
+			if (g.reviewed && metrics.every(m => L.met(m, m.baseline))) {
+				say("acceptance review: every metric meets its target here; is the intent met?");
+				const { unmet, closedUp } = await accept(ctx, root, g, Object.fromEntries(metrics.map(m => [m.name, m.baseline])));
+				if (!unmet) await writeExport(root);
+				const st = refresh(ctx, root);
+				verdict = unmet ? unmetText(unmet) : achievedText(st, ctx, st.goals.get(g.id) ?? g, closedUp);
+			} else refresh(ctx, root);
 			const lines = metrics.map(
 				m =>
 					`- ${m.name} = ${m.baseline}${m.unit ? ` ${m.unit}` : ""} → ${m.hold ? "hold (must not regress)" : `target ${m.target}`} (${m.dir} is better, noise ${pct(m.noise)}, ${m.samples} run${m.samples > 1 ? "s" : ""} per measurement${price(m, m.samples) ? `, ${price(m, m.samples)}` : ""})`,
@@ -1123,7 +1159,7 @@ export default async function climb(pi: ExtensionAPI) {
 					...lines,
 					`Frozen instrument: ${frozen.join(", ") || "none — declare frozen paths so experiments cannot game the measurement"}`,
 					...warnings,
-					"Next: call climb_experiment with your highest-expected-gain lever.",
+					verdict,
 				].join("\n"),
 			);
 		})),
@@ -1433,35 +1469,26 @@ export default async function climb(pi: ExtensionAPI) {
 			append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: h, values, verdict: kept ? "kept" : "dropped", reason: reason!, reverted, proof: byProof || undefined, runs: samples, paired: pairs, gates, env: ENV.hash });
 			let won = kept && g.card.metrics.every(m => L.met(m, values[m.name]));
 			let unmet: { unmet: string; next: string } | undefined;
+			let closedUp: string[] = [];
 			if (won) {
 				// "Done" is never claimed from a single draw: confirm with fresh samples.
 				const c = await measure(root, g.card.metrics, { phase: "confirm", goal: g.id }, signal, samples, t => say(t && `confirming targets ${t}`));
 				won = !c.errors.length && g.card.metrics.every(m => L.met(m, c.values[m.name]));
 				if (won) {
 					say("acceptance review: is the intent met, not just the scorecard?");
-					const r = await review(ctx, root, g);
-					if (r && !r.achieved) {
-						won = false;
-						unmet = r;
-						append(root, { ts: L.now(), kind: "judge", goal: g.id, by: "judge", verdict: "continue", diagnosis: `Every target is met, but not the intent: ${r.unmet}`, next: r.next });
-					} else append(root, { ts: L.now(), kind: "done", goal: g.id, result: "achieved", values: c.values });
+					({ unmet, closedUp } = await accept(ctx, root, g, c.values));
+					won = !unmet;
 				}
 			}
-			const closedUp = won ? await rollUp(ctx, root, g.id) : [];
 			await writeExport(root);
 			const st = refresh(ctx, root);
 			let text = kept
 				? `KEPT ${exp.id}${byProof ? " by proof" : ""}: ${reason}.${byProof ? " A verified fix, but the scorecard has not moved: it does not count as progress." : ""}`
 				: `DROPPED ${exp.id}: ${reason}.${reverted ? ` Reverted in ${reverted.slice(0, 8)}.` : ""}`;
-			if (won) {
-				text += `\nGOAL ACHIEVED: ${g.id}, every target met.${g.card.parked?.length ? ` Parked metrics remain: ${g.card.parked.join(", ")}.` : ""}${closedUp.length ? ` That completes ${closedUp.join(" and ")}: every part achieved.` : ""}`;
-				const rest = L.roots(st);
-				if (rest.length) text += `\n${rest.map(r => X.nextAction(st, r)).join("\n")}`;
-				ctx.ui?.notify?.(`climb ${g.id} achieved`, "info");
-				if (!L.active(st).length) stopTimer(ctx);
-			} else {
+			if (won) text += `\n${achievedText(st, ctx, g, closedUp)}`;
+			else {
 				// The review's finding is the next step; the tree's routing would only repeat it.
-				if (unmet) text += `\nEVERY TARGET MET, BUT THE INTENT IS NOT DONE (acceptance review): ${unmet.unmet}\nNEXT: ${unmet.next}. Put what is missing on the scorecard (climb_scorecard) or into a part (climb_split).`;
+				if (unmet) text += `\n${unmetText(unmet)}`;
 				else {
 					if (kept && g.card.metrics.every(m => L.met(m, values[m.name]))) text += "\nTargets met once but not confirmed on re-measurement; keep climbing.";
 					text += `\n${X.nextAction(st, L.rootOf(st, st.goals.get(g.id)!))}`;

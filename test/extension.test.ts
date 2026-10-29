@@ -1032,6 +1032,32 @@ describe("acceptance review", () => {
 		}
 	});
 
+	test("a goal the review holds open can verify a check that already passes: the scorecard asks the review again", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-verify-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo 0 > lost.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "accept-verify");
+			await z.load();
+			await z.cmd("shrink work without losing reports");
+			const w = { name: "w", cmd: "cat work.txt", dir: "down", target: 50, noise: 0.05 };
+			const lost = { name: "lost", cmd: "cat lost.txt", dir: "down", target: 0, noise: 0.05 };
+			await expect(z.tool("climb_scorecard", { metrics: [w, lost] })).rejects.toThrow("already meets its target");
+			await z.tool("climb_scorecard", { metrics: [w] });
+			z.h.judge = "VERDICT: unmet\nUNMET: report delivery was never checked\nNEXT: count lost reports on the kept commit";
+			await z.tool("climb_experiment", { lever: "halve", hypothesis: "", prediction: "" });
+			await run("echo 40 > work.txt && git commit -qam halve");
+			expect(await z.tool("climb_measure", {})).toContain("THE INTENT IS NOT DONE");
+			await expect(z.tool("climb_scorecard", { metrics: [{ ...lost, hold: true }] })).rejects.toThrow("Give that check a target");
+			z.h.judge = "VERDICT: achieved\nUNMET: none\nNEXT: none";
+			const out = await z.tool("climb_scorecard", { metrics: [w, lost] });
+			expect(out).toContain("GOAL ACHIEVED: g-shrink-work-without-losing");
+			expect(L.fold(L.read(d)).goals.get("g-shrink-work-without-losing")!.done?.result).toBe("achieved");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
 	test("a part the review holds open comes next, with what is missing, not a sibling's climb", async () => {
 		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-part-"));
 		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
