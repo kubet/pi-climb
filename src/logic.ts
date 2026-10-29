@@ -305,7 +305,7 @@ export function researchBrief(g: Goal): string {
 	].join("\n");
 }
 
-export function judgePrompt(g: Goal, tail: Entry[], gitLog: string): string {
+export function judgePrompt(g: Goal, tail: Entry[], gitLog: string, efficiency = ""): string {
 	const tried = [...g.levers.entries()].map(([k, l]) => `- ${k}: ${l.kept} kept / ${l.tried} tried`).join("\n") || "- none";
 	const series = (g.card?.metrics ?? [])
 		.map(m => `- ${m.name} (${m.dir}, noise ±${(m.noise * 100).toFixed(1)}%): ${(g.series.get(m.name) ?? []).slice(-12).map(p => p.v).join(", ")}`)
@@ -319,7 +319,8 @@ export function judgePrompt(g: Goal, tail: Entry[], gitLog: string): string {
 		`Recent measurements (oldest first):\n${series}`,
 		`Recent ledger:\n${tail.map(e => JSON.stringify(e)).join("\n")}`,
 		`Recent commits:\n${gitLog}`,
-		"Diagnose WHY there is no progress: wrong lever; broken or noisy metric; blocked environment; goal needs decomposition; grid-search trap (same idea repeated); target unreachable by code alone. Use the conversation so far as evidence.",
+		...(efficiency ? [`Where the time went (traced by the extension):\n${efficiency}`] : []),
+		"Diagnose WHY there is no progress: wrong lever; broken or noisy metric; blocked environment; goal needs decomposition; grid-search trap (same idea repeated); target unreachable by code alone; time lost to refused calls, crashing or slow instruments. Use the conversation so far as evidence.",
 		"Answer in exactly this format:",
 		"VERDICT: continue|pivot|stuck   (stuck = only a human can unblock this)",
 		"DIAGNOSIS: <one or two sentences>",

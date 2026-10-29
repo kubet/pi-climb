@@ -522,7 +522,7 @@ describe("lessons from a live run", () => {
 		const noisy = "n=$(cat .git/cyc 2>/dev/null || echo 0); echo $((n+1)) > .git/cyc; awk -v n=$n 'BEGIN{split(\"100 160 40\",a,\" \"); print a[n%3+1]}'";
 		const err = await z.tool("climb_scorecard", { metrics: [{ name: "lat", cmd: noisy, dir: "down", target: 1 }] }).catch(e => String(e));
 		expect(err).toContain("as large as the whole way to the target");
-		expect(err).toContain("samples: 5");
+		expect(err).toContain("Samples: 5");
 		const card = await z.tool("climb_scorecard", { metrics: [{ name: "lat", cmd: noisy, dir: "down", target: 1, samples: 5 }] });
 		expect(Number((await run("cat .git/cyc")).stdout.trim())).toBe(5); // 3 cached + 2 topped up, not 3 + 5
 		expect(card).toContain("each kept step must beat");

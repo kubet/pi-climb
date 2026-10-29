@@ -46,6 +46,7 @@ Metrics are whatever the agent defines: any command that prints a number, such a
 ## Tracking
 
 - **Self:** `.climb/oracle.jsonl` holds every decision as JSON. `/climb` shows a sparkline, velocity and ETA, and the status line shows live progress.
+- **Traces:** `.climb/trace.jsonl` records the work behind the decisions: every benchmark, guard, proof and probe run (phase, duration, exit code, value, retries), every reuse of a recent measurement, every climb tool call with its duration and refusal reason, every judge call. `/climb`, `climb_status` and the judge's prompt carry a summary: time per tool, time wasted on refused calls and why, flaky metrics, cost per run, reuse savings, experiments per hour.
 - **External in:** a metric is any command that prints a number, so it can `curl` Prometheus, CI or an API.
 - **External out:** set `CLIMB_SINK` and every ledger event goes out as `{text, content, repo, entry}`:
 
