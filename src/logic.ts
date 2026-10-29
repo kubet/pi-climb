@@ -78,6 +78,9 @@ export function noiseOf(xs: number[], baseline: number, samples: number): number
 /** Decision noise from a relative per-run standard deviation (a median is ~1.25x noisier than a mean). */
 export const noiseFromSd = (sdRel: number, samples: number) => 2 * Math.SQRT2 * ((samples >= 3 ? 1.2533 : 1) / Math.sqrt(samples)) * sdRel;
 
+/** Student's t, two-sided 95%, by degrees of freedom. */
+export const t975 = (dof: number) => [Number.POSITIVE_INFINITY, 12.71, 4.3, 3.18, 2.78, 2.57, 2.45, 2.36, 2.31, 2.26, 2.23][dof] ?? 2.1;
+
 /** Control and candidate measured back to back (A B, B A, ...) cancel drift: decide on the median paired
  *  gain, with noise from the spread of the pairs themselves (floor 1%). */
 export function pairedVerdict(metrics: Metric[], pairs: Record<string, [number, number][]>, plain?: { ref: Values; values: Values }) {
@@ -94,7 +97,8 @@ export function pairedVerdict(metrics: Metric[], pairs: Record<string, [number, 
 		const n = gains.length;
 		const mean = gains.reduce((s, x) => s + x, 0) / n;
 		const sd = n > 1 ? Math.sqrt(gains.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1)) : 0;
-		stats[m.name] = { gain: median(gains), noise: Math.max(0.01, (2 * 1.2533 * sd) / Math.sqrt(n)), n };
+		// Few pairs estimate their own spread badly: Student's t, not 2, keeps false keeps near 2.5% a side.
+		stats[m.name] = { gain: median(gains), noise: Math.max(0.01, (t975(n - 1) * 1.2533 * sd) / Math.sqrt(n)), n };
 	}
 	const fmt = (k: string) => `${k} ${stats[k].gain >= 0 ? "+" : ""}${(stats[k].gain * 100).toFixed(1)}% ±${(stats[k].noise * 100).toFixed(1)}%${stats[k].n ? "" : " (unpaired)"}`;
 	const names = Object.keys(stats);
@@ -276,7 +280,8 @@ export function nextAction(st: State, g: Goal): string {
 	}
 	if (!g.card) {
 		const n = g.probes.filter(p => p.value !== undefined).length;
-		return `[climb ${g.id}] Researching "${g.intent}"${tag} (${n} candidate metrics probed). Itemize the research: register each candidate metric with climb_probe (the extension runs it). Then call climb_scorecard with the 1-${MAX_METRICS} that matter, each with a direction and an ambitious target. If the intent needs metrics with different instruments, split it into parts with climb_split.${lessons(st, g)}`;
+		const judged = g.judge ? ` Judge (${g.judge.verdict}): ${g.judge.diagnosis} → ${g.judge.next}.` : "";
+		return `[climb ${g.id}] Researching "${g.intent}"${tag} (${n} candidate metrics probed).${judged} Itemize the research: register each candidate metric with climb_probe (the extension runs it). Then call climb_scorecard with the 1-${MAX_METRICS} that matter, each with a direction and an ambitious target. If the intent needs metrics with different instruments, split it into parts with climb_split.${lessons(st, g)}`;
 	}
 	if (g.open)
 		return `[climb ${g.id}] Experiment ${g.open.id} is open (lever "${g.open.lever}": ${g.open.hypothesis}). Finish it: implement, commit, then call climb_measure${tag}. State: ${cardSummary(g)}.`;
@@ -358,13 +363,13 @@ export const indirectRunner = (cmd: string) =>
 /** Absolute paths a command mentions (`/x`, `--flag=/x`): candidates for an instrument outside the repo. */
 export const absolutePaths = (cmd: string) => [...new Set(cmd.split(/[\s"'`()=,;|&<>]+/).filter(t => /^\/[^/]/.test(t)))];
 
-/** A changed file that cannot move these metric commands: a doc or a test that no command names, and
- *  for tests, no command runs a whole suite. (Frozen instrument files are checked separately.) */
+/** A changed file that cannot move these metric commands: a test source no command names, while no
+ *  command runs a whole suite. (Frozen instrument files are checked separately.) */
 export function inert(f: string, commands: string[]): boolean {
+	// Only test sources by name: docs can be runtime prompts, and test/ or docs/ folders hold fixtures benchmarks read.
 	const base = f.split("/").pop() ?? f;
 	if (commands.some(c => c.includes(f) || c.includes(base))) return false;
-	if (/\.(md|mdx|rst)$|(^|\/)docs?\//i.test(f)) return true;
-	const test = /(^|\/)(tests?|__tests__|spec)\/|\.(test|spec)\.[A-Za-z]+$|_test\.(go|py)$|(^|\/)test_[^/]*\.py$/i.test(f);
+	const test = /\.(test|spec)\.[A-Za-z]+$|_test\.(go|py)$|(^|\/)test_[^/]*\.py$/i.test(f);
 	return test && !commands.some(indirectRunner);
 }
 
@@ -470,8 +475,11 @@ export function reviewPrompt(st: State, g: Goal, gitLog: string): string {
 export function parseReview(text: string): { achieved: boolean; unmet: string; next: string } {
 	const field = (k: string) => text.match(new RegExp(`^[\\s*_#]*${k}[*_]*\\s*:[*_\\s]*(.+?)\\s*$`, "im"))?.[1];
 	const unmetLine = field("UNMET") ?? "";
+	// A clear negative ("unmet", `unmet`, "not achieved", "missing") holds the goal open; anything else,
+	// including a reply that cannot be parsed, does not.
+	const v = (field("VERDICT") ?? "").toLowerCase();
 	return {
-		achieved: !(field("VERDICT")?.toLowerCase() ?? "").startsWith("unmet"),
+		achieved: !/unmet|\bnot\b|\bno\b|missing|incomplete|unsatisfied/.test(v),
 		unmet: unmetLine || "unspecified",
 		next: field("NEXT") ?? "put the missing requirement on the scorecard",
 	};

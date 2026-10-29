@@ -206,6 +206,8 @@ describe("acceptance review", () => {
 		expect(X.parseReview("**VERDICT:** unmet\nUNMET: the unicode bug was never checked\nNEXT: add a part for it")).toEqual({ achieved: false, unmet: "the unicode bug was never checked", next: "add a part for it" });
 		expect(X.parseReview("VERDICT: achieved\nUNMET: none\nNEXT: stop").achieved).toBe(true);
 		expect(X.parseReview("garbled").achieved).toBe(true);
+		for (const v of ["`unmet`", "[unmet]", "not achieved", "Unmet."]) expect(X.parseReview(`VERDICT: ${v}\nUNMET: x\nNEXT: y`).achieved).toBe(false);
+		expect(X.parseReview("VERDICT: **achieved**\nUNMET: none").achieved).toBe(true);
 	});
 });
 

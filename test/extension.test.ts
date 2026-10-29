@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import climb from "../src/index";
+import climb, { DERIVED, ENVS, leaksIntoRepo } from "../src/index";
 import * as L from "../src/ledger";
 import * as X from "../src/logic";
 import * as T from "../src/trace";
@@ -944,10 +944,10 @@ describe("drift", () => {
 			shift = 62 * 60_000;
 			expect(await z.tool("climb_experiment", { lever: "next", hypothesis: "", prediction: "" })).toContain("guard passes, no regression");
 			await z.tool("climb_measure", { abandon: "drift test" });
-			// A docs-only commit cannot move the metric: adopted without a comparison, however slow the window.
-			await run("echo w >> README.md && git commit -qam docs && echo 400 > .git/level");
+			// A test-source-only commit cannot move the metric: adopted without a comparison, however slow the window.
+			await run("echo 'def test_x(): pass' > test_x.py && git add test_x.py && git commit -qm tests && echo 400 > .git/level");
 			shift = 93 * 60_000;
-			expect(await z.tool("climb_experiment", { lever: "after", hypothesis: "", prediction: "" })).toContain("only tests, docs or the proof changed");
+			expect(await z.tool("climb_experiment", { lever: "after", hypothesis: "", prediction: "" })).toContain("only test sources or the proof changed");
 		} finally {
 			L.clock.ms = clock;
 			fs.rmSync(d, { recursive: true, force: true });
@@ -963,9 +963,9 @@ describe("paired measurement", () => {
 		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
 		// Every run reads 10 higher than the one before: the machine keeps getting slower. The command also
 		// needs an untracked data file (linked into the base) and must not see the candidate's build output.
-		const cmd = `test -f data/seed && test ! -f dist/candidate && n=$(cat ${ctr} 2>/dev/null || echo 0); echo $((n+1)) > ${ctr}; echo $(( $(cat work.txt) + n * 10 ))`;
+		const cmd = `test -f data/seed && test -f "données.csv" && test ! -f dist/candidate && n=$(cat ${ctr} 2>/dev/null || echo 0); echo $((n+1)) > ${ctr}; echo $(( $(cat work.txt) + n * 10 ))`;
 		try {
-			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo x > README.md && printf 'data/\\ndist/\\n' > .gitignore && git add -A && git commit -qm init && mkdir -p data && touch data/seed");
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo x > README.md && printf 'data/\\ndist/\\n' > .gitignore && git add -A && git commit -qm init && mkdir -p data && touch data/seed && touch données.csv");
 			const z = host(d, "main", "paired");
 			await z.load();
 			await z.cmd("faster");
@@ -1042,6 +1042,28 @@ describe("updates", () => {
 			await until(() => z.notes.some(n => n.includes("newer version is installed")));
 		} finally {
 			fs.utimesSync(src, was.atime, was.mtime);
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("base worktree safety", () => {
+	test("links back into tracked code block pairing; environments and build outputs are never shared", () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-leak-"));
+		try {
+			fs.mkdirSync(path.join(d, "packages/pkg"), { recursive: true });
+			fs.mkdirSync(path.join(d, "node_modules/.pnpm/dep/node_modules/dep"), { recursive: true });
+			fs.mkdirSync(path.join(d, "node_modules/@scope"), { recursive: true });
+			// pnpm's internal links stay inside node_modules: safe to share.
+			fs.symlinkSync(path.join(d, "node_modules/.pnpm/dep/node_modules/dep"), path.join(d, "node_modules/dep"));
+			expect(leaksIntoRepo(d, "node_modules", ["node_modules"])).toBe(false);
+			// A workspace package resolves into the repo's own code: the base would run the candidate's.
+			fs.symlinkSync(path.join(d, "packages/pkg"), path.join(d, "node_modules/@scope/pkg"));
+			expect(leaksIntoRepo(d, "node_modules", ["node_modules"])).toBe(true);
+			for (const env of [".venv", "venv", "sub/.tox"]) expect(ENVS.test(env)).toBe(true);
+			for (const out of ["dist", "lib", "web/.svelte-kit", "app.tsbuildinfo", "pkg/__pycache__"]) expect(DERIVED.test(out)).toBe(true);
+			for (const keep of ["node_modules", ".env", "data", "bench/runs"]) expect(DERIVED.test(keep) || ENVS.test(keep)).toBe(false);
+		} finally {
 			fs.rmSync(d, { recursive: true, force: true });
 		}
 	});

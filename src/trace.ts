@@ -22,6 +22,8 @@ export interface RunT extends Base {
 	metric?: string;
 	/** Git tree measured: runs of one tree, at any time, are A/A data for its metric. */
 	tree?: string;
+	/** Fingerprint of the command: a metric re-registered with another command starts a new history. */
+	cmd?: string;
 	ms: number;
 	code: number;
 	value?: number;
@@ -104,14 +106,17 @@ export const dur = (ms: number) => {
 };
 const sum = (xs: number[]) => xs.reduce((s, x) => s + x, 0);
 
-const good = (traces: Trace[], goal: string, metric: string, sinceMs: number) =>
-	traces.filter((x): x is RunT & { value: number } => x.kind === "run" && x.goal === goal && x.metric === metric && x.code === 0 && typeof x.value === "number" && epoch(x.ts) >= sinceMs);
+const good = (traces: Trace[], goal: string, metric: string, sinceMs: number, cmd?: string) =>
+	traces.filter(
+		(x): x is RunT & { value: number } =>
+			x.kind === "run" && x.goal === goal && x.metric === metric && x.code === 0 && typeof x.value === "number" && epoch(x.ts) >= sinceMs && (!cmd || x.cmd === cmd),
+	);
 
 /** Relative per-run spread pooled over every tree measured since `sinceMs`. Back-to-back A/A runs
  *  catch one calm moment; runs of the same code across hours also catch drift and load. */
-export function pooledSd(traces: Trace[], goal: string, metric: string, sinceMs: number): { sd: number; runs: number; trees: number } | undefined {
+export function pooledSd(traces: Trace[], goal: string, metric: string, sinceMs: number, cmd?: string): { sd: number; runs: number; trees: number } | undefined {
 	const byTree = new Map<string, number[]>();
-	for (const r of good(traces, goal, metric, sinceMs)) if (r.tree) byTree.set(r.tree, [...(byTree.get(r.tree) ?? []), r.value]);
+	for (const r of good(traces, goal, metric, sinceMs, cmd)) if (r.tree) byTree.set(r.tree, [...(byTree.get(r.tree) ?? []), r.value]);
 	let ss = 0;
 	let dof = 0;
 	let runs = 0;
@@ -128,8 +133,8 @@ export function pooledSd(traces: Trace[], goal: string, metric: string, sinceMs:
 }
 
 /** Median of every good run of one tree since `sinceMs`: a steadier reference than a single window. */
-export function treeMedian(traces: Trace[], goal: string, metric: string, tree: string, sinceMs: number): number | undefined {
-	const xs = good(traces, goal, metric, sinceMs).filter(r => r.tree === tree).map(r => r.value);
+export function treeMedian(traces: Trace[], goal: string, metric: string, tree: string, sinceMs: number, cmd?: string): number | undefined {
+	const xs = good(traces, goal, metric, sinceMs, cmd).filter(r => r.tree === tree).map(r => r.value);
 	return xs.length ? medianOf(xs) : undefined;
 }
 
@@ -160,7 +165,7 @@ export function stats(traces: Trace[], ledger: Entry[], nowMs: number, windowMs 
 	const runs = t.filter((x): x is RunT => x.kind === "run");
 	const reuse = t.filter((x): x is ReuseT => x.kind === "reuse");
 	const judges = t.filter((x): x is JudgeT => x.kind === "judge");
-	if (!tools.length && !runs.length) return "efficiency: nothing traced yet";
+	if (!tools.length && !runs.length) return "";
 	const out: string[] = [`efficiency, traced over the last ${dur(Math.min(windowMs, nowMs - Math.min(...t.map(x => epoch(x.ts)))))}:`];
 
 	const byTool = new Map<string, number>();

@@ -27,13 +27,65 @@ const LEDGER_GUARD = "The climb ledger (.climb/) is append-only and owned by the
 
 type Ctx = ExtensionContext;
 type Progress = (text: string) => void;
-type Tag = { phase: T.Phase; goal?: string; metric?: string; tree?: string };
+type Tag = { phase: T.Phase; goal?: string; metric?: string; tree?: string; cmd?: string };
 type Update = (partial: { content: { type: "text"; text: string }[] }) => void;
 // Instruments outside the repo worth warning about; system tools are not instruments.
 /** A positive number, or the default: strict-schema providers send 0 or null for "not given". */
 const pos = (v: number | null | undefined, d: number) => (typeof v === "number" && v > 0 ? v : d);
 const SYSTEM = /^\/(dev|usr|bin|sbin|etc|opt|nix|proc|System|Library|Applications)(\/|$)/;
 const sha = (text: string) => createHash("sha1").update(text).digest("hex");
+const cmdId = (cmd: string) => sha(cmd).slice(0, 8);
+// What a base worktree never borrows from the repo. Build outputs and caches are derived from the code
+// (only untracked or ignored paths are linked at all, so an ignored lib/ or bin/ is a build output):
+// the candidate's would be measured on the base side.
+export const DERIVED =
+	/(^|\/)(dist|build|out|lib|bin|obj|target|\.next|\.nuxt|\.svelte-kit|\.output|\.vercel|\.expo|\.angular|\.docusaurus|\.turbo|\.cache|\.parcel-cache|\.gradle|coverage|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache)(\/|$)|\.(pyc|o|class|tsbuildinfo)$/;
+// Mutable environments: tools rewrite them in place (uv run re-points an editable install at whatever
+// tree runs it) and editable installs point back at the repo's code. The base builds its own, or falls back.
+export const ENVS = /(^|\/)(\.venv|venv|\.tox|\.nox|\.direnv)(\/|$)/;
+
+/** A linked folder (or its first level, scoped packages included) holding a symlink into the repo's own
+ *  tracked code, like a workspace package in node_modules, would run the candidate's code on the base side. */
+export function leaksIntoRepo(root: string, rel: string, linked: string[]): boolean {
+	const real = (p: string) => {
+		try {
+			return fs.realpathSync(p);
+		} catch {
+			return p;
+		}
+	};
+	const top = real(root);
+	const shared = linked.map(l => real(path.join(root, l)));
+	const leaks = (p: string) => {
+		const r = real(p);
+		return r.startsWith(top + path.sep) && !shared.some(x => r === x || r.startsWith(x + path.sep));
+	};
+	const src = path.join(root, rel);
+	const isLink = (p: string) => {
+		try {
+			return fs.lstatSync(p).isSymbolicLink();
+		} catch {
+			return false;
+		}
+	};
+	if (isLink(src)) return leaks(src);
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(src, { withFileTypes: true });
+	} catch {
+		return false;
+	}
+	let seen = 0;
+	for (const e of entries) {
+		if (++seen > 5000) return true; // too large to vet: do not risk it
+		const p = path.join(src, e.name);
+		if (e.isSymbolicLink() && leaks(p)) return true;
+		if (e.isDirectory() && e.name.startsWith("@")) {
+			for (const s of fs.readdirSync(p, { withFileTypes: true })) if (s.isSymbolicLink() && leaks(path.join(p, s.name))) return true;
+		}
+	}
+	return false;
+}
 /** The machine measurements run on: a result is "metric M on commit C, instrument I, environment E". */
 const ENV: L.Env = (() => {
 	const cpus = os.cpus();
@@ -180,10 +232,10 @@ export default async function climb(pi: ExtensionAPI) {
 			for (let i = 0; i < m.samples; i++) {
 				progress?.(`${m.name} run ${i + 1}/${m.samples}`);
 				const t0 = performance.now();
-				let r = await run(root, m.cmd, m.timeout_s * 1000, { ...tag, metric: m.name }, signal);
+				let r = await run(root, m.cmd, m.timeout_s * 1000, { ...tag, metric: m.name, cmd: cmdId(m.cmd) }, signal);
 				if (r.code !== 0 && !r.killed && !signal?.aborted) {
 					await restore(root);
-					r = await run(root, m.cmd, m.timeout_s * 1000, { ...tag, metric: m.name }, signal, true);
+					r = await run(root, m.cmd, m.timeout_s * 1000, { ...tag, metric: m.name, cmd: cmdId(m.cmd) }, signal, true);
 				}
 				// An operator interrupt is not a verdict: nothing is decided or reverted.
 				if (signal?.aborted)
@@ -273,27 +325,32 @@ export default async function climb(pi: ExtensionAPI) {
 		const dir = path.join(holder, "tree");
 		const links: string[] = [];
 		try {
-			const add = await git(root, "worktree", "add", "--detach", "--force", dir, sha);
-			if (add.code !== 0) return undefined;
-			const listed = await Promise.all([
-				git(root, "ls-files", "--others", "--exclude-standard", "--directory"),
-				git(root, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"),
-			]);
-			// Build outputs and caches are derived from the code: linking the candidate's into the base would
-			// measure the candidate twice. The base builds its own, or the paired check falls back.
-			const derived = /(^|\/)(dist|build|out|target|\.next|\.nuxt|\.turbo|\.cache|\.parcel-cache|coverage|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache)(\/|$)|\.(pyc|o|class)$/;
-			const extra = new Set(
-				listed
-					.flatMap(r => r.stdout.split("\n"))
-					.map(l => l.replace(/\/+$/, ""))
-					.filter(l => l && l !== L.DIR && !l.startsWith(`${L.DIR}/`) && !derived.test(l)),
-			);
-			for (const rel of extra) {
-				const target = path.join(dir, rel);
-				if (fs.existsSync(target)) continue;
-				fs.mkdirSync(path.dirname(target), { recursive: true });
-				fs.symlinkSync(path.join(root, rel), target);
-				links.push(target);
+			// Setup problems mean "cannot pair", never a failed measurement: the caller falls back.
+			try {
+				const add = await git(root, "worktree", "add", "--detach", "--force", dir, sha);
+				if (add.code !== 0) return undefined;
+				const listed = await Promise.all([
+					git(root, "ls-files", "-z", "--others", "--exclude-standard", "--directory"),
+					git(root, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"),
+				]);
+				const extra = [
+					...new Set(
+						listed
+							.flatMap(r => r.stdout.split("\0"))
+							.map(l => l.replace(/\/+$/, ""))
+							.filter(l => l && l !== L.DIR && !l.startsWith(`${L.DIR}/`) && !DERIVED.test(l) && !ENVS.test(l)),
+					),
+				];
+				if (extra.some(rel => leaksIntoRepo(root, rel, extra))) return undefined;
+				for (const rel of extra) {
+					const target = path.join(dir, rel);
+					if (fs.existsSync(target)) continue;
+					fs.mkdirSync(path.dirname(target), { recursive: true });
+					fs.symlinkSync(path.join(root, rel), target);
+					links.push(target);
+				}
+			} catch {
+				return undefined;
 			}
 			return await fn(dir);
 		} finally {
@@ -312,13 +369,13 @@ export default async function climb(pi: ExtensionAPI) {
 			return await withBase(root, base, async dir => {
 				const out: Record<string, [number, number][]> = {};
 				for (const m of metrics) {
-					const n = Math.max(2, Math.min(4, m.samples + 1));
+					const n = Math.max(3, Math.min(6, m.samples + 2));
 					const ps: [number, number][] = [];
 					for (let i = 0; i < n; i++) {
 						const v: { a?: number; b?: number } = {};
 						for (const side of i % 2 ? (["b", "a"] as const) : (["a", "b"] as const)) {
 							progress?.(`${m.name} pair ${i + 1}/${n}, ${side === "a" ? "base" : "candidate"}`);
-							const r = await run(side === "a" ? dir : root, m.cmd, m.timeout_s * 1000, { phase: "paired", goal, metric: m.name, tree: side === "a" ? baseTree : candTree }, signal);
+							const r = await run(side === "a" ? dir : root, m.cmd, m.timeout_s * 1000, { phase: "paired", goal, metric: m.name, tree: side === "a" ? baseTree : candTree, cmd: cmdId(m.cmd) }, signal);
 							if (signal?.aborted) throw new Error("Measurement interrupted; nothing was decided and the experiment stays open.");
 							const x = r.code === 0 ? X.parseNumber(r.stdout) : undefined;
 							if (x === undefined || !Number.isFinite(x)) return undefined;
@@ -485,8 +542,9 @@ export default async function climb(pi: ExtensionAPI) {
 		throw new Error("No active climb goal. The user starts one with /climb <intent>.");
 	}
 
-	/** A part that closes may close its parent: achieved when every part is. Returns the goals closed. */
-	function rollUp(root: string, id: string): string[] {
+	/** A part that closes may close its parent: achieved when every part is and the acceptance review
+	 *  agrees the parent's own intent is met. Returns the goals closed. */
+	async function rollUp(ctx: Ctx, root: string, id: string): Promise<string[]> {
 		const closed: string[] = [];
 		let st = load(root);
 		for (let g = st.goals.get(id); g?.parent; g = st.goals.get(g.parent)) {
@@ -494,6 +552,11 @@ export default async function climb(pi: ExtensionAPI) {
 			if (!parent || parent.done) break;
 			const ps = L.parts(st, parent);
 			if (!ps.every(c => c.done?.result === "achieved")) break;
+			const r = await review(ctx, root, parent);
+			if (r && !r.achieved) {
+				append(root, { ts: L.now(), kind: "judge", goal: parent.id, by: "judge", verdict: "continue", diagnosis: `Every part is achieved, but not the intent: ${r.unmet}`, next: r.next });
+				break;
+			}
 			append(root, { ts: L.now(), kind: "done", goal: parent.id, result: "achieved", values: {} });
 			closed.push(parent.id);
 			st = load(root);
@@ -568,7 +631,7 @@ export default async function climb(pi: ExtensionAPI) {
 		const since = cardSince(root, g);
 		const notes: string[] = [];
 		const metrics = g.card!.metrics.map(m => {
-			const p = T.pooledSd(traces, g.id, m.name, since);
+			const p = T.pooledSd(traces, g.id, m.name, since, cmdId(m.cmd));
 			const n = p ? X.noiseFromSd(p.sd, m.samples) : 0;
 			if (n <= m.noise) return m;
 			notes.push(`${m.name} noise re-estimated at ±${(n * 100).toFixed(1)}% from ${p!.runs} runs of ${p!.trees} unchanged trees (the scorecard's A/A said ±${(m.noise * 100).toFixed(1)}%)`);
@@ -1189,14 +1252,14 @@ export default async function climb(pi: ExtensionAPI) {
 			const control = await measureTree(root, g.card.metrics, m => m.samples, { phase: "control", goal: g.id }, signal, say);
 			if (control.errors.length) throw new Error(`Control measurement failed at ${base.slice(0, 8)}:\n${control.errors.join("\n")}`);
 			let adopted = "";
-			if (unmeasured && harmless) adopted = ` Adopted commits since ${unmeasured}: only tests, docs or the proof changed.`;
+			if (unmeasured && harmless) adopted = ` Adopted commits since ${unmeasured}: only test sources or the proof changed.`;
 			else if (unmeasured) {
 				// Judge against everything measured on the baseline tree, not one window of it, and with a
 				// higher bar: this is a sanity check on commits outside experiments, and drift is not a regression.
 				const traces = T.read(root);
 				const baseTree = (await tree(root, g.baseRef!)) ?? "";
 				const since = cardSince(root, g);
-				const reference = Object.fromEntries(g.card.metrics.map(m => [m.name, T.treeMedian(traces, g.id, m.name, baseTree, since) ?? g.baseValues?.[m.name]])) as L.Values;
+				const reference = Object.fromEntries(g.card.metrics.map(m => [m.name, T.treeMedian(traces, g.id, m.name, baseTree, since, cmdId(m.cmd)) ?? g.baseValues?.[m.name]])) as L.Values;
 				const lenient = effective(root, g, traces).metrics.map(m => ({ ...m, noise: 2 * m.noise }));
 				let worse = X.regressions(lenient, reference, control.values);
 				// Before refusing, measure the baseline and HEAD interleaved: drift between then and now cancels.
@@ -1356,7 +1419,7 @@ export default async function climb(pi: ExtensionAPI) {
 					} else append(root, { ts: L.now(), kind: "done", goal: g.id, result: "achieved", values: c.values });
 				}
 			}
-			const closedUp = won ? rollUp(root, g.id) : [];
+			const closedUp = won ? await rollUp(ctx, root, g.id) : [];
 			await writeExport(root);
 			const st = refresh(ctx, root);
 			let text = kept
@@ -1498,7 +1561,7 @@ export default async function climb(pi: ExtensionAPI) {
 			ctxRef = ctx;
 			const root = await needRoot(ctx);
 			const st = load(root);
-			return ok(`${X.report(st)}\n\n${efficiency(root)}\n\n${L.roots(st).map(g => X.nextAction(st, g)).join("\n")}`.trim());
+			return ok([X.report(st), efficiency(root), L.roots(st).map(g => X.nextAction(st, g)).join("\n")].filter(Boolean).join("\n\n"));
 		},
 	});
 
@@ -1524,7 +1587,7 @@ export default async function climb(pi: ExtensionAPI) {
 			};
 
 			if (!sub || (words.length === 1 && (sub === "status" || sub === "report"))) {
-				const text = `${X.report(st)}\n\n${efficiency(root)}`;
+				const text = [X.report(st), efficiency(root)].filter(Boolean).join("\n\n");
 				if (ctx.isIdle()) pi.sendMessage({ customType: "climb-report", content: text, display: true });
 				else ctx.ui.notify(text, "info");
 				return;
@@ -1563,7 +1626,7 @@ export default async function climb(pi: ExtensionAPI) {
 				const won = (x: L.Goal) => !!x.card && x.card.metrics.every(m => L.met(m, x.best[m.name]));
 				const tree = L.subtree(st, g).filter(x => !x.done).reverse();
 				for (const x of tree) append(root, { ts: L.now(), kind: "done", goal: x.id, result: won(x) ? "achieved" : "abandoned", values: x.best });
-				const up = won(g) ? rollUp(root, g.id) : [];
+				const up = won(g) ? await rollUp(ctx, root, g.id) : [];
 				await writeExport(root);
 				const now = refresh(ctx, root);
 				if (!L.active(now).length) stopTimer(ctx);
