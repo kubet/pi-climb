@@ -168,13 +168,15 @@ export function report(st: State, nowMs = clock.ms()): string {
 function section(st: State, g: Goal, nowMs: number): string[] {
 	const out: string[] = [];
 	{
-		const state = g.done ? `DONE (${g.done.result})` : stuck(g) ? "STUCK — needs you" : g.stallPending ? "STALLED — judge pending" : umbrella(st, g) ? `split into ${parts(st, g).length} parts, ${goalPct(st, g)}%` : "climbing";
+		const state = g.done ? `DONE (${g.done.result})` : stuck(g) ? "STUCK — needs you" : g.stallPending ? "STALLED — judge pending" : umbrella(st, g) ? `split into ${parts(st, g).length} parts, ${goalPct(st, g)}%` : g.card ? "climbing" : "researching";
 		out.push(`${g.parent ? "↳" : "##"} ${g.id} — ${state}`, `"${g.intent}"${g.why ? ` (why: ${g.why})` : ""}`);
 		const learned = g.learned;
 		if (learned.length) {
 			const n = (k: string) => learned.filter(l => l.type === k).length;
 			out.push(`  knowledge: ${n("fact")} facts, ${n("trap")} traps, ${n("dead-end")} dead ends; latest: ${learned.slice(-2).map(l => `[${l.type}] ${l.text}`).join(" | ")}`);
 		}
+		// A split goal climbs through its parts; its own scorecard is history from before the split.
+		if (g.card && umbrella(st, g)) out.push("  scorecard before the split (history; the parts below carry the climb):");
 		if (!g.card) {
 			if (umbrella(st, g) && !g.probes.length) return out;
 			out.push(`researching: ${g.probes.length} research items probed`);

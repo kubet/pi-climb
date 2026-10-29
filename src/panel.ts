@@ -35,8 +35,9 @@ function metricRow(g: Goal, m: Metric): string {
 function goalBlock(st: State, g: Goal, depth: number): string {
 	const kids = parts(st, g);
 	const state = g.done ? `done: ${g.done.result}` : g.stallPending ? "stalled, judge pending" : kids.some(k => !k.done) ? `split into ${kids.length} parts` : g.open ? `${g.open.id} open: ${g.open.lever}` : g.card ? "climbing" : "researching";
+	const history = g.card && kids.some(k => !k.done) ? `<p class="dim">Scorecard before the split: history; the parts below carry the climb.</p>` : "";
 	const card = g.card
-		? `<table class="metrics"><thead><tr><th>metric</th><th>baseline → best / target</th><th>progress</th><th>noise</th><th>trend</th></tr></thead><tbody>${g.card.metrics.map(m => metricRow(g, m)).join("")}</tbody></table>`
+		? `${history}<table class="metrics"><thead><tr><th>metric</th><th>baseline → best / target</th><th>progress</th><th>noise</th><th>trend</th></tr></thead><tbody>${g.card.metrics.map(m => metricRow(g, m)).join("")}</tbody></table>`
 		: g.probes.length
 			? `<p class="dim">research: ${g.probes.length} probes; latest ${g.probes.slice(-3).map(p => `${esc(p.name)} = ${num(p.value)}`).join(", ")}</p>`
 			: "";
