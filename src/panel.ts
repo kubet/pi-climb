@@ -29,7 +29,7 @@ function metricRow(g: Goal, m: Metric): string {
 	const pct = m.hold ? undefined : progressPct(m, best);
 	const series = (g.series.get(m.name) ?? []).map(p => p.v);
 	const bar = pct === undefined ? `<span class="pill">hold</span>` : `<div class="bar"><span style="width:${Math.max(0, Math.min(100, pct))}%"></span></div><span class="pct">${pct}%</span>`;
-	return `<tr><td>${met(m, best) ? "✓" : ""} <b>${esc(m.name)}</b>${m.unit ? ` <span class="dim">${esc(m.unit)}</span>` : ""}</td><td>${num(m.baseline)} → <b>${num(best)}</b>${m.hold ? "" : ` / ${num(m.target)}`}</td><td>${bar}</td><td class="dim">±${(m.noise * 100).toFixed(1)}%</td><td>${spark(series, m.hold ? undefined : m.target, m.dir)}</td></tr>`;
+	return `<tr><td class="name">${met(m, best) ? "✓ " : ""}<b>${esc(m.name)}</b>${m.unit ? `<div class="unit">${esc(m.unit)}</div>` : ""}</td><td class="nums">${num(m.baseline)} → <b>${num(best)}</b>${m.hold ? "" : ` / ${num(m.target)}`}</td><td class="nums">${bar}</td><td class="dim nums">±${(m.noise * 100).toFixed(1)}%</td><td>${spark(series, m.hold ? undefined : m.target, m.dir)}</td></tr>`;
 }
 
 function goalBlock(st: State, g: Goal, depth: number): string {
@@ -86,7 +86,7 @@ table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 8px;
 .win{color:var(--win)}.loss{color:var(--loss)}.reason{color:var(--dim);font-size:12px;max-width:420px}td:first-child{white-space:nowrap}
 tr.kept td:first-child,tr.kept-by-proof td:first-child{border-left:3px solid var(--win)}tr.dropped td:first-child{border-left:3px solid var(--loss)}tr.abandoned td:first-child{border-left:3px solid var(--line)}
 pre{white-space:pre-wrap;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12px}
-.scroll{overflow-x:auto}
+.scroll{overflow-x:auto}.metrics{table-layout:auto}.metrics .name{width:40%}.metrics .unit{color:var(--dim);font-size:12px;font-weight:400}.nums{white-space:nowrap}.goal{overflow-x:auto}
 </style></head><body><main>
 <h1>climb · ${esc(data.repo.name)}</h1>
 <p class="dim">${total} experiments decided, ${kept} kept · updated ${esc(data.generated_at.slice(0, 16).replace("T", " "))} UTC · evidence: .climb/export.json (${esc(data.schema)})</p>
