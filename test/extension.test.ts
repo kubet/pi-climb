@@ -797,7 +797,9 @@ describe("decomposition and knowledge", () => {
 		await z.tool("climb_learn", { goal: "g-make-it-fast-and", kind: "trap", text: "fast.txt drops after a cold start; warm up before reading it" });
 		await z.tool("climb_learn", { goal: "g-fast-responses", kind: "dead-end", text: "caching the parse made no difference", evidence: "x0" });
 		expect(await z.tool("climb_learn", { goal: "g-fast-responses", kind: "dead-end", text: "caching the parse made no difference" })).toContain("Already recorded");
+		await z.tool("climb_learn", { goal: "g-good-answers", kind: "trap", text: "good.txt is cached by the grader; clear it between runs" });
 		const next = X.nextAction(st(), st().goals.get("g-fast-responses")!);
+		expect(next).toContain("good.txt is cached by the grader"); // a sibling's trap reaches this part
 		expect(next).toContain("Known dead ends: caching the parse made no difference");
 		expect(next).toContain("Traps: fast.txt drops after a cold start");
 		expect(await z.tool("climb_status", {})).toContain("knowledge: 0 facts, 1 traps, 0 dead ends");

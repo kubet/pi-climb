@@ -256,10 +256,10 @@ const clip = (t: string, n = 140) => (t.length > n ? `${t.slice(0, n - 1)}…` :
 
 /** What the goal's tree has learned that the next move must not ignore: dead ends and traps. */
 function lessons(st: State, g: Goal): string {
-	const k = knowledge(st, g);
-	const pick = (type: LearnE["type"]) => k.filter(l => l.type === type).slice(-3).map(l => clip(l.text)).join("; ");
-	const dead = pick("dead-end");
-	const traps = pick("trap");
+	const pick = (k: LearnE[], type: LearnE["type"]) => k.filter(l => l.type === type).slice(-3).map(l => clip(l.text)).join("; ");
+	// Dead ends belong to the part that hit them; a trap is a warning for the whole tree, siblings included.
+	const dead = pick(knowledge(st, g), "dead-end");
+	const traps = pick(knowledge(st, rootOf(st, g)), "trap");
 	return `${dead ? ` Known dead ends: ${dead}.` : ""}${traps ? ` Traps: ${traps}.` : ""}`;
 }
 
