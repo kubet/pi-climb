@@ -1128,8 +1128,13 @@ export default async function climb(pi: ExtensionAPI) {
 			}
 			if (problems.length) throw new Error(`${problems.join("\n")}\n${cached}`);
 			const outside = [...new Set(commands.flatMap(X.absolutePaths))].filter(f => !SYSTEM.test(f) && !f.startsWith(`${root}/`) && fs.existsSync(f));
-			if (outside.length)
-				warnings.push(`Instrument outside the repo, so climb cannot freeze or version it: ${outside.join(", ")}. A change there moves the metric invisibly.`);
+			if (outside.length) {
+				// A temp dir (a session scratchpad, /tmp) is wiped on reboot or by cleanup: then every measurement breaks at once.
+				const temp = outside.filter(f => f.startsWith(os.tmpdir()) || /^\/(private\/)?(tmp|var\/folders)\//.test(f));
+				warnings.push(
+					`Instrument outside the repo, so climb cannot freeze or version it: ${outside.join(", ")}. A change there moves the metric invisibly.${temp.length ? ` ${temp.join(", ")} ${temp.length > 1 ? "are" : "is"} in a temp directory, cleared on reboot or cleanup: every measurement breaks then. Move ${temp.length > 1 ? "them" : "it"} into the repo or a stable path.` : ""}`,
+				);
+			}
 			if (reused.length) warnings.push(`Reused A/A runs of this commit for ${reused.join(", ")}.`);
 			const tracked = new Set((await git(root, "ls-files")).stdout.split("\n").filter(Boolean));
 			// An explicit list is authoritative (pass [] to freeze nothing); otherwise freeze what the commands execute.

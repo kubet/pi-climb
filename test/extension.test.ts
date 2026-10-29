@@ -626,6 +626,7 @@ describe("lessons from a live run", () => {
 		fs.writeFileSync(ext, "echo 100\n");
 		const out = await z.tool("climb_scorecard", { metrics: [{ name: "work", cmd: `bash ${ext}`, dir: "down", target: 10 }] });
 		expect(out).toContain("Instrument outside the repo");
+		expect(out).toContain("in a temp directory, cleared on reboot");
 		fs.rmSync(path.dirname(ext), { recursive: true, force: true });
 	});
 });
