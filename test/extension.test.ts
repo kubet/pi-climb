@@ -176,10 +176,18 @@ describe("climb extension", () => {
 		expect((await sh("git log -1 --format=%s")).stdout).toContain("revert: climb x2");
 	});
 
-	test("guard failure drops the experiment", async () => {
+	test("a guard failure decides nothing: the experiment stays open for the fix, and stray files are named", async () => {
 		await x.tool("climb_experiment", { lever: "empty", hypothesis: "?", prediction: "?" });
-		await sh(": > work.txt && git commit -qam empty");
-		expect(await x.tool("climb_measure", {})).toContain("guard failed");
+		await sh("mkdir -p scratch && echo draft > scratch/notes.txt && : > work.txt && git commit -qam empty");
+		const results = () => ledger().filter(e => e.kind === "result").length;
+		const before = results();
+		const refused = x.tool("climb_measure", {});
+		await expect(refused).rejects.toThrow("stays open");
+		await expect(refused).rejects.toThrow("scratch/");
+		expect(results()).toBe(before);
+		expect(fs.readFileSync(path.join(dir, "work.txt"), "utf8")).toBe("");
+		await sh("rm -r scratch && echo 50 > work.txt && git commit -qam fix");
+		expect(await x.tool("climb_measure", {})).toContain("no metric beat noise");
 		expect(fs.readFileSync(path.join(dir, "work.txt"), "utf8").trim()).toBe("50");
 	});
 
@@ -1085,6 +1093,20 @@ describe("flaky guard", () => {
 			expect(out).toContain("Scorecard set");
 			expect(out).toContain("guard failed once");
 			expect(out).toContain("it is flaky");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+	test("a failing guard shows what it printed on stdout too (bun run echoes on stderr, tsc errs on stdout)", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-guardout-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "guardout");
+			await z.load();
+			await z.cmd("shrink");
+			const guard = "echo '$ tsc --noEmit' >&2; echo 'a.ts(1,1): error TS1375: await needs a module'; exit 2";
+			await expect(z.tool("climb_scorecard", { metrics: [{ name: "w", cmd: "cat work.txt", dir: "down", target: 10, noise: 0.05 }], guard })).rejects.toThrow("TS1375");
 		} finally {
 			fs.rmSync(d, { recursive: true, force: true });
 		}

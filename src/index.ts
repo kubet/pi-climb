@@ -145,6 +145,8 @@ export default async function climb(pi: ExtensionAPI) {
 		return r;
 	}
 	const tail = (s: string) => s.replace(/[ \t]{2,}/g, " ").replace(/\n\s*\n/g, "\n").trim().slice(-400);
+	// Both streams: `bun run x` echoes the script on stderr while tsc prints its errors on stdout.
+	const said = (r: { stdout: string; stderr: string }) => tail(`${r.stdout}\n${r.stderr}`);
 
 	async function repoRoot(cwd: string): Promise<string | undefined> {
 		const hit = roots.get(cwd);
@@ -247,7 +249,7 @@ export default async function climb(pi: ExtensionAPI) {
 							: "Measurement interrupted; nothing was decided and the experiment stays open.",
 					);
 				if (r.code !== 0) {
-					errors.push(`${m.name}: exit ${r.code}${r.killed ? " (killed/timeout)" : ""}: ${tail(r.stderr || r.stdout)}`);
+					errors.push(`${m.name}: exit ${r.code}${r.killed ? " (killed/timeout)" : ""}: ${said(r)}`);
 					break;
 				}
 				const n = X.parseNumber(r.stdout);
@@ -407,7 +409,7 @@ export default async function climb(pi: ExtensionAPI) {
 				if (signal?.aborted) throw new Error("Proof interrupted; nothing was decided.");
 				if (r.code === 0) passed++;
 				else {
-					out = tail(r.stderr || r.stdout);
+					out = said(r);
 					if (r.killed) broken = `timed out after ${PROOF_MS / 1000}s`;
 					else if (r.code === 126 || r.code === 127) broken = `could not start (exit ${r.code}): ${out}`;
 				}
@@ -480,21 +482,27 @@ export default async function climb(pi: ExtensionAPI) {
 			r = await run(root, cmd, 1_800_000, { phase: "guard", goal }, signal, true);
 			await restore(root);
 			if (r.code === 0)
-				notices.push(`The guard failed once (exit ${first.code}: ${tail(first.stderr || first.stdout).slice(-160)}) and passed on a retry: it is flaky. Keep network-bound or timing-sensitive checks out of the guard, or it will refuse good work.`);
+				notices.push(`The guard failed once (exit ${first.code}: ${said(first).slice(-160)}) and passed on a retry: it is flaky. Keep network-bound or timing-sensitive checks out of the guard, or it will refuse good work.`);
 		}
 		if (signal?.aborted) throw new Error("Guard interrupted; nothing was decided and the experiment stays open.");
-		if (r.code === 0) guardPassed.set(key, L.clock.ms());
-		return r.code === 0 ? undefined : `guard failed (exit ${r.code}): ${tail(r.stderr || r.stdout)}`;
+		if (r.code === 0) {
+			guardPassed.set(key, L.clock.ms());
+			return undefined;
+		}
+		// Untracked files are in the working tree every run sees, but in no commit: name them.
+		const loose = (await git(root, "ls-files", "--others", "--exclude-standard", "--directory")).stdout.split("\n").filter(f => f && !f.startsWith(`${L.DIR}/`));
+		const stray = loose.length ? `\nUntracked files took part in this run (no commit holds them): ${loose.slice(0, 8).join(", ")}${loose.length > 8 ? ` and ${loose.length - 8} more` : ""}.` : "";
+		return `guard failed (exit ${r.code}): ${said(r)}${stray}`;
 	}
 
 	async function revert(root: string, exp: L.ExpE, reason: string): Promise<{ sha?: string; err?: string }> {
 		// Restore the base tree exactly (handles merges and added files), then commit it.
 		const r = await git(root, "restore", `--source=${exp.base}`, "--staged", "--worktree", ":/");
-		if (r.code !== 0) return { err: tail(r.stderr || r.stdout) };
+		if (r.code !== 0) return { err: said(r) };
 		const c = await git(root, "commit", "-m", `revert: climb ${exp.id} (${exp.lever})`, "-m", reason.slice(0, 500));
 		if (c.code !== 0 && !/nothing to commit/.test(c.stdout + c.stderr)) {
 			await git(root, "reset", "-q", "--hard", "HEAD"); // undo only our staged restore; the tree was clean before
-			return { err: tail(c.stderr || c.stdout) || `git commit exit ${c.code}` };
+			return { err: said(c) || `git commit exit ${c.code}` };
 		}
 		return { sha: await head(root) };
 	}
@@ -1150,7 +1158,7 @@ export default async function climb(pi: ExtensionAPI) {
 					r.code !== 0
 						? r.killed
 							? `timed out after ${limit}s (pass timeout_s for a slow command)`
-							: `exit ${r.code}: ${tail(r.stderr || r.stdout)}`
+							: `exit ${r.code}: ${said(r)}`
 						: n === undefined
 							? `no number in output: ${tail(r.stdout) || "(empty)"}`
 							: undefined;
@@ -1347,10 +1355,16 @@ export default async function climb(pi: ExtensionAPI) {
 			let kept = false;
 			let byProof = false;
 			say("guard");
-			let reason = await guard(root, g.card.guard, g.id, signal);
+			const broken = await guard(root, g.card.guard, g.id, signal);
 			const moved = await instrumentChanged(root, g.card, exp.base);
-			const gates: L.Gates = { guard: !g.card.guard ? "none" : reason ? "fail" : "pass", instrument: moved.length ? "changed" : "same" };
-			if (moved.length && !reason) reason = `instrument changed (${moved.join(", ")}): the measurement is not comparable`;
+			// A candidate that fails the guard is broken, not evidence against its idea: like a
+			// crashed metric it decides nothing, and the work stays for the fix.
+			if (broken && !moved.length)
+				throw new Error(
+					`${exp.id} was not measured: ${broken}\nNothing was decided and ${exp.id} stays open: fix it in another commit and call climb_measure again, or climb_measure with abandon if the idea itself is broken.`,
+				);
+			const gates: L.Gates = { guard: !g.card.guard ? "none" : broken ? "fail" : "pass", instrument: moved.length ? "changed" : "same" };
+			let reason = moved.length ? `instrument changed (${moved.join(", ")}): the measurement is not comparable` : undefined;
 			let noted = "";
 			let pairs: Record<string, [number, number][]> | undefined;
 			if (!reason) {

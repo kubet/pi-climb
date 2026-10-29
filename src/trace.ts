@@ -85,7 +85,7 @@ export function refusal(error: string): string {
 		[/as large as the whole way|could be told apart from luck/, "too noisy for its target"],
 		[/already meets its target/, "target already met"],
 		[/Fix these metric commands|Control measurement failed|Measurement failed/, "a metric command crashed"],
-		[/guard must pass/, "guard failed"],
+		[/guard must pass|guard failed/, "guard failed"],
 		[/since the last measured baseline/, "unmeasured commits refused"],
 		[/dropped in a row/, "drop-streak gate"],
 		[/judge is reviewing|STALLED/, "stall gate"],
