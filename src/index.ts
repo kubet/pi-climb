@@ -1324,7 +1324,7 @@ export default async function climb(pi: ExtensionAPI) {
 					if (!failed) gates.proof = "pass";
 				}
 			}
-			if (noted) reason = `${reason}${noted}`;
+			if (noted) reason = `${reason!.replace(/[.\s]*$/, "")}.${noted}`;
 			let reverted: string | undefined;
 			if (!kept) {
 				const rv = await revert(root, exp, reason!);
