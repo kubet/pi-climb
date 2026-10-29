@@ -16,7 +16,19 @@ interface Base {
 	ts: string;
 	goal?: string;
 }
-export interface RunT extends Base { kind: "run"; phase: Phase; metric?: string; ms: number; code: number; value?: number; retry?: true; killed?: true }
+export interface RunT extends Base {
+	kind: "run";
+	phase: Phase;
+	metric?: string;
+	ms: number;
+	code: number;
+	value?: number;
+	retry?: true;
+	killed?: true;
+	/** 1-minute load average and free memory when the run ended: contention is the first suspect for noise. */
+	load?: number;
+	free_mb?: number;
+}
 /** Runs not executed because the same tree and command were measured minutes ago. */
 export interface ReuseT extends Base { kind: "reuse"; phase: Phase; metric: string; runs: number }
 export interface ToolT extends Base { kind: "tool"; tool: string; ms: number; ok: boolean; error?: string }

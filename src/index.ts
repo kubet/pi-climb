@@ -10,11 +10,13 @@
 //     judge model call diagnoses the stall and redirects the worker
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as L from "./ledger";
 import * as X from "./logic";
+import * as E from "./export";
 import * as T from "./trace";
 
 const TICK_MS = 15_000;
@@ -29,6 +31,21 @@ type Update = (partial: { content: { type: "text"; text: string }[] }) => void;
 /** A positive number, or the default: strict-schema providers send 0 or null for "not given". */
 const pos = (v: number | null | undefined, d: number) => (typeof v === "number" && v > 0 ? v : d);
 const SYSTEM = /^\/(dev|usr|bin|sbin|etc|opt|nix|proc|System|Library|Applications)(\/|$)/;
+const sha = (text: string) => createHash("sha1").update(text).digest("hex");
+/** The machine measurements run on: a result is "metric M on commit C, instrument I, environment E". */
+const ENV: L.Env = (() => {
+	const cpus = os.cpus();
+	const facts = {
+		host: os.hostname(),
+		os: `${os.platform()} ${os.release()}`,
+		arch: os.arch(),
+		cpus: cpus.length,
+		cpu: cpus[0]?.model?.trim() ?? "?",
+		mem_gb: Math.round(os.totalmem() / 2 ** 30),
+		runtime: process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.versions.node}`,
+	};
+	return { ...facts, hash: sha(JSON.stringify(facts)).slice(0, 12) };
+})();
 
 export default async function climb(pi: ExtensionAPI) {
 	const S = await schemas(pi);
@@ -55,7 +72,9 @@ export default async function climb(pi: ExtensionAPI) {
 		const t0 = performance.now();
 		const r = await sh(root, cmd, timeoutMs, signal);
 		const value = r.code === 0 && tag.metric ? X.parseNumber(r.stdout) : undefined;
-		T.append(root, { ts: L.now(), kind: "run", ...tag, ms: Math.round(performance.now() - t0), code: r.code, value, retry: retry || undefined, killed: r.killed || undefined });
+		const load = Math.round(os.loadavg()[0] * 100) / 100; // contention is the first suspect for a noisy run
+		const free_mb = Math.round(os.freemem() / 2 ** 20);
+		T.append(root, { ts: L.now(), kind: "run", ...tag, ms: Math.round(performance.now() - t0), code: r.code, value, retry: retry || undefined, killed: r.killed || undefined, load, free_mb });
 		return r;
 	}
 	const tail = (s: string) => s.replace(/[ \t]{2,}/g, " ").replace(/\n\s*\n/g, "\n").trim().slice(-400);
@@ -367,11 +386,28 @@ export default async function climb(pi: ExtensionAPI) {
 			if (g && !g.done) return g;
 			throw new Error(`No active goal "${id}". Active: ${goals.map(g => g.id).join(", ") || "none"}.`);
 		}
-		const preferred = pred ? goals.filter(pred) : [];
-		const c = preferred.length ? preferred : goals;
+		const leaves = goals.filter(g => !L.umbrella(st, g));
+		const preferred = pred ? leaves.filter(pred) : [];
+		const c = preferred.length ? preferred : leaves;
 		if (c.length === 1) return c[0];
 		if (c.length) throw new Error(`Several active goals; pass goal: ${c.map(g => g.id).join(", ")}.`);
 		throw new Error("No active climb goal. The user starts one with /climb <intent>.");
+	}
+
+	/** A part that closes may close its parent: achieved when every part is. Returns the goals closed. */
+	function rollUp(root: string, id: string): string[] {
+		const closed: string[] = [];
+		let st = load(root);
+		for (let g = st.goals.get(id); g?.parent; g = st.goals.get(g.parent)) {
+			const parent = st.goals.get(g.parent);
+			if (!parent || parent.done) break;
+			const ps = L.parts(st, parent);
+			if (!ps.every(c => c.done?.result === "achieved")) break;
+			append(root, { ts: L.now(), kind: "done", goal: parent.id, result: "achieved", values: {} });
+			closed.push(parent.id);
+			st = load(root);
+		}
+		return closed;
 	}
 
 	function refresh(ctx: Ctx, root: string): L.State {
@@ -418,6 +454,23 @@ export default async function climb(pi: ExtensionAPI) {
 	}
 
 	const efficiency = (root: string) => T.stats(T.read(root), L.read(root), L.clock.ms());
+
+	/** .climb/export.json: the ledger as evidence rows (benchmaxx schema), rewritten after every decision. */
+	async function writeExport(root: string, file = path.join(root, L.DIR, "export.json")): Promise<{ file: string; rows: number; findings: number }> {
+		if (!remotes.has(root)) remotes.set(root, (await git(root, "remote", "get-url", "origin")).stdout.trim().replace(/\/\/[^@/]*@/, "//") || undefined);
+		const repo = { name: path.basename(root), remote: remotes.get(root) };
+		const out = E.build(L.read(root), repo, L.clock.ms());
+		try {
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			const tmp = `${file}.${process.pid}.tmp`;
+			fs.writeFileSync(tmp, JSON.stringify(out, null, 1));
+			fs.renameSync(tmp, file);
+		} catch (e) {
+			pi.logger?.warn?.("climb export failed", { error: String(e) });
+		}
+		return { file, rows: out.metric_rows.length, findings: out.knowledge.length };
+	}
+	const remotes = new Map<string, string | undefined>();
 
 	// A turn queued from a command starts asynchronously. Headless hosts (print/json)
 	// exit once idle, so hold the command until that turn is actually running; the
@@ -471,7 +524,8 @@ export default async function climb(pi: ExtensionAPI) {
 				st = load(root);
 			}
 			T.cap(root);
-			const goals = L.active(st);
+			// Parts are audited through their root: one heartbeat, one stall count, one judge per tree.
+			const goals = L.roots(st);
 			if (!goals.length) {
 				stopTimer(ctx);
 				ctx.ui?.setStatus?.("climb", undefined);
@@ -498,8 +552,10 @@ export default async function climb(pi: ExtensionAPI) {
 		// The heartbeat audits the ledger; it never measures. Measuring here would race the
 		// worker's edits and its benchmarks, and only kept results move the climb anyway.
 		const h = (await head(root)) ?? "";
-		const note = !g.card ? "no scorecard yet" : g.open ? `${g.open.id} open` : !idle ? "worker busy" : undefined;
-		const progress = L.progressSinceBeat(g);
+		const st = load(root);
+		const busy = X.openIn(st, g);
+		const note = busy ? `${busy.open!.id} open${busy !== g ? ` on ${busy.id}` : ""}` : !g.card && !L.umbrella(st, g) ? "no scorecard yet" : !idle ? "worker busy" : undefined;
+		const progress = L.treeProgressSinceBeat(st, g);
 		// An independent verdict restarts the count, so the judge runs once per stall, not every beat.
 		const stale = progress ? 0 : (L.judgedSinceBeat(g) ? 0 : (g.lastBeat?.stale ?? 0)) + 1;
 		append(root, { ts: L.now(), kind: "beat", goal: g.id, head: h, progress, stale, note });
@@ -512,7 +568,10 @@ export default async function climb(pi: ExtensionAPI) {
 			return;
 		}
 		const line = `[climb heartbeat ${g.id}] ${progress ? "progress" : `no progress (stale ${stale}/${g.cfg.poke_max})`}${note ? ` · ${note}` : ""}`;
-		if (idle) deliver(ctx, `${line}\n${X.nextAction(load(root).goals.get(g.id)!)}`, true);
+		if (idle) {
+			const now = load(root);
+			deliver(ctx, `${line}\n${X.nextAction(now, now.goals.get(g.id)!)}`, true);
+		}
 		else if (!progress) deliver(ctx, line, false);
 	}
 
@@ -527,12 +586,10 @@ export default async function climb(pi: ExtensionAPI) {
 			if (!g || g.done) return;
 			// Always retry the judge itself; judgeBroken only decides who may clear the gate meanwhile.
 			const turn = ctx.runEphemeralTurn?.bind(ctx);
-			if (!turn) return deliver(ctx, `${X.nextAction(g)} No independent judge on this host: call climb_judge with an honest diagnosis.`, true);
-			const ledgerTail = L.read(root)
-				.filter(e => e.goal === id && e.kind !== "beat" && e.kind !== "rollup")
-				.slice(-15);
+			if (!turn) return deliver(ctx, `${X.nextAction(load(root), g)} No independent judge on this host: call climb_judge with an honest diagnosis.`, true);
 			const log = (await git(root, "log", "--oneline", "-15")).stdout.trim();
-			const promptText = X.judgePrompt(g, ledgerTail, log, T.stats(T.read(root), L.read(root), L.clock.ms()));
+			const tree = new Set(L.subtree(load(root), g).map(x => x.id));
+			const promptText = X.judgePrompt(load(root), g, L.read(root).filter(e => tree.has(e.goal) && e.kind !== "beat" && e.kind !== "rollup").slice(-15), log, T.stats(T.read(root), L.read(root), L.clock.ms()));
 			// Transports differ in what side turns accept (output caps, tool opt-out): degrade.
 			let reply: string | undefined;
 			let lastErr: unknown;
@@ -572,7 +629,7 @@ export default async function climb(pi: ExtensionAPI) {
 			mark(false, String(e));
 			const g = load(root).goals.get(id);
 			// Never leave the worker gated on a judge that cannot answer.
-			if (g && !g.done) deliver(ctx, `${X.nextAction(g)} The independent judge failed (${String(e).slice(0, 160)}): call climb_judge with an honest diagnosis.`, true);
+			if (g && !g.done) deliver(ctx, `${X.nextAction(load(root), g)} The independent judge failed (${String(e).slice(0, 160)}): call climb_judge with an honest diagnosis.`, true);
 		} finally {
 			judging.delete(id);
 		}
@@ -605,7 +662,8 @@ export default async function climb(pi: ExtensionAPI) {
 		const root = await repoRoot(ctx.cwd);
 		if (!root) return;
 		const st = load(root);
-		const goals = L.active(st).filter(g => !L.stuck(g) && !judging.has(g.id));
+		// A part rests with its root: a STUCK or judged tree does not hold the worker.
+		const goals = L.active(st).filter(g => !L.stuck(L.rootOf(st, g)) && !judging.has(L.rootOf(st, g).id) && !judging.has(g.id));
 		if (st.paused || !goals.length || !lease(root, ctx)) {
 			stopIdle = 0;
 			stopLines = -1;
@@ -631,7 +689,7 @@ export default async function climb(pi: ExtensionAPI) {
 			for (const g of goals) void judge(ctx, root, g.id, "worker kept stopping idle");
 			return;
 		}
-		return { decision: "block" as const, reason: goals.map(X.nextAction).join("\n") };
+		return { decision: "block" as const, reason: [...new Set(goals.map(g => L.rootOf(st, g)))].map(g => X.nextAction(st, g)).join("\n") };
 	});
 
 	// Survive host compaction: the summary always carries the authoritative climb state.
@@ -642,7 +700,12 @@ export default async function climb(pi: ExtensionAPI) {
 		const st = load(root);
 		const goals = L.active(st);
 		if (!goals.length) return;
-		return { context: [`Climb state (authoritative, from ${L.DIR}/${L.FILE}):\n${X.report(st)}\n${goals.map(X.nextAction).join("\n")}`] };
+		const known = goals.flatMap(g => g.learned).slice(-20);
+		return {
+			context: [
+				`Climb state (authoritative, from ${L.DIR}/${L.FILE}):\n${X.report(st)}\n${L.roots(st).map(g => X.nextAction(st, g)).join("\n")}${known.length ? `\nRecorded knowledge:\n${known.map(l => `- [${l.type}] ${l.text}`).join("\n")}` : ""}`,
+			],
+		};
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
@@ -721,6 +784,8 @@ export default async function climb(pi: ExtensionAPI) {
 			holder(root, ctx);
 			const g = pick(load(root), p.goal);
 			if (g.open) throw new Error(`Experiment ${g.open.id} is open; close it with climb_measure before changing the scorecard.`);
+			const st0 = load(root);
+			if (L.umbrella(st0, g)) throw new Error(`${g.id} is split into parts (${L.openParts(st0, g).map(c => c.id).join(", ")}): give each part its own scorecard (goal: <part>).`);
 			if (!p.metrics?.length || p.metrics.length > X.MAX_METRICS)
 				throw new Error(`Use 1-${X.MAX_METRICS} metrics: focus on the few that matter and list the rest under parked.`);
 			const names = new Set<string>();
@@ -806,8 +871,12 @@ export default async function climb(pi: ExtensionAPI) {
 			const tracked = new Set((await git(root, "ls-files")).stdout.split("\n").filter(Boolean));
 			// An explicit list is authoritative (pass [] to freeze nothing); otherwise freeze what the commands execute.
 			const frozen = p.frozen ?? [...new Set(commands.flatMap(c => X.instrumentFiles(c, tracked)))];
+			// The instrument's identity: its commands and the frozen files' contents at this commit.
+			const blobs = (await git(root, "ls-files", "-s")).stdout.split("\n").filter(Boolean).map(l => ({ blob: l.split(" ")[1], file: l.split("\t")[1] }));
+			const frozenNow = new Set(X.touchedFrozen(blobs.map(b => b.file), frozen));
+			const instrument = sha([...commands, ...blobs.filter(b => frozenNow.has(b.file)).map(b => `${b.file} ${b.blob}`)].join("\n")).slice(0, 16);
 			const h = await head(root);
-			append(root, { ts: L.now(), kind: "card", goal: g.id, metrics, guard: p.guard, frozen, head: h, parked: p.parked, axioms: p.axioms });
+			append(root, { ts: L.now(), kind: "card", goal: g.id, metrics, guard: p.guard, frozen, head: h, parked: p.parked, axioms: p.axioms, instrument, env: ENV });
 			refresh(ctx, root);
 			const lines = metrics.map(
 				m =>
@@ -888,13 +957,16 @@ export default async function climb(pi: ExtensionAPI) {
 			holder(root, ctx);
 			const st = load(root);
 			const g = pick(st, p.goal);
-			if (!g.card) throw new Error("Define the scorecard first with climb_scorecard.");
+			if (L.umbrella(st, g)) throw new Error(`${g.id} is split into parts; experiment on one of them (goal: ${L.openParts(st, g).map(c => c.id).join(" | ")}).`);
+			if (!g.card) throw new Error(`Define the scorecard first with climb_scorecard${g.parent ? ` (goal: "${g.id}")` : ""}.`);
 			const busy = L.active(st).find(x => x.open);
 			if (busy?.open) throw new Error(`Experiment ${busy.open.id} on ${busy.id} is still open; finish it with climb_measure first.`);
-			if (g.stallPending) {
-				if (!hasJudge(ctx)) throw new Error(X.nextAction(g));
+			// A stall belongs to the whole tree: no part experiments until the judge has spoken.
+			const top = L.rootOf(st, g);
+			if (top.stallPending) {
+				if (!hasJudge(ctx)) throw new Error(X.nextAction(st, top));
 				// A stall whose judge never ran (or died with a restart) gets one now.
-				if (!judging.has(g.id)) void judge(ctx, root, g.id, "stall left without a verdict");
+				if (!judging.has(top.id)) void judge(ctx, root, top.id, "stall left without a verdict");
 				throw new Error("The independent judge is reviewing this stall; its verdict arrives as a message shortly. Record your own diagnosis with climb_judge meanwhile if you have one.");
 			}
 			const blocked = X.streakBlocked(g);
@@ -961,7 +1033,7 @@ export default async function climb(pi: ExtensionAPI) {
 				}
 			}
 			const id = `x${g.nextExp}`;
-			append(root, { ts: L.now(), kind: "exp", goal: g.id, id, lever: p.lever, hypothesis: p.hypothesis, prediction: p.prediction, base, ref: control.values, proof });
+			append(root, { ts: L.now(), kind: "exp", goal: g.id, id, lever: p.lever, hypothesis: p.hypothesis, prediction: p.prediction, base, ref: control.values, proof, runs: control.samples, env: ENV.hash });
 			refresh(ctx, root);
 			const ref = Object.entries(control.values).map(([k, v]) => `${k}=${v}`).join(", ");
 			const reused = control.reused.length ? ` (${control.reused.join(", ")}: reused runs of this tree from the last 30 minutes)` : "";
@@ -1001,9 +1073,10 @@ export default async function climb(pi: ExtensionAPI) {
 					if (rv.sha) reverted = rv.sha;
 					else reason += ` — auto-revert failed (${rv.err}); restore by hand: git revert --no-commit ${exp.base.slice(0, 8)}..HEAD && git commit`;
 				}
-				append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: at, values: {}, verdict: "dropped", reason, reverted });
+				append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: at, values: {}, verdict: "dropped", reason, reverted, env: ENV.hash });
+				await writeExport(root);
 				const st = refresh(ctx, root);
-				return ok(`DROPPED ${exp.id} (${reason}).${reverted ? ` Reverted in ${reverted.slice(0, 8)}.` : ""}\n${X.nextAction(st.goals.get(g.id)!)}`);
+				return ok(`DROPPED ${exp.id} (${reason}).${reverted ? ` Reverted in ${reverted.slice(0, 8)}.` : ""}\n${X.nextAction(st, L.rootOf(st, st.goals.get(g.id)!))}`);
 			}
 			const h = await head(root);
 			if (!h || h === exp.base) throw new Error(`HEAD is still the base commit ${exp.base.slice(0, 8)}; commit ${exp.id} first.`);
@@ -1014,8 +1087,9 @@ export default async function climb(pi: ExtensionAPI) {
 			let byProof = false;
 			say("guard");
 			let reason = await guard(root, g.card.guard, g.id, signal);
-			const moved = reason ? [] : await instrumentChanged(root, g.card, exp.base);
-			if (moved.length) reason = `instrument changed (${moved.join(", ")}): the measurement is not comparable`;
+			const moved = await instrumentChanged(root, g.card, exp.base);
+			const gates: L.Gates = { guard: !g.card.guard ? "none" : reason ? "fail" : "pass", instrument: moved.length ? "changed" : "same" };
+			if (moved.length && !reason) reason = `instrument changed (${moved.join(", ")}): the measurement is not comparable`;
 			if (!reason) {
 				let r = await measure(root, g.card.metrics, { phase: "result", goal: g.id }, signal, {}, say);
 				// Within 2x noise either way: measure again before deciding, so noise
@@ -1035,6 +1109,7 @@ export default async function climb(pi: ExtensionAPI) {
 					const now = await hashes(root, Object.keys(exp.proof.files));
 					const edited = Object.keys(exp.proof.files).filter(f => now[f] !== exp.proof!.files[f]);
 					let failed = edited.length ? `proof void: ${edited.join(", ")} changed since registration` : "";
+					gates.proof = edited.length ? "void" : "fail";
 					if (!failed) {
 						say("proof");
 						const pr = await proofRuns(root, exp.proof.cmd, g.id, signal);
@@ -1051,6 +1126,7 @@ export default async function climb(pi: ExtensionAPI) {
 						reason = `proof passes (it failed at ${exp.base.slice(0, 8)}): ${exp.proof.cmd}; ${reason.replace(/^no metric beat noise/, "no metric regressed")}`;
 					}
 					kept = !failed;
+					if (!failed) gates.proof = "pass";
 				}
 			}
 			let reverted: string | undefined;
@@ -1059,7 +1135,7 @@ export default async function climb(pi: ExtensionAPI) {
 				if (rv.sha) reverted = rv.sha;
 				else reason += ` — auto-revert failed (${rv.err}); restore by hand: git revert --no-commit ${exp.base.slice(0, 8)}..HEAD && git commit`;
 			}
-			append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: h, values, verdict: kept ? "kept" : "dropped", reason: reason!, reverted, proof: byProof || undefined });
+			append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: h, values, verdict: kept ? "kept" : "dropped", reason: reason!, reverted, proof: byProof || undefined, runs: samples, gates, env: ENV.hash });
 			let won = kept && g.card.metrics.every(m => L.met(m, values[m.name]));
 			if (won) {
 				// "Done" is never claimed from a single draw: confirm with fresh samples.
@@ -1067,17 +1143,21 @@ export default async function climb(pi: ExtensionAPI) {
 				won = !c.errors.length && g.card.metrics.every(m => L.met(m, c.values[m.name]));
 				if (won) append(root, { ts: L.now(), kind: "done", goal: g.id, result: "achieved", values: c.values });
 			}
+			const closedUp = won ? rollUp(root, g.id) : [];
+			await writeExport(root);
 			const st = refresh(ctx, root);
 			let text = kept
 				? `KEPT ${exp.id}${byProof ? " by proof" : ""}: ${reason}.${byProof ? " A verified fix, but the scorecard has not moved: it does not count as progress." : ""}`
 				: `DROPPED ${exp.id}: ${reason}.${reverted ? ` Reverted in ${reverted.slice(0, 8)}.` : ""}`;
 			if (won) {
-				text += `\nGOAL ACHIEVED: ${g.id}, every target met.${g.card.parked?.length ? ` Parked metrics remain: ${g.card.parked.join(", ")}.` : ""}`;
+				text += `\nGOAL ACHIEVED: ${g.id}, every target met.${g.card.parked?.length ? ` Parked metrics remain: ${g.card.parked.join(", ")}.` : ""}${closedUp.length ? ` That completes ${closedUp.join(" and ")}: every part achieved.` : ""}`;
+				const rest = L.roots(st);
+				if (rest.length) text += `\n${rest.map(r => X.nextAction(st, r)).join("\n")}`;
 				ctx.ui?.notify?.(`climb ${g.id} achieved`, "info");
 				if (!L.active(st).length) stopTimer(ctx);
 			} else {
 				if (kept && g.card.metrics.every(m => L.met(m, values[m.name]))) text += "\nTargets met once but not confirmed on re-measurement; keep climbing.";
-				text += `\n${X.nextAction(st.goals.get(g.id)!)}`;
+				text += `\n${X.nextAction(st, L.rootOf(st, st.goals.get(g.id)!))}`;
 			}
 			return ok(text);
 		})),
@@ -1100,7 +1180,12 @@ export default async function climb(pi: ExtensionAPI) {
 			worker(ctx);
 			const root = await needRoot(ctx);
 			holder(root, ctx);
-			const g = pick(load(root), p.goal, x => x.stallPending || x.streak >= X.DROP_STREAK);
+			const st0 = load(root);
+			const stalled = L.roots(st0).filter(r => r.stallPending);
+			const g0 = !p.goal && stalled.length === 1 ? stalled[0] : pick(st0, p.goal, x => x.stallPending || x.streak >= X.DROP_STREAK);
+			// A stall belongs to the root: a diagnosis of it goes there, or (without a judge) it could never lift.
+			const top = L.rootOf(st0, g0);
+			const g = top.stallPending && !g0.stallPending && g0.streak < X.DROP_STREAK ? top : g0;
 			const independent = hasJudge(ctx);
 			const escalate = p.verdict === "stuck" && independent;
 			append(root, {
@@ -1116,8 +1201,75 @@ export default async function climb(pi: ExtensionAPI) {
 				void judge(ctx, root, g.id, "worker said stuck");
 				return ok("Recorded. 'stuck' is decided by the independent judge, now reviewing; keep working meanwhile.");
 			}
-			const after = refresh(ctx, root).goals.get(g.id)!;
-			return ok(p.verdict === "stuck" ? "Recorded as STUCK: the loop rests until a human or a new commit moves it." : `Recorded. ${X.nextAction(after)}`);
+			const st2 = refresh(ctx, root);
+			const after = st2.goals.get(g.id)!;
+			return ok(p.verdict === "stuck" ? "Recorded as STUCK: the loop rests until a human or a new commit moves it." : `Recorded. ${X.nextAction(st2, after)}`);
+		}),
+	});
+
+	pi.registerTool({
+		name: "climb_split",
+		label: "Climb: split",
+		description:
+			"Decompose a goal into parts (2-4), each a goal of its own: research, scorecard, experiments and knowledge, rolled up into the parent, which closes as achieved when every part is. Split when one scorecard cannot hold the intent: the parts need different instruments, metrics keep being swapped in and out, or a part must first build a steadier instrument. Parts share the repo: a kept change in one part that regresses another's metric is caught at that part's next experiment.",
+		parameters: S.obj({
+			goal: S.opt(S.str("Goal to split; optional when one goal is active")),
+			parts: S.arr(S.obj({ intent: S.str("What this part must achieve: one measurable thing"), why: S.opt(S.str("Why it is a separate part")) }), "2-4 parts"),
+		}),
+		loadMode: "essential",
+		execute: logged("climb_split", async (_id, p: SplitParams, _s, _u, ctx) => {
+			worker(ctx);
+			const root = await needRoot(ctx);
+			holder(root, ctx);
+			const st = load(root);
+			const g = pick(st, p.goal);
+			const busy = X.openIn(st, g);
+			if (busy) throw new Error(`Experiment ${busy.open!.id} on ${busy.id} is open; finish it with climb_measure before splitting.`);
+			if (L.depth(st, g) + 1 > X.MAX_DEPTH) throw new Error(`${g.id} is already ${X.MAX_DEPTH - 1} level(s) deep; split its parent differently instead.`);
+			const open = L.openParts(st, g).length;
+			const intents = (p.parts ?? []).map(x => x.intent?.trim()).filter(Boolean);
+			if (intents.length !== (p.parts ?? []).length || new Set(intents).size !== intents.length) throw new Error("Each part needs its own non-empty intent.");
+			if (!intents.length || (!open && intents.length < 2) || open + intents.length > X.MAX_PARTS)
+				throw new Error(`A split makes 2-${X.MAX_PARTS} parts (${g.id} has ${open} open). Focus: fewer, sharper parts.`);
+			const taken = new Set(st.goals.keys());
+			const ids = intents.map(intent => {
+				const id = X.slug(intent, taken);
+				taken.add(id);
+				return id;
+			});
+			append(root, ...p.parts.map((x, i) => ({ ts: L.now(), kind: "goal" as const, goal: ids[i], intent: intents[i], cfg: g.cfg, parent: g.id, why: x.why })));
+			const after = refresh(ctx, root);
+			return ok(`Split ${g.id} into ${ids.join(", ")}. Each part is a goal: probe it, give it a scorecard, climb it (pass goal: <part> to the climb tools).\n${X.nextAction(after, after.goals.get(g.id)!)}`);
+		}),
+	});
+
+	pi.registerTool({
+		name: "climb_learn",
+		label: "Climb: learn",
+		description:
+			"Record durable knowledge for a goal: a fact (true about the system or the instrument, with numbers), a trap (X looks like Y; check Z), or a dead end (an approach shown not to work, with its experiments as evidence). It survives compaction and restarts, is repeated with your next steps and shown to the judge, and goes to the export for dashboards and other agents. One finding per call.",
+		parameters: S.obj({
+			goal: S.opt(S.str("Goal id; optional when one goal is active")),
+			kind: S.enum(["fact", "trap", "dead-end"], "fact, trap, or dead-end"),
+			text: S.str("The finding, one or two sentences"),
+			evidence: S.opt(S.str("Experiment ids, commits, files or numbers that back it")),
+		}),
+		loadMode: "essential",
+		approval: "write",
+		execute: logged("climb_learn", async (_id, p: LearnParams, _s, _u, ctx) => {
+			worker(ctx);
+			const root = await needRoot(ctx);
+			holder(root, ctx);
+			const st = load(root);
+			// A finished part's lessons still serve its siblings: any known goal can learn.
+			const g = p.goal && st.goals.has(p.goal) ? st.goals.get(p.goal)! : pick(st, p.goal);
+			const text = p.text?.trim() ?? "";
+			if (!text || text.length > 600) throw new Error("A finding is one or two sentences (1-600 characters).");
+			if (!["fact", "trap", "dead-end"].includes(p.kind)) throw new Error('kind is "fact", "trap" or "dead-end".');
+			if (L.knowledge(st, g).some(l => l.text === text)) return ok(`Already recorded for ${g.id}.`);
+			append(root, { ts: L.now(), kind: "learn", goal: g.id, type: p.kind, text, evidence: p.evidence?.trim() || undefined });
+			const n = L.knowledge(load(root), L.rootOf(load(root), g)).length;
+			return ok(`Recorded ${p.kind} for ${g.id} (${n} findings in this goal's tree).`);
 		}),
 	});
 
@@ -1132,7 +1284,7 @@ export default async function climb(pi: ExtensionAPI) {
 			ctxRef = ctx;
 			const root = await needRoot(ctx);
 			const st = load(root);
-			return ok(`${X.report(st)}\n\n${efficiency(root)}\n\n${L.active(st).map(X.nextAction).join("\n")}`.trim());
+			return ok(`${X.report(st)}\n\n${efficiency(root)}\n\n${L.roots(st).map(g => X.nextAction(st, g)).join("\n")}`.trim());
 		},
 	});
 
@@ -1140,7 +1292,7 @@ export default async function climb(pi: ExtensionAPI) {
 
 	pi.registerCommand("climb", {
 		description:
-			"Autonomous hill-climb. /climb <intent> [--beat 30m] [--poke-max 3] starts a goal · /climb shows progress · beat · judge [goal] · pause · resume · done [goal] · compact",
+			"Autonomous hill-climb. /climb <intent> [--beat 30m] [--poke-max 3] starts a goal · /climb shows progress · beat · judge [goal] · pause · resume · done [goal] · export [path] · compact",
 		handler: async (args, ctx) => {
 			ctxRef = ctx;
 			const root = await repoRoot(ctx.cwd);
@@ -1187,17 +1339,25 @@ export default async function climb(pi: ExtensionAPI) {
 				lease(root, ctx, true);
 				ensureTimer(ctx);
 				const now = refresh(ctx, root);
-				for (const g of L.active(now)) deliver(ctx, X.nextAction(g), true);
+				for (const g of L.roots(now)) deliver(ctx, X.nextAction(now, g), true);
 				return started(ctx);
 			}
 			if (sub === "done" && words.length <= 2) {
 				const g = one(words[1]);
 				if (!g) return;
-				const won = !!g.card && g.card.metrics.every(m => L.met(m, g.best[m.name]));
-				append(root, { ts: L.now(), kind: "done", goal: g.id, result: won ? "achieved" : "abandoned", values: g.best });
+				// Closing a split goal closes its open parts first (deepest first).
+				const won = (x: L.Goal) => !!x.card && x.card.metrics.every(m => L.met(m, x.best[m.name]));
+				const tree = L.subtree(st, g).filter(x => !x.done).reverse();
+				for (const x of tree) append(root, { ts: L.now(), kind: "done", goal: x.id, result: won(x) ? "achieved" : "abandoned", values: x.best });
+				const up = won(g) ? rollUp(root, g.id) : [];
+				await writeExport(root);
 				const now = refresh(ctx, root);
 				if (!L.active(now).length) stopTimer(ctx);
-				return ctx.ui.notify(`climb ${g.id} closed (${won ? "achieved" : "abandoned"}).`, "info");
+				return ctx.ui.notify(`climb ${tree.map(x => x.id).join(", ")} closed (${won(g) ? "achieved" : "abandoned"})${up.length ? `; ${up.join(", ")} achieved` : ""}.`, "info");
+			}
+			if (sub === "export" && words.length <= 2) {
+				const x = await writeExport(root, words[1] ? path.resolve(ctx.cwd, words[1]) : undefined);
+				return ctx.ui.notify(`climb export: ${x.file} (${x.rows} metric rows, ${x.findings} findings; schema ${E.SCHEMA})`, "info");
 			}
 			if (words.length === 1 && sub === "compact") {
 				const before = L.read(root);
@@ -1222,7 +1382,7 @@ export default async function climb(pi: ExtensionAPI) {
 			}
 			const intent = rest.join(" ");
 			if (!intent) return ctx.ui.notify("Usage: /climb <intent> [--beat 30m] [--poke-max 3]", "error");
-			if (L.active(st).length >= X.MAX_GOALS)
+			if (L.roots(st).length >= X.MAX_GOALS)
 				return ctx.ui.notify(`${X.MAX_GOALS} goals already active; finish one (/climb done <goal>) first. Focus beats breadth.`, "error");
 			if (!(await head(root))) return ctx.ui.notify("climb needs at least one commit.", "error");
 			await ensureExcluded(root);
@@ -1256,6 +1416,14 @@ interface ProbeParams extends GoalParam {
 	cmd: string;
 	note?: string;
 	timeout_s?: number;
+}
+interface SplitParams extends GoalParam {
+	parts: { intent: string; why?: string }[];
+}
+interface LearnParams extends GoalParam {
+	kind: L.LearnKind;
+	text: string;
+	evidence?: string;
 }
 interface MeasureParams extends GoalParam {
 	abandon?: string;

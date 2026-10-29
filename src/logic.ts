@@ -6,17 +6,28 @@ import {
 	type State,
 	type Values,
 	type Verdict,
+	type LearnE,
 	active,
 	clock,
 	epoch,
 	gain,
+	knowledge,
 	met,
+	openParts,
+	parts,
+	rootOf,
+	roots,
 	stuck,
+	subtree,
+	umbrella,
 } from "./ledger";
 
 export const MAX_GOALS = 2;
 export const MAX_METRICS = 3;
 export const DROP_STREAK = 3;
+/** Decomposition bounds: parts per goal, and how deep a split may go (root = 0). */
+export const MAX_PARTS = 4;
+export const MAX_DEPTH = 2;
 
 export function parseNumber(stdout: string): number | undefined {
 	const lines = stdout.trim().split("\n");
@@ -108,32 +119,62 @@ const ago = (ts: string | undefined, nowMs: number) => {
 	return m < 60 ? `${m}m ago` : m < 2880 ? `${Math.round(m / 60)}h ago` : `${Math.round(m / 1440)}d ago`;
 };
 
+/** Progress toward targets; a split goal's is the mean of its parts' (abandoned parts excluded). */
+export function goalPct(st: State, g: Goal): number {
+	const ps = parts(st, g).filter(c => c.done?.result !== "abandoned");
+	if (ps.length) return Math.round(ps.reduce((sum, c) => sum + (c.done ? 100 : goalPct(st, c)), 0) / ps.length);
+	if (!g.card) return 0;
+	const goals = g.card.metrics.filter(m => !m.hold);
+	return Math.min(...(goals.length ? goals : g.card.metrics).map(m => progressPct(m, g.best[m.name])));
+}
+
+/** The goal in a tree that holds the open experiment, if any. */
+export const openIn = (st: State, g: Goal) => subtree(st, g).find(x => x.open);
+
 export function statusLine(st: State, nowMs = clock.ms()): string | undefined {
-	const goals = active(st);
+	const goals = roots(st);
 	if (!goals.length) return undefined;
-	const parts = goals.map(g => {
-		if (!g.card) return `${g.id}: researching (${g.probes.filter(p => p.value !== undefined).length} probes)`;
-		const goals = g.card.metrics.filter(m => !m.hold);
-		const pct = Math.min(...(goals.length ? goals : g.card.metrics).map(m => progressPct(m, g.best[m.name])));
+	const shown = goals.map(g => {
+		const split = umbrella(st, g);
+		if (!g.card && !split) return `${g.id}: researching (${g.probes.filter(p => p.value !== undefined).length} probes)`;
 		const due = g.lastBeat ? Math.max(0, g.cfg.beat_s - (nowMs - epoch(g.lastBeat.ts)) / 1000) : g.cfg.beat_s;
 		const flag = stuck(g) ? " STUCK" : g.stallPending ? " STALL" : "";
-		return `${g.id} ${pct}% · stale ${g.lastBeat?.stale ?? 0}/${g.cfg.poke_max}${g.open ? ` · ${g.open.id}` : ""} · beat ${Math.ceil(due / 60)}m${flag}`;
+		const busy = openIn(st, g);
+		const where = busy ? ` · ${busy.open!.id}${busy !== g ? ` on ${busy.id}` : ""}` : "";
+		return `${g.id} ${goalPct(st, g)}%${split ? ` · ${openParts(st, g).length} parts` : ""} · stale ${g.lastBeat?.stale ?? 0}/${g.cfg.poke_max}${where} · beat ${Math.ceil(due / 60)}m${flag}`;
 	});
-	return `⛰ ${st.paused ? "PAUSED " : ""}${parts.join(" | ")}`;
+	return `⛰ ${st.paused ? "PAUSED " : ""}${shown.join(" | ")}`;
 }
 
 export function report(st: State, nowMs = clock.ms()): string {
-	const goals = [...st.goals.values()].filter(g => !g.done || nowMs - epoch(g.done.ts) < 86_400_000);
-	if (!goals.length) return "No goals. Start one: /climb <intent>";
+	const top = [...st.goals.values()].filter(g => !g.parent && (!g.done || nowMs - epoch(g.done.ts) < 86_400_000));
+	if (!top.length) return "No goals. Start one: /climb <intent>";
 	const out: string[] = [];
 	if (st.paused) out.push("PAUSED — /climb resume to continue");
-	for (const g of goals) {
-		const state = g.done ? `DONE (${g.done.result})` : stuck(g) ? "STUCK — needs you" : g.stallPending ? "STALLED — judge pending" : "climbing";
-		out.push(`## ${g.id} — ${state}`, `"${g.intent}"`);
+	const walk = (g: Goal, depth: number) => {
+		const lines = section(st, g, nowMs);
+		out.push(...lines.map(l => `${"  ".repeat(depth)}${l}`));
+		for (const c of parts(st, g)) walk(c, depth + 1);
+	};
+	for (const g of top) walk(g, 0);
+	return out.join("\n");
+}
+
+function section(st: State, g: Goal, nowMs: number): string[] {
+	const out: string[] = [];
+	{
+		const state = g.done ? `DONE (${g.done.result})` : stuck(g) ? "STUCK — needs you" : g.stallPending ? "STALLED — judge pending" : umbrella(st, g) ? `split into ${parts(st, g).length} parts, ${goalPct(st, g)}%` : "climbing";
+		out.push(`${g.parent ? "↳" : "##"} ${g.id} — ${state}`, `"${g.intent}"${g.why ? ` (why: ${g.why})` : ""}`);
+		const learned = g.learned;
+		if (learned.length) {
+			const n = (k: string) => learned.filter(l => l.type === k).length;
+			out.push(`  knowledge: ${n("fact")} facts, ${n("trap")} traps, ${n("dead-end")} dead ends; latest: ${learned.slice(-2).map(l => `[${l.type}] ${l.text}`).join(" | ")}`);
+		}
 		if (!g.card) {
+			if (umbrella(st, g) && !g.probes.length) return out;
 			out.push(`researching: ${g.probes.length} research items probed`);
 			for (const p of g.probes.slice(-8)) out.push(`  · ${p.name} = ${p.value ?? `failed (${p.error})`}${p.note ? ` — ${p.note}` : ""}`);
-			continue;
+			return out;
 		}
 		for (const m of g.card.metrics) {
 			const best = g.best[m.name];
@@ -161,7 +202,7 @@ export function report(st: State, nowMs = clock.ms()): string {
 		if (d) out.push(`  last diagnosis (${d.by}, ${ago(d.ts, nowMs)}): ${d.verdict} — ${d.diagnosis} → ${d.next}`);
 		if (g.card.parked?.length) out.push(`  parked: ${g.card.parked.join(", ")}`);
 	}
-	return out.join("\n");
+	return out;
 }
 
 export function cardSummary(g: Goal): string {
@@ -175,19 +216,37 @@ export function cardSummary(g: Goal): string {
 		.join("; ");
 }
 
-/** The single next obligation the worker must meet for this goal. */
-export function nextAction(g: Goal): string {
+const clip = (t: string, n = 140) => (t.length > n ? `${t.slice(0, n - 1)}…` : t);
+
+/** What the goal's tree has learned that the next move must not ignore: dead ends and traps. */
+function lessons(st: State, g: Goal): string {
+	const k = knowledge(st, g);
+	const pick = (type: LearnE["type"]) => k.filter(l => l.type === type).slice(-3).map(l => clip(l.text)).join("; ");
+	const dead = pick("dead-end");
+	const traps = pick("trap");
+	return `${dead ? ` Known dead ends: ${dead}.` : ""}${traps ? ` Traps: ${traps}.` : ""}`;
+}
+
+/** The single next obligation the worker must meet for this goal (for a split goal: for its next part). */
+export function nextAction(st: State, g: Goal): string {
+	const tag = g.parent ? ` (pass goal: "${g.id}")` : "";
+	if (g.stallPending && !openIn(st, g))
+		return `[climb ${g.id}] STALLED: no progress in ${g.lastBeat?.stale ?? "several"} heartbeats. Stop and diagnose before experimenting: is the lever wrong, the metric broken/noisy, something blocked, or are you grid-searching one idea? Call climb_judge with an honest diagnosis and the next move; where an independent judge runs, its verdict releases the stall. State: ${umbrella(st, g) ? `split into ${openParts(st, g).map(p => p.id).join(", ")}` : cardSummary(g)}.`;
+	if (umbrella(st, g)) {
+		const ps = openParts(st, g);
+		const next = ps.find(p => openIn(st, p)) ?? ps.find(p => !p.card && !umbrella(st, p)) ?? [...ps].sort((a, b) => goalPct(st, a) - goalPct(st, b))[0];
+		const list = ps.map(p => `${p.id} (${p.card || umbrella(st, p) ? `${goalPct(st, p)}%` : "researching"}${openIn(st, p) ? `, ${openIn(st, p)!.open!.id} open` : ""})`).join(", ");
+		return `[climb ${g.id}] Split into parts: ${list}. Next, ${next.id}: ${nextAction(st, next)}`;
+	}
 	if (!g.card) {
 		const n = g.probes.filter(p => p.value !== undefined).length;
-		return `[climb ${g.id}] Researching "${g.intent}" (${n} candidate metrics probed). Itemize the research: register each candidate metric with climb_probe (the extension runs it). Then call climb_scorecard with the 1-${MAX_METRICS} that matter, each with a direction and an ambitious target.`;
+		return `[climb ${g.id}] Researching "${g.intent}"${tag} (${n} candidate metrics probed). Itemize the research: register each candidate metric with climb_probe (the extension runs it). Then call climb_scorecard with the 1-${MAX_METRICS} that matter, each with a direction and an ambitious target. If the intent needs metrics with different instruments, split it into parts with climb_split.${lessons(st, g)}`;
 	}
 	if (g.open)
-		return `[climb ${g.id}] Experiment ${g.open.id} is open (lever "${g.open.lever}": ${g.open.hypothesis}). Finish it: implement, commit, then call climb_measure. State: ${cardSummary(g)}.`;
-	if (g.stallPending)
-		return `[climb ${g.id}] STALLED: no progress in ${g.lastBeat?.stale ?? "several"} heartbeats. Stop and diagnose before experimenting: is the lever wrong, the metric broken/noisy, something blocked, or are you grid-searching one idea? Call climb_judge with an honest diagnosis and the next move; where an independent judge runs, its verdict releases the stall. State: ${cardSummary(g)}.`;
+		return `[climb ${g.id}] Experiment ${g.open.id} is open (lever "${g.open.lever}": ${g.open.hypothesis}). Finish it: implement, commit, then call climb_measure${tag}. State: ${cardSummary(g)}.`;
 	const tried = [...g.levers.entries()].map(([k, l]) => `${k} (${l.kept}/${l.tried} kept)`).join(", ");
 	const judged = g.diagnosis ? ` Last diagnosis (${g.diagnosis.by}): ${g.diagnosis.verdict} — ${g.diagnosis.next}.` : "";
-	return `[climb ${g.id}] Keep climbing. State: ${cardSummary(g)}.${tried ? ` Levers tried: ${tried}.` : ""}${judged} Pick the lever with the highest expected gain on the metric furthest from target and call climb_experiment.`;
+	return `[climb ${g.id}] Keep climbing${tag}. State: ${cardSummary(g)}.${tried ? ` Levers tried: ${tried}.` : ""}${judged}${lessons(st, g)} Pick the lever with the highest expected gain on the metric furthest from target and call climb_experiment.`;
 }
 
 /** Consecutive drops on any lever (renaming a lever does not reset it) demand an independent diagnosis. */
@@ -278,7 +337,7 @@ export function describe(e: Entry): string {
 	const g = `[climb ${e.goal}]`;
 	switch (e.kind) {
 		case "goal":
-			return `${g} started: "${e.intent}" (heartbeat ${Math.round(e.cfg.beat_s / 60)}m, judge after ${e.cfg.poke_max} stale beats)`;
+			return e.parent ? `${g} part of ${e.parent}: "${e.intent}"${e.why ? ` (${e.why})` : ""}` : `${g} started: "${e.intent}" (heartbeat ${Math.round(e.cfg.beat_s / 60)}m, judge after ${e.cfg.poke_max} stale beats)`;
 		case "card":
 			return `${g} scorecard: ${e.metrics.map(m => `${m.name} ${m.baseline}→${m.hold ? "hold" : m.target}${m.unit ? ` ${m.unit}` : ""} (±${(m.noise * 100).toFixed(1)}%)`).join(", ")}`;
 		case "exp":
@@ -300,6 +359,8 @@ export function describe(e: Entry): string {
 			return `[climb] ${e.kind}d`;
 		case "rollup":
 			return `${g} rolled up ${e.n} heartbeats`;
+		case "learn":
+			return `${g} learned (${e.type}): ${e.text}${e.evidence ? ` [${e.evidence}]` : ""}`;
 	}
 }
 
@@ -309,11 +370,12 @@ export function researchBrief(g: Goal): string {
 		"1. Research in parallel if you can (subagents): (a) what measurable quantities express this goal: find or write a command for each that prints one number, and register each one with climb_probe (that is the itemized research; the extension runs it and the heartbeat counts it as progress); (b) which code changes (levers) could move them, ranked by expected gain/effort.",
 		`2. Call climb_scorecard with 1-${MAX_METRICS} metrics (focus: the few that matter, park the rest), an ambitious target each, and a guard command (tests) that must keep passing. The extension measures the baselines itself.`,
 		"3. Loop: climb_experiment (pre-register lever + prediction) → implement → commit → climb_measure. The extension decides kept/dropped against noise and reverts dropped experiments. A defect fix the scorecard is too coarse to see gets a proof: a fast check that fails now and passes once fixed.",
+		"Decompose when one scorecard cannot hold the intent (parts need different instruments, or you keep swapping metrics): climb_split makes each part a goal with its own scorecard. Record what you learn with climb_learn (facts, traps, dead ends): it survives compaction and stops the loop from re-trying what failed.",
 		"Do not stop while the goal is open; the extension will hold you to it. A heartbeat audits progress and a judge intervenes if you stall.",
 	].join("\n");
 }
 
-export function judgePrompt(g: Goal, tail: Entry[], gitLog: string, efficiency = ""): string {
+export function judgePrompt(st: State, g: Goal, tail: Entry[], gitLog: string, efficiency = ""): string {
 	const tried = [...g.levers.entries()].map(([k, l]) => `- ${k}: ${l.kept} kept / ${l.tried} tried`).join("\n") || "- none";
 	const series = (g.card?.metrics ?? [])
 		.map(m => `- ${m.name} (${m.dir}, noise ±${(m.noise * 100).toFixed(1)}%): ${(g.series.get(m.name) ?? []).slice(-12).map(p => p.v).join(", ")}`)
@@ -322,13 +384,17 @@ export function judgePrompt(g: Goal, tail: Entry[], gitLog: string, efficiency =
 		"You are the JUDGE for an autonomous hill-climbing loop. You are not the worker. Be adversarial and specific.",
 		`Goal ${g.id}: "${g.intent}"`,
 		`Scorecard: ${cardSummary(g)}`,
+		...(parts(st, g).length
+			? [`Parts:\n${subtree(st, g).slice(1).map(p => `- ${p.id}${p.done ? ` [${p.done.result}]` : ""}: "${p.intent}" — ${cardSummary(p)}; experiments ${p.results.length} (${p.results.filter(r => r.verdict === "kept").length} kept)`).join("\n")}`]
+			: []),
+		...(knowledge(st, g).length ? [`Knowledge recorded so far:\n${knowledge(st, g).slice(-20).map(l => `- [${l.type}] ${l.text}${l.evidence ? ` (${l.evidence})` : ""}`).join("\n")}`] : []),
 		`No progress for ${g.lastBeat?.stale ?? "?"} heartbeats (every ${Math.round(g.cfg.beat_s / 60)}m). Last progress: ${g.lastProgress ?? "never"}.`,
 		`Levers:\n${tried}`,
 		`Recent measurements (oldest first):\n${series}`,
 		`Recent ledger:\n${tail.map(e => JSON.stringify(e)).join("\n")}`,
 		`Recent commits:\n${gitLog}`,
 		...(efficiency ? [`Where the time went (traced by the extension):\n${efficiency}`] : []),
-		"Diagnose WHY there is no progress: wrong lever; broken or noisy metric; blocked environment; goal needs decomposition; grid-search trap (same idea repeated); target unreachable by code alone; time lost to refused calls, crashing or slow instruments. Use the conversation so far as evidence.",
+		"Diagnose WHY there is no progress: wrong lever; broken or noisy metric; blocked environment; goal needs decomposition (climb_split into parts with their own scorecards); grid-search trap (same idea repeated, or a recorded dead end retried); target unreachable by code alone; time lost to refused calls, crashing or slow instruments. Use the conversation so far as evidence.",
 		"Answer in exactly this format:",
 		"VERDICT: continue|pivot|stuck   (stuck = only a human can unblock this)",
 		"DIAGNOSIS: <one or two sentences>",

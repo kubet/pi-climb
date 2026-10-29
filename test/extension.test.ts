@@ -7,6 +7,7 @@ import * as path from "node:path";
 import climb from "../src/index";
 import * as L from "../src/ledger";
 import * as X from "../src/logic";
+import * as T from "../src/trace";
 
 type Handler = (e: unknown, ctx: unknown) => unknown;
 
@@ -744,5 +745,152 @@ describe("review findings", () => {
 		await z.cmd("judge");
 		expect(z.sent.at(-1)?.m.content).toContain("The independent judge failed");
 		z.h.judgeThrows = false;
+	});
+});
+
+// One intent, several instruments: the night run swapped scorecards 8 times instead of splitting.
+describe("decomposition and knowledge", () => {
+	let d: string;
+	let z: ReturnType<typeof host>;
+	const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+	const st = () => L.fold(L.read(d));
+
+	beforeAll(async () => {
+		d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-split-"));
+		await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > fast.txt && echo 10 > good.txt && git add -A && git commit -qm init");
+		z = host(d, "main", "split");
+		await z.load();
+		await z.cmd("make it fast and good");
+	});
+	afterAll(() => fs.rmSync(d, { recursive: true, force: true }));
+
+	test("a goal splits into parts that each climb with their own scorecard", async () => {
+		await expect(z.tool("climb_split", { parts: [{ intent: "only one" }] })).rejects.toThrow("2-4 parts");
+		const out = await z.tool("climb_split", { parts: [{ intent: "fast responses", why: "latency bench" }, { intent: "good answers", why: "quality grader" }] });
+		expect(out).toContain("Split g-make-it-fast-and into g-fast-responses, g-good-answers");
+		const s = st();
+		expect(L.parts(s, s.goals.get("g-make-it-fast-and")!).map(p => p.id)).toEqual(["g-fast-responses", "g-good-answers"]);
+		await expect(z.tool("climb_scorecard", { goal: "g-make-it-fast-and", metrics: [{ name: "x", cmd: "cat fast.txt", dir: "down", target: 1 }] })).rejects.toThrow("split into parts");
+		await expect(z.tool("climb_scorecard", { metrics: [{ name: "x", cmd: "cat fast.txt", dir: "down", target: 1 }] })).rejects.toThrow("Several active goals");
+		await z.tool("climb_scorecard", { goal: "g-fast-responses", metrics: [{ name: "ms", cmd: "cat fast.txt", dir: "down", target: 50, noise: 0.05 }] });
+		await z.tool("climb_scorecard", { goal: "g-good-answers", metrics: [{ name: "score", cmd: "cat good.txt", dir: "up", target: 20, noise: 0.05 }] });
+		expect(X.statusLine(st())).toContain("g-make-it-fast-and 0% · 2 parts");
+	});
+
+	test("knowledge is shared down the tree and repeated with the next step", async () => {
+		await z.tool("climb_learn", { goal: "g-make-it-fast-and", kind: "trap", text: "fast.txt drops after a cold start; warm up before reading it" });
+		await z.tool("climb_learn", { goal: "g-fast-responses", kind: "dead-end", text: "caching the parse made no difference", evidence: "x0" });
+		expect(await z.tool("climb_learn", { goal: "g-fast-responses", kind: "dead-end", text: "caching the parse made no difference" })).toContain("Already recorded");
+		const next = X.nextAction(st(), st().goals.get("g-fast-responses")!);
+		expect(next).toContain("Known dead ends: caching the parse made no difference");
+		expect(next).toContain("Traps: fast.txt drops after a cold start");
+		expect(await z.tool("climb_status", {})).toContain("knowledge: 0 facts, 1 traps, 0 dead ends");
+		const ctx = (await z.emit("session.compacting")) as unknown as { context: string[] };
+		expect(ctx.context[0]).toContain("[dead-end] caching the parse made no difference");
+	});
+
+	test("parts climb through the root: one heartbeat, the root's stall gates every part, achieving all parts closes the root", async () => {
+		await z.tool("climb_experiment", { goal: "g-fast-responses", lever: "halve", hypothesis: "", prediction: "" });
+		expect(X.statusLine(st())).toContain("x1 on g-fast-responses");
+		await run("echo 40 > fast.txt && git commit -qam halve");
+		const fast = await z.tool("climb_measure", {});
+		expect(fast).toContain("GOAL ACHIEVED: g-fast-responses");
+		expect(fast).toContain("g-good-answers");
+		L.append(d, { ts: L.now(), kind: "stall", goal: "g-make-it-fast-and", stale: 3 });
+		await expect(z.tool("climb_experiment", { goal: "g-good-answers", lever: "more", hypothesis: "", prediction: "" })).rejects.toThrow("independent judge is reviewing");
+		await until(() => !st().goals.get("g-make-it-fast-and")!.stallPending);
+		await z.tool("climb_experiment", { goal: "g-good-answers", lever: "double", hypothesis: "", prediction: "" });
+		await run("echo 25 > good.txt && git commit -qam double");
+		const good = await z.tool("climb_measure", {});
+		expect(good).toContain("That completes g-make-it-fast-and: every part achieved");
+		expect(st().goals.get("g-make-it-fast-and")!.done?.result).toBe("achieved");
+		expect(L.active(st())).toEqual([]);
+		const x = JSON.parse(fs.readFileSync(path.join(d, ".climb/export.json"), "utf8"));
+		expect(x.goals.map((g: { done?: string }) => g.done)).toEqual(["achieved", "achieved", "achieved"]);
+		expect(await z.tool("climb_learn", { goal: "g-fast-responses", kind: "fact", text: "halving fast.txt is enough for the target" })).toContain("Recorded fact");
+	});
+});
+
+// Every number carries how it was validated, in a shape other systems (the benchmaxx panel) read.
+describe("evidence and export", () => {
+	let d: string;
+	let z: ReturnType<typeof host>;
+	const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+
+	beforeAll(async () => {
+		d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-export-"));
+		await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo 'cat work.txt' > bench.sh && git add -A && git commit -qm init");
+		z = host(d, "main", "export");
+		await z.load();
+		await z.cmd("shrink work");
+		await z.tool("climb_scorecard", { metrics: [{ name: "work", cmd: "bash bench.sh", dir: "down", target: 10, unit: "units", samples: 3, noise: 0.05 }], guard: "test -s work.txt" });
+		await z.tool("climb_experiment", { lever: "halve", hypothesis: "less work", prediction: "work -50%" });
+		await run("echo 50 > work.txt && git commit -qam halve");
+		await z.tool("climb_measure", {});
+		await z.tool("climb_experiment", { lever: "bloat", hypothesis: "?", prediction: "?" });
+		await run("echo 80 > work.txt && git commit -qam bloat");
+		await z.tool("climb_measure", {});
+	});
+	afterAll(() => fs.rmSync(d, { recursive: true, force: true }));
+
+	test("cards, experiments and results carry instrument, environment, raw runs and gates", () => {
+		const e = L.read(d);
+		const card = e.find(x => x.kind === "card") as L.CardE;
+		expect(card.instrument).toMatch(/^[0-9a-f]{16}$/);
+		expect(card.env).toMatchObject({ host: os.hostname(), cpus: os.cpus().length });
+		const exp = e.find(x => x.kind === "exp") as L.ExpE;
+		expect(exp.runs?.work).toEqual([100, 100, 100]);
+		const kept = e.find(x => x.kind === "result") as L.ResultE;
+		expect(kept).toMatchObject({ verdict: "kept", runs: { work: [50, 50, 50] }, gates: { guard: "pass", instrument: "same" }, env: card.env!.hash });
+		const runs = T.read(d).filter((t): t is T.RunT => t.kind === "run" && t.metric === "work");
+		expect(runs.every(r => typeof r.load === "number" && typeof r.free_mb === "number")).toBe(true);
+	});
+
+	test("export.json holds one benchmaxx-style row per decided experiment and metric", async () => {
+		const x = JSON.parse(fs.readFileSync(path.join(d, ".climb/export.json"), "utf8"));
+		expect(x.schema).toBe("climb.export/1");
+		expect(x.metric_rows).toHaveLength(2);
+		const [win, loss] = x.metric_rows;
+		expect(win).toMatchObject({ record_id: "g-shrink-work/x1", metric_id: "work", unit: "units", direction: "lower", before: 100, after: 50, change_percent: -50, raw_before: [100, 100, 100], reference_samples: 3, candidate_samples: 3, verdict: "kept", correctness: { gate: "PASS", scope: "test -s work.txt" } });
+		expect(win.qualification).toMatchObject({ statistical_win: true, kept: true, by_proof: false });
+		expect(win.baseline_commit).toMatch(/^[0-9a-f]{40}$/);
+		expect(loss).toMatchObject({ record_id: "g-shrink-work/x2", verdict: "dropped", qualification: { statistical_win: false } });
+		await z.cmd(`export ${path.join(d, "out.json")}`);
+		expect(z.notes.at(-1)).toContain("2 metric rows");
+		expect(JSON.parse(fs.readFileSync(path.join(d, "out.json"), "utf8")).source_ledger_sha256).toMatch(/^[0-9a-f]{64}$/);
+	});
+
+	test("an abandoned experiment was never measured: no drop streak, no lever attempt", async () => {
+		for (const n of [1, 2, 3]) {
+			await z.tool("climb_experiment", { lever: "try", hypothesis: "", prediction: "" });
+			await run(`echo ${60 + n} > work.txt && git commit -qam try${n}`);
+			await z.tool("climb_measure", { abandon: "instrument down" });
+		}
+		const g = L.fold(L.read(d)).goals.get("g-shrink-work")!;
+		expect(g.streak).toBe(1); // only x2's real drop
+		expect(g.levers.has("try")).toBe(false);
+	});
+});
+
+describe("decomposition without an independent judge", () => {
+	test("the worker's diagnosis lifts the root's stall, so parts are never deadlocked", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-split-nj-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > a.txt && echo 100 > b.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "split-nj");
+			z.noJudge();
+			await z.load();
+			await z.cmd("shrink both");
+			await z.tool("climb_split", { parts: [{ intent: "shrink a" }, { intent: "shrink b" }] });
+			await z.tool("climb_scorecard", { goal: "g-shrink-a", metrics: [{ name: "a", cmd: "cat a.txt", dir: "down", target: 10, noise: 0.05 }] });
+			L.append(d, { ts: L.now(), kind: "stall", goal: "g-shrink-both", stale: 3 });
+			await expect(z.tool("climb_experiment", { goal: "g-shrink-a", lever: "x", hypothesis: "", prediction: "" })).rejects.toThrow("STALLED");
+			await z.tool("climb_judge", { verdict: "pivot", diagnosis: "both parts wait on the same parser", next: "fix the parser first" });
+			expect(L.read(d).filter(e => e.kind === "judge").at(-1)).toMatchObject({ goal: "g-shrink-both", by: "fallback" });
+			expect(await z.tool("climb_experiment", { goal: "g-shrink-a", lever: "x", hypothesis: "", prediction: "" })).toContain("Registered x1");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
 	});
 });

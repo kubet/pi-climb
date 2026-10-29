@@ -12,6 +12,8 @@ The LLM is a stateless worker. The extension is the enforcer:
 - **Never lets it quit** while a goal is open (`session_stop` block). An agent that keeps stopping without progress is rested and handed to the heartbeat.
 - **Heartbeat** every 30m audits the ledger: was anything kept since the last beat? It skips while the agent is busy and forces a check-in at 2× as a watchdog. After `poke-max` stale beats, an independent **judge** diagnoses the stall and redirects the agent. The judge is a side turn on the current model, outside the agent's history. The agent can record its own diagnosis, but only the judge or you clear a stall. A judge cut off by a restart or a hang (5 min) is re-run, never waited on forever.
 - **Focus**: at most 2 goals, 3 metrics per goal, and 1 open experiment. Three drops in a row summon the judge before the next try, and renaming the lever doesn't reset that.
+- **Decomposition**: `climb_split` turns a goal into 2-4 parts (two levels at most), each a goal with its own research, scorecard, experiments and knowledge. The parent climbs only through its parts and is achieved when every part is. One heartbeat, stall count and judge cover the whole tree, and a part's kept change that regresses a sibling's metric is caught at the sibling's next experiment.
+- **Knowledge**: `climb_learn` records facts, traps ("X looks like Y; check Z") and dead ends. They survive compaction and restarts, are repeated with the worker's next step, reach the judge, and flow to parts from their parents.
 
 ## Install
 
@@ -31,13 +33,15 @@ Requires a git repo with at least one commit.
 /climb beat            heartbeat now
 /climb judge [goal]    run the judge now
 /climb pause | resume  stop/restart heartbeats and stop-blocking; resume also un-sticks a STUCK goal
-/climb done [goal]     close a goal
+/climb done [goal]     close a goal (a split goal closes its open parts too)
+/climb export [path]   write the evidence export (default .climb/export.json)
 ```
 
 The agent drives the loop through tools:
 
 1. **Research, itemized:** `climb_probe` registers each candidate metric (`timeout_s` for slow ones). The extension runs it and records the number, and each probe counts as progress before a scorecard exists.
 2. **Climb:** `climb_scorecard` → `climb_experiment` (optional `proof`) → commit → `climb_measure` (or `abandon`), plus `climb_judge` and `climb_status`. Long measurements stream progress to the tool output and the status line.
+3. **Structure:** `climb_split` (parts) and `climb_learn` (facts, traps, dead ends).
 
 Metrics are whatever the agent defines: any command that prints a number, such as runtime, memory, test count, bundle size, or itemized findings (`grep -c '^- ' findings.md`). A metric with `hold: true` is a constraint ("no slower"): it has no target, and any regression beyond noise drops the experiment.
 
@@ -56,6 +60,8 @@ CLIMB_SINK='cat >> ~/climb.log'                  omp   # anything else: shell co
 ```
 
 Other extensions can subscribe with `pi.events.on("climb", …)`.
+
+- **Evidence export:** `.climb/export.json` (schema `climb.export/1`) is rewritten after every decision, in the benchmaxx evidence shape: one row per decided experiment and scorecard metric, with `record_id`, `metric_id`, unit, direction, before/after medians and `raw_before`/`raw_after` runs, sample counts, `baseline_commit`/`candidate_commit`, the measured noise, the `qualification` actually earned (`statistical_win`, kept, by proof, limits), the `correctness` gate, the instrument hash, the environment hash and evidence pointers. Around the rows: the goal tree, all recorded knowledge and independent diagnoses, provenance (`source_ledger_sha256`) and the rules the rows follow. Every card records the instrument (a hash over its commands and frozen files) and the machine; every run records load and free memory.
 
 ## Develop
 

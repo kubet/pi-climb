@@ -32,7 +32,8 @@ interface Base {
 	ts: string;
 	goal: string;
 }
-export interface GoalE extends Base { kind: "goal"; intent: string; cfg: Cfg }
+/** A goal; with `parent`, a part of a decomposed goal (its own research, scorecard and experiments). */
+export interface GoalE extends Base { kind: "goal"; intent: string; cfg: Cfg; parent?: string; why?: string }
 export interface CardE extends Base {
 	kind: "card";
 	metrics: Metric[];
@@ -43,14 +44,34 @@ export interface CardE extends Base {
 	head?: string;
 	parked?: string[];
 	axioms?: string[];
+	/** Hash of what measures: metric commands, guard, and the frozen files' contents at `head`. */
+	instrument?: string;
+	/** The machine the baselines were measured on. */
+	env?: Env;
 }
+export interface Env { host: string; os: string; arch: string; cpus: number; cpu: string; mem_gb: number; runtime: string; hash: string }
+/** How each gate came out, so a result can be audited without parsing its reason. */
+export interface Gates { guard: "pass" | "fail" | "none"; instrument: "same" | "changed"; proof?: "pass" | "fail" | "void" }
 /** A check that failed at the base and must pass once the change works, with the
  *  content hashes of the scripts it runs (edited scripts void it). */
 export interface Proof {
 	cmd: string;
 	files: Record<string, string>;
 }
-export interface ExpE extends Base { kind: "exp"; id: string; lever: string; hypothesis: string; prediction: string; base: string; ref: Values; proof?: Proof }
+export interface ExpE extends Base {
+	kind: "exp";
+	id: string;
+	lever: string;
+	hypothesis: string;
+	prediction: string;
+	base: string;
+	ref: Values;
+	proof?: Proof;
+	/** The control's raw runs per metric (ref holds their medians). */
+	runs?: Record<string, number[]>;
+	/** Env hash at registration. */
+	env?: string;
+}
 export interface ResultE extends Base {
 	kind: "result";
 	exp: string;
@@ -61,6 +82,11 @@ export interface ResultE extends Base {
 	reverted?: string;
 	/** Kept on its proof: a verified fix with no regression, not a measured gain. */
 	proof?: boolean;
+	/** The candidate's raw runs per metric (values holds their medians). */
+	runs?: Record<string, number[]>;
+	gates?: Gates;
+	/** Env hash at measurement. */
+	env?: string;
 }
 export interface BeatE extends Base { kind: "beat"; head: string; values?: Values; progress: boolean; stale: number; note?: string }
 export interface StallE extends Base { kind: "stall"; stale: number }
@@ -70,8 +96,11 @@ export interface JudgeE extends Base { kind: "judge"; by: "judge" | "worker" | "
 export interface DoneE extends Base { kind: "done"; result: "achieved" | "abandoned"; values: Values }
 export interface PauseE extends Base { kind: "pause" | "resume" }
 export interface RollupE extends Base { kind: "rollup"; cd: number; n: number; from: string; to: string; progress: number; stale: number; values?: Values }
+/** Knowledge: a fact about the system or instrument, a trap (X looks like Y; check Z), or a dead end. */
+export type LearnKind = "fact" | "trap" | "dead-end";
+export interface LearnE extends Base { kind: "learn"; type: LearnKind; text: string; evidence?: string }
 
-export type Entry = GoalE | CardE | ExpE | ResultE | BeatE | StallE | ProbeE | JudgeE | DoneE | PauseE | RollupE;
+export type Entry = GoalE | CardE | ExpE | ResultE | BeatE | StallE | ProbeE | JudgeE | DoneE | PauseE | RollupE | LearnE;
 
 export interface Point {
 	t: number;
@@ -81,6 +110,12 @@ export interface Point {
 export interface Goal {
 	id: string;
 	intent: string;
+	/** Set on a part of a decomposed goal. */
+	parent?: string;
+	why?: string;
+	/** Parts this goal was split into (ids, creation order). */
+	children: string[];
+	learned: LearnE[];
 	cfg: Cfg;
 	created: string;
 	card?: CardE;
@@ -160,6 +195,10 @@ function newGoal(e: GoalE): Goal {
 	return {
 		id: e.goal,
 		intent: e.intent,
+		parent: e.parent,
+		why: e.why,
+		children: [],
+		learned: [],
 		cfg: e.cfg,
 		created: e.ts,
 		best: {},
@@ -205,7 +244,11 @@ export function fold(entries: Entry[]): State {
 	for (const [seq, e] of entries.entries()) {
 		if (e.kind === "pause") { st.paused = true; continue; }
 		if (e.kind === "resume") { st.paused = false; continue; }
-		if (e.kind === "goal") { st.goals.set(e.goal, { ...newGoal(e), seq }); continue; }
+		if (e.kind === "goal") {
+			st.goals.set(e.goal, { ...newGoal(e), seq });
+			if (e.parent) st.goals.get(e.parent)?.children.push(e.goal);
+			continue;
+		}
 		const g = st.goals.get(e.goal);
 		if (!g) continue;
 		switch (e.kind) {
@@ -231,7 +274,9 @@ export function fold(entries: Entry[]): State {
 				// the base tree; if the revert failed, HEAD will not match and climbing halts.
 				g.baseRef = e.verdict === "kept" ? e.head : (e.reverted ?? exp?.base ?? g.baseRef);
 				g.baseValues = e.verdict === "kept" ? e.values : (exp?.ref ?? g.baseValues);
-				const l = g.levers.get(key) ?? { tried: 0, kept: 0, dropped: 0 };
+				// Abandoned = never measured: not an attempt of the lever, not a step in a drop streak.
+				const abandoned = e.reason.startsWith("abandoned:");
+				const l = { ...(g.levers.get(key) ?? { tried: 0, kept: 0, dropped: 0 }) };
 				l.tried++;
 				if (e.verdict === "kept") {
 					l.kept++;
@@ -245,9 +290,9 @@ export function fold(entries: Entry[]): State {
 					}
 				} else {
 					l.dropped++;
-					g.streak++;
+					if (!abandoned) g.streak++;
 				}
-				g.levers.set(key, l);
+				if (!abandoned) g.levers.set(key, l);
 				break;
 			}
 			case "beat":
@@ -280,12 +325,45 @@ export function fold(entries: Entry[]): State {
 			case "done":
 				g.done = e;
 				break;
+			case "learn":
+				g.learned.push(e);
+				break;
 		}
 	}
 	return st;
 }
 
 export const active = (st: State) => [...st.goals.values()].filter(g => !g.done);
+
+// --- decomposition: a goal can be split into parts, each a goal with its own scorecard ---
+export const parts = (st: State, g: Goal): Goal[] => g.children.map(id => st.goals.get(id)).filter((c): c is Goal => !!c);
+export const openParts = (st: State, g: Goal) => parts(st, g).filter(c => !c.done);
+/** A goal with open parts climbs only through them. */
+export const umbrella = (st: State, g: Goal) => openParts(st, g).length > 0;
+export const rootOf = (st: State, g: Goal): Goal => {
+	let r = g;
+	for (let i = 0; r.parent && i < 8; i++) r = st.goals.get(r.parent) ?? r;
+	return r;
+};
+export const depth = (st: State, g: Goal) => {
+	let n = 0;
+	for (let r = g; r.parent && n < 8; n++) r = st.goals.get(r.parent) ?? r;
+	return n;
+};
+export const subtree = (st: State, g: Goal): Goal[] => [g, ...parts(st, g).flatMap(c => subtree(st, c))];
+/** Active goals the heartbeat audits: roots only; a part's progress counts for its root. */
+export const roots = (st: State) => active(st).filter(g => !g.parent);
+/** Knowledge visible from a goal: its ancestors' (shared context), its own and its parts'. */
+export function knowledge(st: State, g: Goal): LearnE[] {
+	const up: Goal[] = [];
+	for (let r = g; r.parent && up.length < 8; ) {
+		const p = st.goals.get(r.parent);
+		if (!p) break;
+		up.push(p);
+		r = p;
+	}
+	return [...up, ...subtree(st, g)].flatMap(x => x.learned).sort((a, b) => epoch(a.ts) - epoch(b.ts));
+}
 
 /** Latest judge said "stuck" and nothing moved since: needs a human. */
 export const stuck = (g: Goal) => g.judge?.verdict === "stuck" && g.progressSeq < g.judgeSeq;
@@ -294,6 +372,11 @@ export const stuck = (g: Goal) => g.judge?.verdict === "stuck" && g.progressSeq 
 export const keptSinceBeat = (g: Goal) => g.lastKeptSeq > (g.lastBeat?.seq ?? g.seq);
 /** Progress for the heartbeat: kept results; before a scorecard exists, measured research items count. */
 export const progressSinceBeat = (g: Goal) => keptSinceBeat(g) || (!g.card && g.lastProbeSeq > (g.lastBeat?.seq ?? g.seq));
+/** The same over a root and all its parts, measured from the root's last beat. */
+export function treeProgressSinceBeat(st: State, root: Goal): boolean {
+	const since = root.lastBeat?.seq ?? root.seq;
+	return subtree(st, root).some(g => g.lastKeptSeq > since || (!g.card && g.lastProbeSeq > since));
+}
 export const judgedSinceBeat = (g: Goal) => g.judgeSeq > (g.lastBeat?.seq ?? g.seq);
 
 // ---------------------------------------------------------------------------
