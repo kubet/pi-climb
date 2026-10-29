@@ -961,10 +961,11 @@ describe("paired measurement", () => {
 		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-paired-"));
 		const ctr = path.join(os.tmpdir(), `climb-paired-ctr-${process.pid}`);
 		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
-		// Every run reads 10 higher than the one before: the machine keeps getting slower.
-		const cmd = `n=$(cat ${ctr} 2>/dev/null || echo 0); echo $((n+1)) > ${ctr}; echo $(( $(cat work.txt) + n * 10 ))`;
+		// Every run reads 10 higher than the one before: the machine keeps getting slower. The command also
+		// needs an untracked data file (linked into the base) and must not see the candidate's build output.
+		const cmd = `test -f data/seed && test ! -f dist/candidate && n=$(cat ${ctr} 2>/dev/null || echo 0); echo $((n+1)) > ${ctr}; echo $(( $(cat work.txt) + n * 10 ))`;
 		try {
-			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo x > README.md && git add -A && git commit -qm init");
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo x > README.md && printf 'data/\\ndist/\\n' > .gitignore && git add -A && git commit -qm init && mkdir -p data && touch data/seed");
 			const z = host(d, "main", "paired");
 			await z.load();
 			await z.cmd("faster");
@@ -976,6 +977,8 @@ describe("paired measurement", () => {
 			expect(noop).not.toContain("regressed");
 			await z.tool("climb_experiment", { lever: "halve", hypothesis: "", prediction: "" });
 			await run("echo 50 > work.txt && git commit -qam halve");
+			// The candidate's build output exists only in the main tree; the base must not see it.
+			await run("mkdir -p dist && touch dist/other");
 			const halve = await z.tool("climb_measure", {});
 			expect(halve).toContain("KEPT x2");
 			expect(halve).toContain("paired with the base");

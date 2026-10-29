@@ -279,7 +279,15 @@ export default async function climb(pi: ExtensionAPI) {
 				git(root, "ls-files", "--others", "--exclude-standard", "--directory"),
 				git(root, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"),
 			]);
-			const extra = new Set(listed.flatMap(r => r.stdout.split("\n")).map(l => l.replace(/\/+$/, "")).filter(l => l && l !== L.DIR && !l.startsWith(`${L.DIR}/`)));
+			// Build outputs and caches are derived from the code: linking the candidate's into the base would
+			// measure the candidate twice. The base builds its own, or the paired check falls back.
+			const derived = /(^|\/)(dist|build|out|target|\.next|\.nuxt|\.turbo|\.cache|\.parcel-cache|coverage|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache)(\/|$)|\.(pyc|o|class)$/;
+			const extra = new Set(
+				listed
+					.flatMap(r => r.stdout.split("\n"))
+					.map(l => l.replace(/\/+$/, ""))
+					.filter(l => l && l !== L.DIR && !l.startsWith(`${L.DIR}/`) && !derived.test(l)),
+			);
 			for (const rel of extra) {
 				const target = path.join(dir, rel);
 				if (fs.existsSync(target)) continue;
