@@ -564,6 +564,7 @@ describe("lessons from a live run", () => {
 		await run("mkdir -p checks && printf 'test \"$(cat fixed.txt 2>/dev/null)\" = yes\\n' > checks/fixed.sh");
 		const reg = await z.tool("climb_experiment", { lever: "fix", hypothesis: "the bug", prediction: "work_left unchanged; fixed", proof: "bash checks/fixed.sh" });
 		expect(reg).toContain("The proof fails here");
+		expect(reg).not.toContain("git-ignored");
 		expect((await z.emit("tool_call", { toolName: "write", input: { path: path.join(d, "checks/fixed.sh"), content: "true" } }))?.block).toBe(true);
 		await run("echo yes > fixed.txt && git add fixed.txt && git commit -qm fix");
 		const out = await z.tool("climb_measure", {});
@@ -733,6 +734,12 @@ describe("review findings", () => {
 		await expect(z.tool("climb_measure", { goal: "", abandon: "" })).rejects.toThrow("x2 stays open"); // nor is "" (strict-schema providers send it)
 		expect(last("result")).toMatchObject({ exp: "x1" });
 		await z.tool("climb_measure", { abandon: "check needs a tool this machine lacks" });
+	});
+
+	test("a proof kept in a git-ignored path is accepted with a warning", async () => {
+		await run("mkdir -p runs && echo 'runs/' >> .git/info/exclude && printf 'test -f fixed9.txt\\n' > runs/check.sh");
+		expect(await z.tool("climb_experiment", { lever: "f9", hypothesis: "", prediction: "", proof: "bash runs/check.sh" })).toContain("runs/check.sh is git-ignored");
+		await z.tool("climb_measure", { abandon: "warning checked" });
 	});
 
 	test("a proof must name the file a self-discovering runner would run", async () => {

@@ -1021,6 +1021,7 @@ export default async function climb(pi: ExtensionAPI) {
 				);
 			const say = progressTo(ctx, root, onUpdate, `${g.id} x${g.nextExp} control`);
 			let proof: L.Proof | undefined;
+			let ignoredProof: string[] = [];
 			if (p.proof) {
 				// Paths after `cd` are relative to somewhere else: not checked here.
 				const missing = /(^|[;&|(]\s*)cd\s/.test(p.proof) ? [] : X.scriptPaths(p.proof).filter(f => !fs.existsSync(path.join(root, f)));
@@ -1036,6 +1037,8 @@ export default async function climb(pi: ExtensionAPI) {
 				if (!scripts.length && X.indirectRunner(p.proof))
 					throw new Error("Name the check's file in the proof (e.g. 'bun test test/x.test.ts' or 'pytest tests/t.py::case') so it can be frozen; a runner that discovers its own tests freezes nothing.");
 				proof = { cmd: p.proof, files: await hashes(root, scripts) };
+				// A git-ignored check is neither versioned nor restorable: if it disappears, the proof is void.
+				if (scripts.length) ignoredProof = (await git(root, "check-ignore", ...scripts)).stdout.split("\n").filter(Boolean);
 			}
 			// Commits made outside an experiment (a .gitignore, a failed revert) are adopted
 			// only if they pass the guard and regress nothing against the last measured baseline:
@@ -1084,7 +1087,9 @@ export default async function climb(pi: ExtensionAPI) {
 			refresh(ctx, root);
 			const ref = Object.entries(control.values).map(([k, v]) => `${k}=${v}`).join(", ");
 			const reused = control.reused.length ? ` (${control.reused.join(", ")}: reused runs of this tree from the last 30 minutes)` : "";
-			const proved = proof ? ` The proof fails here, as it must; its scripts (${Object.keys(proof.files).join(", ") || "inline"}) are frozen for ${id}.` : "";
+			const proved = proof
+				? ` The proof fails here, as it must; its scripts (${Object.keys(proof.files).join(", ") || "inline"}) are frozen for ${id}.${ignoredProof.length ? ` Warning: ${ignoredProof.join(", ")} is git-ignored, so nothing versions or restores it; if it is deleted or cleaned up, the proof is void. Keep checks in tracked paths.` : ""}`
+				: "";
 			return ok(
 				`Registered ${id} on ${g.id}.${adopted} Control at ${base.slice(0, 8)}: ${ref}${reused}.${proved} Implement it and commit (any number of commits), then call climb_measure. Everything after ${base.slice(0, 8)} is this experiment; if it is dropped the extension reverts it.`,
 			);
