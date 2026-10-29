@@ -675,6 +675,52 @@ export default async function climb(pi: ExtensionAPI) {
 		else if (!progress) deliver(ctx, line, false);
 	}
 
+	/** One independent side turn, outside the worker's history. Transports differ in what side turns accept
+	 *  (output caps, tool opt-out), so it degrades; a hung turn must not hold a gate shut, so one deadline
+	 *  covers all attempts. Throws when every attempt failed (and marks the judge broken). */
+	async function sideTurn(turn: NonNullable<Ctx["runEphemeralTurn"]>, promptText: string): Promise<string> {
+		let lastErr: unknown;
+		const deadline = Date.now() + JUDGE_MS;
+		for (const opts of [{ tools: false as const, maxTokens: 1500 }, { tools: false as const }, {}]) {
+			const left = deadline - Date.now();
+			if (left <= 0) break;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const attempt = Promise.resolve().then(() => turn({ promptText, ...opts }));
+			const late = new Promise<never>((_, no) => (timer = setTimeout(() => no(new Error(`judge timed out after ${JUDGE_MS / 60_000} minutes`)), left)));
+			attempt.catch(() => {}); // the loser of the race must not surface as an unhandled rejection
+			late.catch(() => {});
+			try {
+				const reply = (await Promise.race([attempt, late])).replyText;
+				judgeBroken = false;
+				return reply;
+			} catch (e) {
+				lastErr = e;
+			} finally {
+				clearTimeout(timer);
+			}
+		}
+		judgeBroken = true;
+		throw lastErr ?? new Error("judge timed out");
+	}
+
+	/** Before a goal closes on met targets, an independent check that its intent is met too: a scorecard
+	 *  can be achieved while a requirement of the intent never made it onto it. Undefined: no judge here. */
+	async function review(ctx: Ctx, root: string, g: L.Goal): Promise<{ achieved: boolean; unmet: string; next: string } | undefined> {
+		const turn = ctx.runEphemeralTurn?.bind(ctx);
+		if (!turn) return undefined;
+		const t0 = performance.now();
+		try {
+			const st = load(root);
+			const log = (await git(root, "log", "--oneline", "-15")).stdout.trim();
+			const reply = await sideTurn(turn, X.reviewPrompt(st, st.goals.get(g.id) ?? g, log));
+			T.append(root, { ts: L.now(), kind: "judge", goal: g.id, ms: Math.round(performance.now() - t0), ok: true, why: "acceptance review" });
+			return X.parseReview(reply);
+		} catch (e) {
+			T.append(root, { ts: L.now(), kind: "judge", goal: g.id, ms: Math.round(performance.now() - t0), ok: false, error: String(e).slice(0, 300), why: "acceptance review" });
+			return undefined; // a review that cannot run does not hold the goal open
+		}
+	}
+
 	async function judge(ctx: Ctx, root: string, id: string, why: string): Promise<void> {
 		if (judging.has(id)) return;
 		judging.add(id);
@@ -690,33 +736,7 @@ export default async function climb(pi: ExtensionAPI) {
 			const log = (await git(root, "log", "--oneline", "-15")).stdout.trim();
 			const tree = new Set(L.subtree(load(root), g).map(x => x.id));
 			const promptText = X.judgePrompt(load(root), g, L.read(root).filter(e => tree.has(e.goal) && e.kind !== "beat" && e.kind !== "rollup").slice(-15), log, T.stats(T.read(root), L.read(root), L.clock.ms()));
-			// Transports differ in what side turns accept (output caps, tool opt-out): degrade.
-			let reply: string | undefined;
-			let lastErr: unknown;
-			// A hung side turn must not hold the stall gate shut: one deadline across all attempts.
-			const deadline = Date.now() + JUDGE_MS;
-			for (const opts of [{ tools: false as const, maxTokens: 1500 }, { tools: false as const }, {}]) {
-				const left = deadline - Date.now();
-				if (left <= 0) break;
-				let timer: ReturnType<typeof setTimeout> | undefined;
-				const attempt = Promise.resolve().then(() => turn({ promptText, ...opts }));
-				const late = new Promise<never>((_, no) => (timer = setTimeout(() => no(new Error(`judge timed out after ${JUDGE_MS / 60_000} minutes`)), left)));
-				attempt.catch(() => {}); // the loser of the race must not surface as an unhandled rejection
-				late.catch(() => {});
-				try {
-					reply = (await Promise.race([attempt, late])).replyText;
-					break;
-				} catch (e) {
-					lastErr = e;
-				} finally {
-					clearTimeout(timer);
-				}
-			}
-			if (reply === undefined) {
-				judgeBroken = true;
-				throw lastErr;
-			}
-			judgeBroken = false;
+			const reply = await sideTurn(turn, promptText);
 			mark(true);
 			const j = X.parseJudge(reply);
 			append(root, { ts: L.now(), kind: "judge", goal: id, by: "judge", ...j });
@@ -1289,11 +1309,20 @@ export default async function climb(pi: ExtensionAPI) {
 			}
 			append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: h, values, verdict: kept ? "kept" : "dropped", reason: reason!, reverted, proof: byProof || undefined, runs: samples, paired: pairs, gates, env: ENV.hash });
 			let won = kept && g.card.metrics.every(m => L.met(m, values[m.name]));
+			let unmet: { unmet: string; next: string } | undefined;
 			if (won) {
 				// "Done" is never claimed from a single draw: confirm with fresh samples.
 				const c = await measure(root, g.card.metrics, { phase: "confirm", goal: g.id }, signal, samples, t => say(t && `confirming targets ${t}`));
 				won = !c.errors.length && g.card.metrics.every(m => L.met(m, c.values[m.name]));
-				if (won) append(root, { ts: L.now(), kind: "done", goal: g.id, result: "achieved", values: c.values });
+				if (won) {
+					say("acceptance review: is the intent met, not just the scorecard?");
+					const r = await review(ctx, root, g);
+					if (r && !r.achieved) {
+						won = false;
+						unmet = r;
+						append(root, { ts: L.now(), kind: "judge", goal: g.id, by: "judge", verdict: "continue", diagnosis: `Every target is met, but not the intent: ${r.unmet}`, next: r.next });
+					} else append(root, { ts: L.now(), kind: "done", goal: g.id, result: "achieved", values: c.values });
+				}
 			}
 			const closedUp = won ? rollUp(root, g.id) : [];
 			await writeExport(root);
@@ -1308,7 +1337,8 @@ export default async function climb(pi: ExtensionAPI) {
 				ctx.ui?.notify?.(`climb ${g.id} achieved`, "info");
 				if (!L.active(st).length) stopTimer(ctx);
 			} else {
-				if (kept && g.card.metrics.every(m => L.met(m, values[m.name]))) text += "\nTargets met once but not confirmed on re-measurement; keep climbing.";
+				if (unmet) text += `\nEVERY TARGET MET, BUT THE INTENT IS NOT DONE (acceptance review): ${unmet.unmet}\nNEXT: ${unmet.next}. Put what is missing on the scorecard (climb_scorecard) or into a part (climb_split).`;
+				else if (kept && g.card.metrics.every(m => L.met(m, values[m.name]))) text += "\nTargets met once but not confirmed on re-measurement; keep climbing.";
 				text += `\n${X.nextAction(st, L.rootOf(st, st.goals.get(g.id)!))}`;
 			}
 			return ok(text);

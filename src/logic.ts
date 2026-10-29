@@ -443,6 +443,35 @@ export function judgePrompt(st: State, g: Goal, tail: Entry[], gitLog: string, e
 	].join("\n\n");
 }
 
+/** The acceptance review: the scorecard is met; is the intent? */
+export function reviewPrompt(st: State, g: Goal, gitLog: string): string {
+	const known = knowledge(st, g).slice(-15);
+	const results = g.results.slice(-8).map(r => `- ${r.exp} ${r.verdict}: ${r.reason.slice(0, 200)}`);
+	return [
+		"You are the ACCEPTANCE REVIEWER for an autonomous hill-climbing loop. Every scorecard target was met and confirmed by re-measurement. Decide whether the goal's INTENT is actually satisfied, or whether an explicit requirement of the intent never made it onto the scorecard (and so was never checked).",
+		"Be strict about requirements the intent states explicitly; do not invent new ones or demand polish beyond the intent.",
+		`Goal ${g.id}: "${g.intent}"${g.parent ? ` (a part of ${g.parent}${g.why ? `: ${g.why}` : ""})` : ""}`,
+		`Scorecard (all met): ${cardSummary(g)}`,
+		`Recent results:\n${results.join("\n") || "- none"}`,
+		...(known.length ? [`Recorded knowledge:\n${known.map(l => `- [${l.type}] ${l.text}`).join("\n")}`] : []),
+		`Recent commits:\n${gitLog}`,
+		"Answer in exactly this format:",
+		"VERDICT: achieved|unmet",
+		"UNMET: <the explicit requirements not met or not checked, or none>",
+		"NEXT: <one concrete next action for the worker>",
+	].join("\n\n");
+}
+
+export function parseReview(text: string): { achieved: boolean; unmet: string; next: string } {
+	const field = (k: string) => text.match(new RegExp(`^[\\s*_#]*${k}[*_]*\\s*:[*_\\s]*(.+?)\\s*$`, "im"))?.[1];
+	const unmetLine = field("UNMET") ?? "";
+	return {
+		achieved: !(field("VERDICT")?.toLowerCase() ?? "").startsWith("unmet"),
+		unmet: unmetLine || "unspecified",
+		next: field("NEXT") ?? "put the missing requirement on the scorecard",
+	};
+}
+
 export function parseJudge(text: string): { verdict: Verdict; diagnosis: string; next: string } {
 	const field = (k: string) => text.match(new RegExp(`^[\\s*_#]*${k}[*_]*\\s*:[*_\\s]*(.+?)\\s*$`, "im"))?.[1];
 	const v = field("VERDICT")?.toLowerCase() ?? "";

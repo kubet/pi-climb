@@ -199,3 +199,11 @@ describe("compaction", () => {
 		expect(after.judge?.ts).toBe(before.judge?.ts);
 	});
 });
+
+describe("acceptance review", () => {
+	test("parses the reviewer's verdict; only an explicit unmet holds the goal open", () => {
+		expect(X.parseReview("**VERDICT:** unmet\nUNMET: the unicode bug was never checked\nNEXT: add a part for it")).toEqual({ achieved: false, unmet: "the unicode bug was never checked", next: "add a part for it" });
+		expect(X.parseReview("VERDICT: achieved\nUNMET: none\nNEXT: stop").achieved).toBe(true);
+		expect(X.parseReview("garbled").achieved).toBe(true);
+	});
+});
