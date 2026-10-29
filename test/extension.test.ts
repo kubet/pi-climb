@@ -587,16 +587,16 @@ describe("lessons from a live run", () => {
 		expect(out).toContain("proof void: checks/fixed2.sh changed");
 	});
 
-	test("a proof is the experiment's claim: a metric gain that leaves it failing is not kept", async () => {
+	test("a proof only adds keeps: a measured gain stands while the claimed fix is incomplete", async () => {
 		await run("mkdir -p checks && printf 'test \"$(cat fixed3.txt 2>/dev/null)\" = yes\\n' > checks/fixed3.sh");
 		await z.tool("climb_experiment", { lever: "fix3", hypothesis: "", prediction: "", proof: "bash checks/fixed3.sh" });
 		await run("echo 25 > work.txt && git commit -qam faster-but-unfixed");
 		const out = await z.tool("climb_measure", {});
-		expect(out).toContain("DROPPED x6");
-		expect(out).toContain("did not do what it registered");
+		expect(out).toContain("KEPT x6");
+		expect(out).toContain("the claimed fix is not complete yet");
 		await z.tool("climb_experiment", { lever: "fix3", hypothesis: "", prediction: "", proof: "bash checks/fixed3.sh" });
-		await run("echo 25 > work.txt && echo yes > fixed3.txt && git add -A && git commit -qm faster-and-fixed");
-		expect(await z.tool("climb_measure", {})).toMatch(/KEPT x7: work 50→25 .*; proof passes/);
+		await run("echo 20 > work.txt && echo yes > fixed3.txt && git add -A && git commit -qm faster-and-fixed");
+		expect(await z.tool("climb_measure", {})).toMatch(/KEPT x7: work 25→20 .*; proof passes/);
 	});
 
 	test("a hold metric bouncing back is not a gain; one flaky run is retried", async () => {

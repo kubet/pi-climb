@@ -1173,7 +1173,7 @@ export default async function climb(pi: ExtensionAPI) {
 			prediction: S.str("Expected movement, e.g. 'runtime_ms -60%'"),
 			proof: S.opt(
 				S.str(
-					"Optional fast check (<120s, deterministic) that fails now and passes (exit 0) once the change works: a regression test or a replay of the defect, e.g. 'bun test test/handoff.test.ts' or 'test \"$(bun bench/replay.ts)\" -eq 0'. Write it before registering; it must fail here and its scripts must stay unchanged. It is this experiment's claim: no keep unless it passes. With it passing and no metric regressed, the experiment is kept even if nothing moved beyond noise. One claim per experiment: register an unrelated gain separately.",
+					"Optional fast check (<120s, deterministic) that fails now and passes (exit 0) once the change works: a regression test or a replay of the defect, e.g. 'bun test test/handoff.test.ts' or 'test \"$(bun bench/replay.ts)\" -eq 0'. Write it before registering; it must fail here and its scripts must stay unchanged. With it passing and no metric regressed, the experiment is kept even if nothing moved beyond noise. A measured gain is kept even while the proof still fails (partial progress), and the result says the claimed fix is not complete.",
 				),
 			),
 		}),
@@ -1396,15 +1396,16 @@ export default async function climb(pi: ExtensionAPI) {
 						if (pr.broken) throw new Error(`The proof ${pr.broken}; nothing was decided and ${exp.id} stays open. Free the machine or fix the environment, then climb_measure again (or abandon).`);
 						if (pr.passed < 2) failed = `proof still fails (${pr.passed}/2 runs passed): ${pr.out}`;
 					}
-					if (failed && kept)
-						reason = `${failed}. ${exp.id} did not do what it registered, though ${reason}: keep a gain by registering it without the proof`;
+					// A proof can only add a keep. A measured gain stands even when the claimed fix is not complete
+					// yet (8 errors → 6 is a step toward 0); the result says so, and "achieved" still needs the
+					// acceptance review, which sees the claim was not met.
+					if (failed && kept) reason += `; but ${failed}: the claimed fix is not complete yet`;
 					else if (failed) reason += `; ${failed}`;
 					else if (kept) reason += "; proof passes";
 					else {
-						byProof = true;
+						kept = byProof = true;
 						reason = `proof passes (it failed at ${exp.base.slice(0, 8)}): ${exp.proof.cmd}; ${reason.replace(/^no metric beat noise/, "no metric regressed")}`;
 					}
-					kept = !failed;
 					if (!failed) gates.proof = "pass";
 				}
 			}
