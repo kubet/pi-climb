@@ -1029,7 +1029,10 @@ export default async function climb(pi: ExtensionAPI) {
 			if (loose.length)
 				throw new Error(`Commit the instrument first: ${[...new Set(loose)].join(", ")} is untracked, so the first revert would delete it and break every later measurement.`);
 			const gerr = await guard(root, p.guard, g.id, signal);
-			if (gerr) throw new Error(`The guard must pass at HEAD before climbing: ${gerr}`);
+			if (gerr)
+				throw new Error(
+					`The guard must pass at HEAD before climbing: ${gerr}\nIf that failure is what this goal sets out to fix, it belongs in a metric (e.g. a count of failing cases, target 0) or in an experiment's proof, not in the guard: the guard only protects what already works.`,
+				);
 			// A/A: at least 3 runs on one commit expose the metric's own noise, so the
 			// keep/drop bar is measured, not guessed.
 			const say = progressTo(ctx, root, onUpdate, "scorecard A/A");
