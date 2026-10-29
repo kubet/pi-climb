@@ -1018,3 +1018,26 @@ describe("acceptance review", () => {
 		}
 	});
 });
+
+describe("updates", () => {
+	test("a running session says so when a newer climb is installed", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-update-"));
+		const src = path.join(import.meta.dir, "../src/trace.ts");
+		const was = fs.statSync(src);
+		try {
+			await exec("bash", ["-c", "git init -q && git config user.email t@t && git config user.name t && echo 1 > a && git add -A && git commit -qm i"], { cwd: d });
+			const z = host(d, "main", "update");
+			await z.load();
+			await z.cmd("anything");
+			z.h.timerFn!();
+			await Bun.sleep(50);
+			expect(z.notes.some(n => n.includes("newer version"))).toBe(false);
+			fs.utimesSync(src, was.atime, new Date(Date.now() + 60_000));
+			z.h.timerFn!();
+			await until(() => z.notes.some(n => n.includes("newer version is installed")));
+		} finally {
+			fs.utimesSync(src, was.atime, was.mtime);
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+});

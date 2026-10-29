@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import * as L from "./ledger";
 import * as X from "./logic";
 import * as E from "./export";
@@ -48,8 +49,21 @@ const ENV: L.Env = (() => {
 	return { ...facts, hash: sha(JSON.stringify(facts)).slice(0, 12) };
 })();
 
+/** Newest modification time of this extension's sources: a running session compares it with what it loaded. */
+function sourceStamp(): number {
+	try {
+		const dir = path.dirname(fileURLToPath(import.meta.url));
+		return Math.max(...fs.readdirSync(dir).filter(f => f.endsWith(".ts")).map(f => fs.statSync(path.join(dir, f)).mtimeMs));
+	} catch {
+		return 0;
+	}
+}
+
 export default async function climb(pi: ExtensionAPI) {
 	const S = await schemas(pi);
+	// A session keeps the code it started with; say so when a newer climb is installed.
+	const loadedStamp = sourceStamp();
+	let staleCode = false;
 	const omp = "zod" in pi && !!(pi as { zod?: unknown }).zod;
 	const roots = new Map<string, string>();
 	const judging = new Set<string>();
@@ -481,8 +495,16 @@ export default async function climb(pi: ExtensionAPI) {
 
 	function refresh(ctx: Ctx, root: string): L.State {
 		const st = load(root);
-		ctx.ui?.setStatus?.("climb", X.statusLine(st));
+		const line = X.statusLine(st);
+		ctx.ui?.setStatus?.("climb", line && staleCode ? `${line} · ↻ restart omp to update climb` : line);
 		return st;
+	}
+
+	/** Checked on the heartbeat: a newer climb on disk is loaded only by a new session. */
+	function checkUpdate(ctx: Ctx): void {
+		if (staleCode || !loadedStamp || sourceStamp() <= loadedStamp + 1000) return;
+		staleCode = true;
+		ctx.ui?.notify?.("climb: a newer version is installed. Restart omp (/exit, then omp -c) to load it; the climb resumes from its ledger.", "info");
 	}
 
 	function deliver(ctx: Ctx, text: string, trigger: boolean): void {
@@ -631,6 +653,7 @@ export default async function climb(pi: ExtensionAPI) {
 				ctx.ui?.setStatus?.("climb", undefined);
 				return;
 			}
+			checkUpdate(ctx);
 			if ((st.paused && !force) || !lease(root, ctx, force)) return void refresh(ctx, root);
 			for (const g of goals) {
 				const since = L.clock.ms() - L.epoch(g.lastBeat?.ts ?? g.created);
