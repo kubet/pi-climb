@@ -720,6 +720,7 @@ describe("review findings", () => {
 		await z.tool("climb_experiment", { lever: "fix2", hypothesis: "", prediction: "", proof: "bash extra/two.sh" });
 		await run("touch fixed2.txt && git add fixed2.txt && git commit -qm fix2");
 		await expect(z.tool("climb_measure", { abandon: null })).rejects.toThrow("x2 stays open"); // null is not abandon
+		await expect(z.tool("climb_measure", { goal: "", abandon: "" })).rejects.toThrow("x2 stays open"); // nor is "" (strict-schema providers send it)
 		expect(last("result")).toMatchObject({ exp: "x1" });
 		await z.tool("climb_measure", { abandon: "check needs a tool this machine lacks" });
 	});

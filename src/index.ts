@@ -26,6 +26,8 @@ type Progress = (text: string) => void;
 type Tag = { phase: T.Phase; goal?: string; metric?: string };
 type Update = (partial: { content: { type: "text"; text: string }[] }) => void;
 // Instruments outside the repo worth warning about; system tools are not instruments.
+/** A positive number, or the default: strict-schema providers send 0 or null for "not given". */
+const pos = (v: number | null | undefined, d: number) => (typeof v === "number" && v > 0 ? v : d);
 const SYSTEM = /^\/(dev|usr|bin|sbin|etc|opt|nix|proc|System|Library|Applications)(\/|$)/;
 
 export default async function climb(pi: ExtensionAPI) {
@@ -737,9 +739,9 @@ export default async function climb(pi: ExtensionAPI) {
 				target: m.target ?? Number.NaN,
 				unit: m.unit,
 				hold: m.hold || undefined,
-				noise: m.noise ?? 0.01,
-				samples: Math.min(9, Math.max(1, Math.round(m.samples ?? 1))),
-				timeout_s: m.timeout_s ?? 600,
+				noise: pos(m.noise, 0.01),
+				samples: Math.min(9, Math.round(pos(m.samples, 1))),
+				timeout_s: pos(m.timeout_s, 600),
 				baseline: Number.NaN,
 			}));
 			const commands = [...metrics.map(m => m.cmd), p.guard ?? ""];
@@ -844,7 +846,7 @@ export default async function climb(pi: ExtensionAPI) {
 				const g = pick(load(root), p.goal);
 				if (!/^[a-z][a-z0-9_]*$/.test(p.name)) throw new Error(`Probe names must be snake_case: "${p.name}".`);
 				// Research may run on an uncommitted tree, so nothing is restored afterwards.
-				const limit = Math.min(1800, Math.max(1, Math.round(p.timeout_s ?? 120)));
+				const limit = Math.min(1800, Math.round(pos(p.timeout_s, 120)));
 				const r = await run(root, p.cmd, limit * 1000, { phase: "probe", goal: g.id }, signal);
 				if (signal?.aborted) throw new Error("Probe interrupted; nothing recorded.");
 				const n = r.code === 0 ? X.parseNumber(r.stdout) : undefined;
@@ -989,7 +991,8 @@ export default async function climb(pi: ExtensionAPI) {
 			if (!exp || !g.card) throw new Error(`No open experiment on ${g.id}; register one with climb_experiment.`);
 			const d = await dirty(root);
 			if (d) throw new Error(`Commit your change first; climb measures commits, never a dirty tree:\n${d}`);
-			if (typeof p.abandon === "string") {
+			// Strict-schema providers fill every optional field: "" is not a reason, so not an abandon.
+			if (typeof p.abandon === "string" && p.abandon.trim()) {
 				const at = (await head(root)) ?? exp.base;
 				let reason = `abandoned: ${p.abandon || "no reason given"}`;
 				let reverted: string | undefined;
