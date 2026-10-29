@@ -5,12 +5,12 @@ Autonomous hill-climbing for [omp](https://github.com/can1357/oh-my-pi) and pi. 
 The LLM is a stateless worker. The extension is the enforcer:
 
 - **Owns the ledger** (`.climb/oracle.jsonl`, git-excluded). The agent cannot edit it.
-- **Measures everything itself** on clean commits: baselines with an A/A run, a control at pre-registration, and the result after commit. Noise is measured for the decision itself (medians of `samples` runs), so more samples shrink it by √samples. A metric too noisy to ever show reaching its target is refused, with the sample count that would fix it. Measuring never leaves the tree dirty, a flaky run is retried once, and an interrupted measurement decides nothing. A tree measured in the last 30 minutes (a rejected scorecard, the base restored by a revert) is not measured again.
+- **Measures everything itself** on clean commits: baselines with an A/A run, a control at pre-registration, and the result after commit. Noise is measured for the decision itself (medians of `samples` runs), so more samples shrink it by √samples. A metric too noisy to ever show reaching its target is refused, with the sample count that would fix it. Measuring never leaves the tree dirty, a flaky run is retried once, and an interrupted or crashed measurement decides nothing: the experiment stays open (`abandon` drops it). A scorecard runs each metric once before its A/A, so a broken command fails in one run. A tree measured in the last 30 minutes (a rejected scorecard, the base restored by a revert) is not measured again.
 - **Decides** kept/dropped. Borderline results are re-measured, and dropped experiments are reverted with a revert commit. "Achieved" is confirmed with a second measurement. Hold metrics guard; they never count as a gain.
 - **Proofs** for fixes the scorecard is too coarse to see: an experiment can carry a check that must fail at registration and pass after. A proof is the experiment's claim, so no keep without it passing. With it passing and no metric regressed, the experiment is kept even if nothing moved beyond noise. A proof keep does not count as progress, so a run of fixes that never moves the scorecard still reaches the judge.
 - **Freezes the instrument**: an experiment that touches the bench or test scripts is dropped. Commits climb never measured cannot enter the baseline.
 - **Never lets it quit** while a goal is open (`session_stop` block). An agent that keeps stopping without progress is rested and handed to the heartbeat.
-- **Heartbeat** every 30m audits the ledger: was anything kept since the last beat? It skips while the agent is busy and forces a check-in at 2× as a watchdog. After `poke-max` stale beats, an independent **judge** diagnoses the stall and redirects the agent. The judge is a side turn on the current model, outside the agent's history. The agent can record its own diagnosis, but only the judge or you clear a stall.
+- **Heartbeat** every 30m audits the ledger: was anything kept since the last beat? It skips while the agent is busy and forces a check-in at 2× as a watchdog. After `poke-max` stale beats, an independent **judge** diagnoses the stall and redirects the agent. The judge is a side turn on the current model, outside the agent's history. The agent can record its own diagnosis, but only the judge or you clear a stall. A judge cut off by a restart or a hang (5 min) is re-run, never waited on forever.
 - **Focus**: at most 2 goals, 3 metrics per goal, and 1 open experiment. Three drops in a row summon the judge before the next try, and renaming the lever doesn't reset that.
 
 ## Install
@@ -37,7 +37,7 @@ Requires a git repo with at least one commit.
 The agent drives the loop through tools:
 
 1. **Research, itemized:** `climb_probe` registers each candidate metric (`timeout_s` for slow ones). The extension runs it and records the number, and each probe counts as progress before a scorecard exists.
-2. **Climb:** `climb_scorecard` → `climb_experiment` (optional `proof`) → commit → `climb_measure`, plus `climb_judge` and `climb_status`. Long measurements stream progress to the tool output and the status line.
+2. **Climb:** `climb_scorecard` → `climb_experiment` (optional `proof`) → commit → `climb_measure` (or `abandon`), plus `climb_judge` and `climb_status`. Long measurements stream progress to the tool output and the status line.
 
 Metrics are whatever the agent defines: any command that prints a number, such as runtime, memory, test count, bundle size, or itemized findings (`grep -c '^- ' findings.md`). A metric with `hold: true` is a constraint ("no slower"): it has no target, and any regression beyond noise drops the experiment.
 

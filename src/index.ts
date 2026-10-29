@@ -17,6 +17,7 @@ import * as L from "./ledger";
 import * as X from "./logic";
 
 const TICK_MS = 15_000;
+const JUDGE_MS = 5 * 60_000;
 const LEDGER_GUARD = "The climb ledger (.climb/) is append-only and owned by the climb extension. Read it with climb_status.";
 
 type Ctx = ExtensionContext;
@@ -115,6 +116,7 @@ export default async function climb(pi: ExtensionAPI) {
 	async function measure(root: string, metrics: L.Metric[], signal?: AbortSignal, prior: Record<string, number[]> = {}, progress?: Progress) {
 		const values: L.Values = {};
 		const samples: Record<string, number[]> = {};
+		const got: Record<string, number[]> = {}; // every good run, including those of a metric that failed later
 		const errors: string[] = [];
 		try {
 		for (const m of metrics) {
@@ -139,15 +141,16 @@ export default async function climb(pi: ExtensionAPI) {
 				}
 				xs.push(n);
 			}
+			got[m.name] = [...(prior[m.name] ?? []), ...xs];
 			if (xs.length < m.samples) continue;
-			samples[m.name] = [...(prior[m.name] ?? []), ...xs];
+			samples[m.name] = got[m.name];
 			values[m.name] = X.median(samples[m.name]);
 		}
 		} finally {
 			await restore(root);
 			progress?.("");
 		}
-		return { values, samples, errors };
+		return { values, samples, errors, got };
 	}
 
 	// Unbiased runs (A/A, controls) by tree and command. A tree measured minutes ago is
@@ -165,9 +168,11 @@ export default async function climb(pi: ExtensionAPI) {
 			return { ...m, samples: Math.max(0, need(m) - prior[m.name].length) };
 		});
 		const r = await measure(root, plan, signal, prior, progress);
+		// Good runs are kept even when a later run of the same metric crashed: a retry only tops up.
 		for (const m of plan) {
 			const key = `${t}\0${m.cmd}`;
-			if (t && m.samples && r.samples[m.name]) runs.set(key, { ts: prior[m.name].length ? runs.get(key)!.ts : L.clock.ms(), xs: r.samples[m.name] });
+			const xs = r.got[m.name] ?? [];
+			if (t && xs.length > prior[m.name].length) runs.set(key, { ts: prior[m.name].length ? runs.get(key)!.ts : L.clock.ms(), xs });
 		}
 		return { ...r, reused: plan.filter(m => !m.samples).map(m => m.name) };
 	}
@@ -224,6 +229,17 @@ export default async function climb(pi: ExtensionAPI) {
 	const LEASE_STALE_MS = 4 * TICK_MS;
 	// Keyed on the process, not the session id: /new or a session switch must not orphan the lease.
 	const me = (_ctx: Ctx) => process.env.CLIMB_LEASE_ID ?? `${os.hostname()}:${process.pid}`;
+	/** A holder on this machine whose process has exited: a restart takes over at once, not after the stale window. */
+	function gone(who: string): boolean {
+		const [host, pid] = who.split(":");
+		if (host !== os.hostname() || !/^\d+$/.test(pid ?? "")) return false;
+		try {
+			process.kill(Number(pid), 0);
+			return false;
+		} catch (e) {
+			return (e as { code?: string }).code === "ESRCH";
+		}
+	}
 	function lease(root: string, ctx: Ctx, claim = false): boolean {
 		const file = path.join(root, L.DIR, "lease.json");
 		let cur: { who: string; ts: number } | undefined;
@@ -231,7 +247,7 @@ export default async function climb(pi: ExtensionAPI) {
 			cur = JSON.parse(fs.readFileSync(file, "utf8"));
 		} catch {}
 		const who = me(ctx);
-		if (!claim && cur && cur.who !== who && L.clock.ms() - cur.ts < LEASE_STALE_MS) return false;
+		if (!claim && cur && cur.who !== who && L.clock.ms() - cur.ts < LEASE_STALE_MS && !gone(cur.who)) return false;
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		fs.writeFileSync(file, JSON.stringify({ who, ts: L.clock.ms() }));
 		return true;
@@ -454,7 +470,10 @@ export default async function climb(pi: ExtensionAPI) {
 			let lastErr: unknown;
 			for (const opts of [{ tools: false as const, maxTokens: 1500 }, { tools: false as const }, {}]) {
 				try {
-					reply = (await turn({ promptText, ...opts })).replyText;
+					// A hung side turn must not hold the stall gate shut forever.
+					let timer: ReturnType<typeof setTimeout> | undefined;
+					const late = new Promise<never>((_, no) => (timer = setTimeout(() => no(new Error("judge timed out after 5 minutes")), JUDGE_MS)));
+					reply = (await Promise.race([turn({ promptText, ...opts }), late]).finally(() => clearTimeout(timer))).replyText;
 					break;
 				} catch (e) {
 					lastErr = e;
@@ -488,7 +507,10 @@ export default async function climb(pi: ExtensionAPI) {
 		ctxRef = ctx;
 		const root = await repoRoot(ctx.cwd);
 		if (!root) return;
-		if (L.active(refresh(ctx, root)).length) ensureTimer(ctx);
+		const goals = L.active(refresh(ctx, root));
+		if (goals.length) ensureTimer(ctx);
+		// A restart can kill a judge mid-verdict: a pending stall must not wait on it forever.
+		if (lease(root, ctx) && hasJudge(ctx)) for (const g of goals) if (g.stallPending && !judging.has(g.id)) void judge(ctx, root, g.id);
 	});
 
 	pi.on("turn_end", async (_e, ctx) => {
@@ -650,8 +672,12 @@ export default async function climb(pi: ExtensionAPI) {
 			// A/A: at least 3 runs on one commit expose the metric's own noise, so the
 			// keep/drop bar is measured, not guessed.
 			const say = progressTo(ctx, root, onUpdate, "scorecard A/A");
+			const fix = (errors: string[]) => new Error(`Fix these metric commands (exit 0 and print a number):\n${errors.join("\n")}\nGood runs on this commit are cached for 30 minutes; a retry only measures what is missing.`);
+			// One run of each first: a broken command fails in one run, not after everything else's A/A.
+			const smoke = await measureTree(root, metrics, () => 1, signal, say);
+			if (smoke.errors.length) throw fix(smoke.errors);
 			const { values, samples, errors, reused } = await measureTree(root, metrics, m => Math.max(3, m.samples), signal, say);
-			if (errors.length) throw new Error(`Fix these metric commands (exit 0 and print a number):\n${errors.join("\n")}`);
+			if (errors.length) throw fix(errors);
 			const warnings: string[] = [];
 			const problems: string[] = [];
 			const pct = (x: number) => `±${(x * 100).toFixed(1)}%`;
@@ -770,8 +796,12 @@ export default async function climb(pi: ExtensionAPI) {
 			if (!g.card) throw new Error("Define the scorecard first with climb_scorecard.");
 			const busy = L.active(st).find(x => x.open);
 			if (busy?.open) throw new Error(`Experiment ${busy.open.id} on ${busy.id} is still open; finish it with climb_measure first.`);
-			if (g.stallPending)
-				throw new Error(judging.has(g.id) ? "The judge is reviewing this stall; its verdict arrives as a message shortly." : X.nextAction(g));
+			if (g.stallPending) {
+				if (!hasJudge(ctx)) throw new Error(X.nextAction(g));
+				// A stall whose judge never ran (or died with a restart) gets one now.
+				if (!judging.has(g.id)) void judge(ctx, root, g.id);
+				throw new Error("The independent judge is reviewing this stall; its verdict arrives as a message shortly. Record your own diagnosis with climb_judge meanwhile if you have one.");
+			}
 			const blocked = X.streakBlocked(g);
 			if (blocked) {
 				if (!hasJudge(ctx)) throw new Error(`${blocked} No independent judge on this host: call climb_judge with an honest diagnosis of why they failed and what is fundamentally different next.`);
@@ -843,10 +873,13 @@ export default async function climb(pi: ExtensionAPI) {
 		name: "climb_measure",
 		label: "Climb: measure",
 		description:
-			"Close the open experiment: the extension runs the guard and every metric on the committed HEAD, compares against the pre-registered control, and decides kept or dropped (noise-aware). Dropped experiments are reverted with a revert commit. Requires a clean tree and at least one commit since registration.",
-		parameters: S.obj({ goal: S.opt(S.str("Goal id; optional")) }),
+			"Close the open experiment: the extension runs the guard and every metric on the committed HEAD, compares against the pre-registered control, and decides kept or dropped (noise-aware). Dropped experiments are reverted with a revert commit. Requires a clean tree and at least one commit since registration. A measurement that crashes decides nothing: the experiment stays open. abandon drops and reverts it without measuring.",
+		parameters: S.obj({
+			goal: S.opt(S.str("Goal id; optional")),
+			abandon: S.opt(S.str("Drop and revert the open experiment without measuring, giving the reason (e.g. its instrument is broken)")),
+		}),
 		loadMode: "essential",
-		execute: (_id, p: GoalParam, signal, onUpdate: Update | undefined, ctx) => exclusive(async () => {
+		execute: (_id, p: MeasureParams, signal, onUpdate: Update | undefined, ctx) => exclusive(async () => {
 			worker(ctx);
 			const root = await needRoot(ctx);
 			holder(root, ctx);
@@ -855,6 +888,19 @@ export default async function climb(pi: ExtensionAPI) {
 			if (!exp || !g.card) throw new Error(`No open experiment on ${g.id}; register one with climb_experiment.`);
 			const d = await dirty(root);
 			if (d) throw new Error(`Commit your change first; climb measures commits, never a dirty tree:\n${d}`);
+			if (p.abandon !== undefined) {
+				const at = (await head(root)) ?? exp.base;
+				let reason = `abandoned: ${p.abandon || "no reason given"}`;
+				let reverted: string | undefined;
+				if (at !== exp.base) {
+					const rv = await revert(root, exp, reason);
+					if (rv.sha) reverted = rv.sha;
+					else reason += ` — auto-revert failed (${rv.err}); restore by hand: git revert --no-commit ${exp.base.slice(0, 8)}..HEAD && git commit`;
+				}
+				append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: at, values: {}, verdict: "dropped", reason, reverted });
+				const st = refresh(ctx, root);
+				return ok(`DROPPED ${exp.id} (${reason}).${reverted ? ` Reverted in ${reverted.slice(0, 8)}.` : ""}\n${X.nextAction(st.goals.get(g.id)!)}`);
+			}
 			const h = await head(root);
 			if (!h || h === exp.base) throw new Error(`HEAD is still the base commit ${exp.base.slice(0, 8)}; commit ${exp.id} first.`);
 			const say = progressTo(ctx, root, onUpdate, `${g.id} ${exp.id}`);
@@ -871,32 +917,34 @@ export default async function climb(pi: ExtensionAPI) {
 				// Within 2x noise either way: measure again before deciding, so noise
 				// neither keeps a lucky draw nor kills a real gain.
 				if (!r.errors.length && X.borderline(g.card.metrics, exp.ref, r.values)) r = await measure(root, g.card.metrics, signal, r.samples, t => say(t && `re-measure (borderline) ${t}`));
-				if (r.errors.length) reason = `measurement failed: ${r.errors.join("; ")}`;
-				else {
-					({ values, samples } = r);
-					const v = X.verdict(g.card.metrics, exp.ref, values);
-					({ kept, reason } = v);
-					// A registered proof is the experiment's own claim: it must hold for any keep, and
-					// when nothing regressed it keeps a fix the scorecard is too coarse to see.
-					if (!v.regressed && exp.proof) {
-						const now = await hashes(root, Object.keys(exp.proof.files));
-						const edited = Object.keys(exp.proof.files).filter(f => now[f] !== exp.proof!.files[f]);
-						let failed = edited.length ? `proof void: ${edited.join(", ")} changed since registration` : "";
-						if (!failed) {
-							say("proof");
-							const pr = await proofRuns(root, exp.proof.cmd, signal);
-							if (pr.passed < 2) failed = `proof still fails (${pr.passed}/2 runs passed): ${pr.out}`;
-						}
-						if (failed && kept)
-							reason = `${failed}. ${exp.id} did not do what it registered, though ${reason}: keep a gain by registering it without the proof`;
-						else if (failed) reason += `; ${failed}`;
-						else if (kept) reason += "; proof passes";
-						else {
-							byProof = true;
-							reason = `proof passes (it failed at ${exp.base.slice(0, 8)}): ${exp.proof.cmd}; ${reason.replace(/^no metric beat noise/, "no metric regressed")}`;
-						}
-						kept = !failed;
+				// A crashed instrument is not evidence against the change: decide nothing.
+				if (r.errors.length)
+					throw new Error(
+						`Measurement failed, even after retrying each failed run once; nothing was decided and ${exp.id} stays open:\n${r.errors.join("\n")}\nFlaky: call climb_measure again. Broken by your change: fix it, commit, measure again. Instrument broken: climb_measure with abandon, repair it, re-baseline with climb_scorecard.`,
+					);
+				({ values, samples } = r);
+				const v = X.verdict(g.card.metrics, exp.ref, values);
+				({ kept, reason } = v);
+				// A registered proof is the experiment's own claim: it must hold for any keep, and
+				// when nothing regressed it keeps a fix the scorecard is too coarse to see.
+				if (!v.regressed && exp.proof) {
+					const now = await hashes(root, Object.keys(exp.proof.files));
+					const edited = Object.keys(exp.proof.files).filter(f => now[f] !== exp.proof!.files[f]);
+					let failed = edited.length ? `proof void: ${edited.join(", ")} changed since registration` : "";
+					if (!failed) {
+						say("proof");
+						const pr = await proofRuns(root, exp.proof.cmd, signal);
+						if (pr.passed < 2) failed = `proof still fails (${pr.passed}/2 runs passed): ${pr.out}`;
 					}
+					if (failed && kept)
+						reason = `${failed}. ${exp.id} did not do what it registered, though ${reason}: keep a gain by registering it without the proof`;
+					else if (failed) reason += `; ${failed}`;
+					else if (kept) reason += "; proof passes";
+					else {
+						byProof = true;
+						reason = `proof passes (it failed at ${exp.base.slice(0, 8)}): ${exp.proof.cmd}; ${reason.replace(/^no metric beat noise/, "no metric regressed")}`;
+					}
+					kept = !failed;
 				}
 			}
 			let reverted: string | undefined;
@@ -933,7 +981,7 @@ export default async function climb(pi: ExtensionAPI) {
 		name: "climb_judge",
 		label: "Climb: diagnosis",
 		description:
-			"Record an honest diagnosis when a goal stalls or a lever keeps failing: why there is no progress and the next move. Required before experimenting again on a stalled goal. 'stuck' is escalated to an independent judge where the host supports one.",
+			"Record an honest diagnosis when a goal stalls or a lever keeps failing: why there is no progress and the next move. Where the host runs an independent judge, its verdict (not yours) releases a stall or the drop-streak gate; yours is recorded for it. Without one, yours does. 'stuck' is escalated to the independent judge.",
 		parameters: S.obj({
 			goal: S.opt(S.str("Goal id; optional")),
 			verdict: S.enum(["continue", "pivot", "stuck"], "continue the approach, pivot to another, or stuck (needs a human)"),
@@ -1102,6 +1150,9 @@ interface ProbeParams extends GoalParam {
 	cmd: string;
 	note?: string;
 	timeout_s?: number;
+}
+interface MeasureParams extends GoalParam {
+	abandon?: string;
 }
 interface ExperimentParams extends GoalParam {
 	lever: string;

@@ -268,11 +268,11 @@ export function fold(entries: Entry[]): State {
 				break;
 			case "judge":
 				g.diagnosis = e;
-				g.stallPending = false;
-				// A worker grading its own work is recorded but never resets the stale count
-				// or the grid-search gate: only an independent verdict does. ("fallback" is a
-				// worker diagnosis accepted because the host has no independent judge.)
+				// A worker grading its own work is recorded but never releases a stall, resets the
+				// stale count or opens the grid-search gate: only an independent verdict does.
+				// ("fallback" is a worker diagnosis accepted because the host has no independent judge.)
 				if (e.by === "worker") break;
+				g.stallPending = false;
 				g.judge = e;
 				g.judgeSeq = seq;
 				g.streak = 0;

@@ -184,7 +184,7 @@ export function nextAction(g: Goal): string {
 	if (g.open)
 		return `[climb ${g.id}] Experiment ${g.open.id} is open (lever "${g.open.lever}": ${g.open.hypothesis}). Finish it: implement, commit, then call climb_measure. State: ${cardSummary(g)}.`;
 	if (g.stallPending)
-		return `[climb ${g.id}] STALLED: no progress in ${g.lastBeat?.stale ?? "several"} heartbeats. Stop and diagnose before experimenting: is the lever wrong, the metric broken/noisy, something blocked, or are you grid-searching one idea? Call climb_judge with an honest diagnosis and the next move. State: ${cardSummary(g)}.`;
+		return `[climb ${g.id}] STALLED: no progress in ${g.lastBeat?.stale ?? "several"} heartbeats. Stop and diagnose before experimenting: is the lever wrong, the metric broken/noisy, something blocked, or are you grid-searching one idea? Call climb_judge with an honest diagnosis and the next move; where an independent judge runs, its verdict releases the stall. State: ${cardSummary(g)}.`;
 	const tried = [...g.levers.entries()].map(([k, l]) => `${k} (${l.kept}/${l.tried} kept)`).join(", ");
 	const judged = g.diagnosis ? ` Last diagnosis (${g.diagnosis.by}): ${g.diagnosis.verdict} — ${g.diagnosis.next}.` : "";
 	return `[climb ${g.id}] Keep climbing. State: ${cardSummary(g)}.${tried ? ` Levers tried: ${tried}.` : ""}${judged} Pick the lever with the highest expected gain on the metric furthest from target and call climb_experiment.`;

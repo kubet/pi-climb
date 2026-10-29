@@ -615,3 +615,68 @@ describe("lessons from a live run", () => {
 		fs.rmSync(path.dirname(ext), { recursive: true, force: true });
 	});
 });
+
+// Seen in the same climb's 16-hour overnight run and its restart.
+describe("lessons from the night", () => {
+	let d: string;
+	let z: ReturnType<typeof host>;
+	const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+	const last = (kind: string) => L.read(d).filter(e => e.kind === kind).at(-1);
+
+	beforeAll(async () => {
+		d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-night-"));
+		await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && git add -A && git commit -qm init");
+		// A restart: the lease still names a process on this machine that has exited.
+		fs.mkdirSync(path.join(d, ".climb"));
+		fs.writeFileSync(path.join(d, ".climb/lease.json"), JSON.stringify({ who: `${os.hostname()}:999999`, ts: L.clock.ms() }));
+		z = host(d, "main", "night");
+		await z.load();
+		await z.cmd("shrink work");
+	});
+	afterAll(() => fs.rmSync(d, { recursive: true, force: true }));
+
+	test("a restarted session takes over from its own dead process at once", async () => {
+		fs.writeFileSync(path.join(d, ".climb/lease.json"), JSON.stringify({ who: `${os.hostname()}:999999`, ts: L.clock.ms() }));
+		expect(await z.tool("climb_probe", { name: "w", cmd: "cat work.txt" })).toContain("= 100");
+		fs.writeFileSync(path.join(d, ".climb/lease.json"), JSON.stringify({ who: `${os.hostname()}:${process.ppid}`, ts: L.clock.ms() }));
+		await expect(z.tool("climb_probe", { name: "w", cmd: "cat work.txt" })).rejects.toThrow("Another omp/pi session");
+		fs.rmSync(path.join(d, ".climb/lease.json"));
+	});
+
+	test("only the independent judge releases a stall, and a stall left without one gets one", async () => {
+		await z.tool("climb_scorecard", { metrics: [{ name: "work", cmd: "test ! -f .git/broken && cat work.txt", dir: "down", target: 10, noise: 0.05 }] });
+		// As if the process died between the stall and the judge's verdict.
+		L.append(d, { ts: L.now(), kind: "stall", goal: "g-shrink-work", stale: 3 });
+		await z.tool("climb_judge", { verdict: "pivot", diagnosis: "I think it is fine", next: "carry on" });
+		expect(L.fold(L.read(d)).goals.get("g-shrink-work")!.stallPending).toBe(true);
+		await expect(z.tool("climb_experiment", { lever: "a", hypothesis: "", prediction: "" })).rejects.toThrow("independent judge is reviewing");
+		await until(() => (last("judge") as L.JudgeE | undefined)?.by === "judge");
+		expect(await z.tool("climb_experiment", { lever: "a", hypothesis: "", prediction: "" })).toContain("Registered x1");
+	});
+
+	test("a crashed measurement decides nothing; abandon drops and reverts", async () => {
+		await run("echo 50 > work.txt && git commit -qam halve && touch .git/broken");
+		await expect(z.tool("climb_measure", {})).rejects.toThrow("x1 stays open");
+		expect(last("result")).toBeUndefined();
+		await run("rm .git/broken");
+		expect(await z.tool("climb_measure", {})).toContain("KEPT x1");
+		await z.tool("climb_experiment", { lever: "b", hypothesis: "", prediction: "" });
+		await run("echo 40 > work.txt && git commit -qam b");
+		expect(await z.tool("climb_measure", { abandon: "grader is down" })).toContain("DROPPED x2 (abandoned: grader is down). Reverted");
+		expect(fs.readFileSync(path.join(d, "work.txt"), "utf8").trim()).toBe("50");
+		expect(last("result")).toMatchObject({ exp: "x2", verdict: "dropped" });
+	});
+
+	test("a broken metric fails the scorecard after one run of each; good runs survive for the retry", async () => {
+		const count = async (f: string) => Number((await run(`cat .git/${f} 2>/dev/null || echo 0`)).stdout.trim());
+		const a = "n=$(cat .git/a 2>/dev/null || echo 0); echo $((n+1)) > .git/a; cat work.txt";
+		await expect(z.tool("climb_scorecard", { metrics: [{ name: "work", cmd: a, dir: "down", target: 10 }, { name: "bad", cmd: "exit 1", dir: "down", target: 1 }] })).rejects.toThrow("Fix these metric commands");
+		expect(await count("a")).toBe(1);
+		// Runs 3 and 4 crash (the retry too): runs 1-2 are kept, so the retry needs one more.
+		const c = "n=$(cat .git/c 2>/dev/null || echo 0); echo $((n+1)) > .git/c; test $n -ne 2 && test $n -ne 3 && cat work.txt";
+		await expect(z.tool("climb_scorecard", { metrics: [{ name: "work", cmd: c, dir: "down", target: 10 }] })).rejects.toThrow("exit 1");
+		expect(await count("c")).toBe(4);
+		expect(await z.tool("climb_scorecard", { metrics: [{ name: "work", cmd: c, dir: "down", target: 10 }] })).toContain("work = 50");
+		expect(await count("c")).toBe(5);
+	});
+});
