@@ -926,10 +926,15 @@ describe("drift", () => {
 			await run("echo y >> README.md && git commit -qam noop");
 			const out = await z.tool("climb_measure", {});
 			expect(out).toContain("noise re-estimated at");
-			// A docs-only commit outside any experiment, measured in an even slower window.
-			await run("echo z >> README.md && git commit -qam docs && echo 160 > .git/level");
+			// A code commit outside any experiment, measured in an even slower window: judged against history.
+			await run("echo z > lib.js && git add lib.js && git commit -qm code && echo 160 > .git/level");
 			shift = 62 * 60_000;
-			expect(await z.tool("climb_experiment", { lever: "next", hypothesis: "", prediction: "" })).toContain("Adopted commits");
+			expect(await z.tool("climb_experiment", { lever: "next", hypothesis: "", prediction: "" })).toContain("guard passes, no regression");
+			await z.tool("climb_measure", { abandon: "drift test" });
+			// A docs-only commit cannot move the metric: adopted without a comparison, however slow the window.
+			await run("echo w >> README.md && git commit -qam docs && echo 400 > .git/level");
+			shift = 93 * 60_000;
+			expect(await z.tool("climb_experiment", { lever: "after", hypothesis: "", prediction: "" })).toContain("only tests, docs or the proof changed");
 		} finally {
 			L.clock.ms = clock;
 			fs.rmSync(d, { recursive: true, force: true });

@@ -325,6 +325,16 @@ export const indirectRunner = (cmd: string) =>
 /** Absolute paths a command mentions (`/x`, `--flag=/x`): candidates for an instrument outside the repo. */
 export const absolutePaths = (cmd: string) => [...new Set(cmd.split(/[\s"'`()=,;|&<>]+/).filter(t => /^\/[^/]/.test(t)))];
 
+/** A changed file that cannot move these metric commands: a doc or a test that no command names, and
+ *  for tests, no command runs a whole suite. (Frozen instrument files are checked separately.) */
+export function inert(f: string, commands: string[]): boolean {
+	const base = f.split("/").pop() ?? f;
+	if (commands.some(c => c.includes(f) || c.includes(base))) return false;
+	if (/\.(md|mdx|rst)$|(^|\/)docs?\//i.test(f)) return true;
+	const test = /(^|\/)(tests?|__tests__|spec)\/|\.(test|spec)\.[A-Za-z]+$|_test\.(go|py)$|(^|\/)test_[^/]*\.py$/i.test(f);
+	return test && !commands.some(indirectRunner);
+}
+
 /** Some metric moved by more than noise but less than 2x noise: measure again before deciding.
  *  A hold metric only matters when it fell. */
 export function borderline(metrics: Metric[], ref: Values, values: Values): boolean {

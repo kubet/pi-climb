@@ -1041,6 +1041,7 @@ export default async function climb(pi: ExtensionAPI) {
 			// only if they pass the guard and regress nothing against the last measured baseline:
 			// they must never quietly lower the bar. The guard runs first: it is the cheap refusal.
 			let unmeasured: string | undefined;
+			let harmless = false;
 			if (g.baseRef) {
 				const [want, have] = await Promise.all([tree(root, g.baseRef), tree(root)]);
 				if (want && want !== have) {
@@ -1048,6 +1049,10 @@ export default async function climb(pi: ExtensionAPI) {
 					// A committed failing test that is this experiment's proof is meant to break the guard.
 					const changed = (await git(root, "diff", "--name-only", `${g.baseRef}..HEAD`)).stdout.split("\n").filter(Boolean);
 					const onlyProof = !!proof && changed.length > 0 && changed.every(f => f in proof!.files);
+					// Tests, docs and the proof's own scripts cannot move a metric that does not run them.
+					const frozen = new Set(X.touchedFrozen(changed, g.card.frozen));
+					const commands = g.card.metrics.map(m => m.cmd);
+					harmless = changed.length > 0 && changed.every(f => !frozen.has(f) && ((proof && f in proof.files) || X.inert(f, commands)));
 					const gerr = onlyProof ? undefined : await guard(root, g.card.guard, g.id, signal);
 					if (gerr)
 						throw new Error(
@@ -1058,7 +1063,8 @@ export default async function climb(pi: ExtensionAPI) {
 			const control = await measureTree(root, g.card.metrics, m => m.samples, { phase: "control", goal: g.id }, signal, say);
 			if (control.errors.length) throw new Error(`Control measurement failed at ${base.slice(0, 8)}:\n${control.errors.join("\n")}`);
 			let adopted = "";
-			if (unmeasured) {
+			if (unmeasured && harmless) adopted = ` Adopted commits since ${unmeasured}: only tests, docs or the proof changed.`;
+			else if (unmeasured) {
 				// Judge against everything measured on the baseline tree, not one window of it, and with a
 				// higher bar: this is a sanity check on commits outside experiments, and drift is not a regression.
 				const traces = T.read(root);
