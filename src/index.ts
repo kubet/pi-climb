@@ -1460,9 +1460,12 @@ export default async function climb(pi: ExtensionAPI) {
 				ctx.ui?.notify?.(`climb ${g.id} achieved`, "info");
 				if (!L.active(st).length) stopTimer(ctx);
 			} else {
+				// The review's finding is the next step; the tree's routing would only repeat it.
 				if (unmet) text += `\nEVERY TARGET MET, BUT THE INTENT IS NOT DONE (acceptance review): ${unmet.unmet}\nNEXT: ${unmet.next}. Put what is missing on the scorecard (climb_scorecard) or into a part (climb_split).`;
-				else if (kept && g.card.metrics.every(m => L.met(m, values[m.name]))) text += "\nTargets met once but not confirmed on re-measurement; keep climbing.";
-				text += `\n${X.nextAction(st, L.rootOf(st, st.goals.get(g.id)!))}`;
+				else {
+					if (kept && g.card.metrics.every(m => L.met(m, values[m.name]))) text += "\nTargets met once but not confirmed on re-measurement; keep climbing.";
+					text += `\n${X.nextAction(st, L.rootOf(st, st.goals.get(g.id)!))}`;
+				}
 			}
 			return ok(text);
 		})),

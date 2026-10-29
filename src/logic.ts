@@ -165,6 +165,9 @@ export function goalPct(st: State, g: Goal): number {
 	return Math.min(...(goals.length ? goals : g.card.metrics).map(m => progressPct(m, g.best[m.name])));
 }
 
+/** A part with every target met that is still not achieved: what the acceptance review found missing (or an unconfirmed meet) is all that is left. */
+const finishing = (st: State, g: Goal) => !umbrella(st, g) && !!g.card && !g.done && g.card.metrics.every(m => m.hold || met(m, g.best[m.name]));
+
 /** The goal in a tree that holds the open experiment, if any. */
 export const openIn = (st: State, g: Goal) => subtree(st, g).find(x => x.open);
 
@@ -274,7 +277,7 @@ export function nextAction(st: State, g: Goal): string {
 		return `[climb ${g.id}] STALLED: no progress in ${g.lastBeat?.stale ?? "several"} heartbeats. Stop and diagnose before experimenting: is the lever wrong, the metric broken/noisy, something blocked, or are you grid-searching one idea? Call climb_judge with an honest diagnosis and the next move; where an independent judge runs, its verdict releases the stall. State: ${umbrella(st, g) ? `split into ${openParts(st, g).map(p => p.id).join(", ")}` : cardSummary(g)}.`;
 	if (umbrella(st, g)) {
 		const ps = openParts(st, g);
-		const next = ps.find(p => openIn(st, p)) ?? ps.find(p => !p.card && !umbrella(st, p)) ?? [...ps].sort((a, b) => goalPct(st, a) - goalPct(st, b))[0];
+		const next = ps.find(p => openIn(st, p)) ?? ps.find(p => finishing(st, p)) ?? ps.find(p => !p.card && !umbrella(st, p)) ?? [...ps].sort((a, b) => goalPct(st, a) - goalPct(st, b))[0];
 		const list = ps.map(p => `${p.id} (${p.card || umbrella(st, p) ? `${goalPct(st, p)}%` : "researching"}${openIn(st, p) ? `, ${openIn(st, p)!.open!.id} open` : ""})`).join(", ");
 		return `[climb ${g.id}] Split into parts: ${list}. Next, ${next.id}: ${nextAction(st, next)}`;
 	}
@@ -287,6 +290,8 @@ export function nextAction(st: State, g: Goal): string {
 		return `[climb ${g.id}] Experiment ${g.open.id} is open (lever "${g.open.lever}": ${g.open.hypothesis}). Finish it: implement, commit, then call climb_measure${tag}. State: ${cardSummary(g)}.`;
 	const tried = [...g.levers.entries()].map(([k, l]) => `${k} (${l.kept}/${l.tried} kept)`).join(", ");
 	const judged = g.diagnosis ? ` Last diagnosis (${g.diagnosis.by}): ${g.diagnosis.verdict} — ${g.diagnosis.next}.` : "";
+	if (finishing(st, g))
+		return `[climb ${g.id}] Every target is met, yet the goal is not achieved${tag}.${g.diagnosis ? ` Last diagnosis (${g.diagnosis.by}): ${g.diagnosis.diagnosis} → ${g.diagnosis.next}.` : ""} Put what is missing on the scorecard (climb_scorecard) or into a part (climb_split); a target met only once is confirmed by the next measurement.`;
 	return `[climb ${g.id}] Keep climbing${tag}. State: ${cardSummary(g)}.${tried ? ` Levers tried: ${tried}.` : ""}${judged}${lessons(st, g)} Pick the lever with the highest expected gain on the metric furthest from target and call climb_experiment.`;
 }
 

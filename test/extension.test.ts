@@ -1031,6 +1031,33 @@ describe("acceptance review", () => {
 			fs.rmSync(d, { recursive: true, force: true });
 		}
 	});
+
+	test("a part the review holds open comes next, with what is missing, not a sibling's climb", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-part-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > a.txt && echo 10 > b.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "accept-part");
+			await z.load();
+			await z.cmd("make it fast and good");
+			await z.tool("climb_split", { parts: [{ intent: "fast responses" }, { intent: "good answers" }] });
+			await z.tool("climb_scorecard", { goal: "g-fast-responses", metrics: [{ name: "ms", cmd: "cat a.txt", dir: "down", target: 50, noise: 0.05 }] });
+			await z.tool("climb_scorecard", { goal: "g-good-answers", metrics: [{ name: "score", cmd: "cat b.txt", dir: "up", target: 20, noise: 0.05 }] });
+			z.h.judge = "VERDICT: unmet\nUNMET: background reports were never checked\nNEXT: run the delivery bench on the kept commit";
+			await z.tool("climb_experiment", { goal: "g-fast-responses", lever: "halve", hypothesis: "", prediction: "" });
+			await run("echo 40 > a.txt && git commit -qam halve");
+			const out = await z.tool("climb_measure", { goal: "g-fast-responses" });
+			expect(out).toContain("THE INTENT IS NOT DONE");
+			expect(out).not.toContain("Next, g-good-answers");
+			const s = L.fold(L.read(d));
+			const next = X.nextAction(s, s.goals.get("g-make-it-fast-and")!);
+			expect(next).toContain("Next, g-fast-responses: [climb g-fast-responses] Every target is met, yet the goal is not achieved");
+			expect(next).toContain("run the delivery bench on the kept commit");
+			expect(next).not.toContain("metric furthest from target");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("updates", () => {
