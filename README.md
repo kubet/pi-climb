@@ -35,6 +35,7 @@ Requires a git repo with at least one commit.
 /climb pause | resume  stop/restart heartbeats and stop-blocking; resume also un-sticks a STUCK goal
 /climb done [goal]     close a goal (a split goal closes its open parts too)
 /climb export [path]   write the evidence export (default .climb/export.json)
+/climb panel           .climb/panel.html: goal tree, metrics vs targets, every experiment, knowledge, time (open in a browser)
 ```
 
 The agent drives the loop through tools:
@@ -61,6 +62,7 @@ CLIMB_SINK='cat >> ~/climb.log'                  omp   # anything else: shell co
 
 Other extensions can subscribe with `pi.events.on("climb", …)`.
 
+- **Panel:** `.climb/panel.html` is rewritten with the export after every decision: the goal tree with progress, each metric from baseline toward target with its trend and noise, every experiment with what it measured against its noise and why it was decided, recorded knowledge, and where the time went. Self-contained; light and dark.
 - **Evidence export:** `.climb/export.json` (schema `climb.export/1`) is rewritten after every decision, in the benchmaxx evidence shape: one row per decided experiment and scorecard metric, with `record_id`, `metric_id`, unit, direction, before/after medians and `raw_before`/`raw_after` runs, sample counts, `baseline_commit`/`candidate_commit`, the measured noise, the `qualification` actually earned (`statistical_win`, kept, by proof, limits), the `correctness` gate, the instrument hash, the environment hash and evidence pointers. Around the rows: the goal tree, all recorded knowledge and independent diagnoses, provenance (`source_ledger_sha256`) and the rules the rows follow. Every card records the instrument (a hash over its commands and frozen files) and the machine; every run records load and free memory.
 
 ## Develop

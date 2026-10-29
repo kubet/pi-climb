@@ -871,6 +871,10 @@ describe("evidence and export", () => {
 		expect(win.qualification).toMatchObject({ statistical_win: true, kept: true, by_proof: false });
 		expect(win.baseline_commit).toMatch(/^[0-9a-f]{40}$/);
 		expect(loss).toMatchObject({ record_id: "g-shrink-work/x2", verdict: "dropped", qualification: { statistical_win: false } });
+		const page = fs.readFileSync(path.join(d, ".climb/panel.html"), "utf8");
+		expect(page).toContain("g-shrink-work/x1");
+		expect(page).toContain("<svg class=\"spark\"");
+		expect(page).toContain("Where the time went");
 		await z.cmd(`export ${path.join(d, "out.json")}`);
 		expect(z.notes.at(-1)).toContain("2 metric rows");
 		expect(JSON.parse(fs.readFileSync(path.join(d, "out.json"), "utf8")).source_ledger_sha256).toMatch(/^[0-9a-f]{64}$/);

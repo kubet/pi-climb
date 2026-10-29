@@ -44,6 +44,9 @@ export function median(xs: number[]): number {
 	return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
+/** Five significant digits: 41.666666666666664 reads as 41.667. */
+export const short = (v: number | undefined) => (v === undefined || !Number.isFinite(v) ? String(v) : String(Number(v.toPrecision(5))));
+
 export function regressions(metrics: Metric[], ref: Values, values: Values): Metric[] {
 	return metrics.filter(m => ref[m.name] !== undefined && values[m.name] !== undefined && gain(m, ref[m.name], values[m.name]) < -m.noise);
 }
@@ -51,7 +54,7 @@ export function regressions(metrics: Metric[], ref: Values, values: Values): Met
 export function verdict(metrics: Metric[], ref: Values, values: Values): { kept: boolean; regressed: boolean; reason: string } {
 	const fmt = (m: Metric) => {
 		const g = gain(m, ref[m.name], values[m.name]);
-		return `${m.name} ${ref[m.name]}→${values[m.name]} (${g >= 0 ? "+" : ""}${(g * 100).toFixed(1)}%)`;
+		return `${m.name} ${short(ref[m.name])}→${short(values[m.name])} (${g >= 0 ? "+" : ""}${(g * 100).toFixed(1)}%)`;
 	};
 	const regressed = regressions(metrics, ref, values);
 	if (regressed.length) return { kept: false, regressed: true, reason: `regressed: ${regressed.map(fmt).join(", ")}` };

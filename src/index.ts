@@ -17,6 +17,7 @@ import * as path from "node:path";
 import * as L from "./ledger";
 import * as X from "./logic";
 import * as E from "./export";
+import * as P from "./panel";
 import * as T from "./trace";
 
 const TICK_MS = 15_000;
@@ -495,6 +496,14 @@ export default async function climb(pi: ExtensionAPI) {
 			fs.renameSync(tmp, file);
 		} catch (e) {
 			pi.logger?.warn?.("climb export failed", { error: String(e) });
+		}
+		// The same evidence, readable: .climb/panel.html (open it in a browser).
+		try {
+			const page = path.join(root, L.DIR, "panel.html");
+			fs.writeFileSync(`${page}.${process.pid}.tmp`, P.render(load(root), out, efficiency(root)));
+			fs.renameSync(`${page}.${process.pid}.tmp`, page);
+		} catch (e) {
+			pi.logger?.warn?.("climb panel failed", { error: String(e) });
 		}
 		return { file, rows: out.metric_rows.length, findings: out.knowledge.length };
 	}
@@ -1358,7 +1367,7 @@ export default async function climb(pi: ExtensionAPI) {
 
 	pi.registerCommand("climb", {
 		description:
-			"Autonomous hill-climb. /climb <intent> [--beat 30m] [--poke-max 3] starts a goal · /climb shows progress · beat · judge [goal] · pause · resume · done [goal] · export [path] · compact",
+			"Autonomous hill-climb. /climb <intent> [--beat 30m] [--poke-max 3] starts a goal · /climb shows progress · beat · judge [goal] · pause · resume · done [goal] · export [path] · panel · compact",
 		handler: async (args, ctx) => {
 			ctxRef = ctx;
 			const root = await repoRoot(ctx.cwd);
@@ -1420,6 +1429,10 @@ export default async function climb(pi: ExtensionAPI) {
 				const now = refresh(ctx, root);
 				if (!L.active(now).length) stopTimer(ctx);
 				return ctx.ui.notify(`climb ${tree.map(x => x.id).join(", ")} closed (${won(g) ? "achieved" : "abandoned"})${up.length ? `; ${up.join(", ")} achieved` : ""}.`, "info");
+			}
+			if (words.length === 1 && sub === "panel") {
+				await writeExport(root);
+				return ctx.ui.notify(`climb panel: ${path.join(root, L.DIR, "panel.html")} (open it in a browser; it is rewritten after every decision)`, "info");
 			}
 			if (sub === "export" && words.length <= 2) {
 				const x = await writeExport(root, words[1] ? path.resolve(ctx.cwd, words[1]) : undefined);
