@@ -413,27 +413,33 @@ export default async function climb(pi: ExtensionAPI) {
 		}
 	}
 
-	// A proof is a fast deterministic check: it fails at the base and passes once the change works.
-	const PROOF_MS = 120_000;
-	async function proofRuns(root: string, cmd: string, goal: string, signal?: AbortSignal): Promise<{ passed: number; out: string; broken?: string }> {
+	// A proof is a deterministic check: it fails at the base and passes once the change works. Some replay a
+	// whole call (~100s), so the cap is the metric default; once its runtime is known, a proof that runs far
+	// longer than at registration has hung.
+	const PROOF_MS = 600_000;
+	const proofLimit = (proof: L.Proof) => (proof.ms ? Math.min(PROOF_MS, Math.max(120_000, 3 * proof.ms)) : PROOF_MS);
+	async function proofRuns(root: string, cmd: string, goal: string, signal?: AbortSignal, limit = PROOF_MS): Promise<{ passed: number; out: string; broken?: string; ms: number }> {
 		let passed = 0;
 		let out = "";
 		let broken: string | undefined; // the check could not run at all: timed out, or its command is missing
+		let ms = 0;
 		try {
 			for (let i = 0; i < 2; i++) {
-				const r = await run(root, cmd, PROOF_MS, { phase: "proof", goal }, signal);
+				const t0 = performance.now();
+				const r = await run(root, cmd, limit, { phase: "proof", goal }, signal);
+				ms = Math.max(ms, Math.round(performance.now() - t0));
 				if (signal?.aborted) throw new Error("Proof interrupted; nothing was decided.");
 				if (r.code === 0) passed++;
 				else {
 					out = said(r);
-					if (r.killed) broken = `timed out after ${PROOF_MS / 1000}s`;
+					if (r.killed) broken = `timed out after ${limit / 1000}s`;
 					else if (r.code === 126 || r.code === 127) broken = `could not start (exit ${r.code}): ${out}`;
 				}
 			}
 		} finally {
 			await restore(root);
 		}
-		return { passed, out, broken };
+		return { passed, out, broken, ms };
 	}
 
 	async function hashes(root: string, files: string[]): Promise<Record<string, string>> {
@@ -1290,7 +1296,7 @@ export default async function climb(pi: ExtensionAPI) {
 			prediction: S.str("Expected movement, e.g. 'runtime_ms -60%'"),
 			proof: S.opt(
 				S.str(
-					"Optional fast check (<120s, deterministic) that fails now and passes (exit 0) once the change works: a regression test or a replay of the defect, e.g. 'bun test test/handoff.test.ts' or 'test \"$(bun bench/replay.ts)\" -eq 0'. Write it before registering; it must fail here and its scripts must stay unchanged. With it passing and no metric regressed, the experiment is kept even if nothing moved beyond noise. A measured gain is kept even while the proof still fails (partial progress), and the result says the claimed fix is not complete.",
+					"Optional deterministic check (seconds ideally; at most 10 minutes) that fails now and passes (exit 0) once the change works: a regression test or a replay of the defect, e.g. 'bun test test/handoff.test.ts' or 'test \"$(bun bench/replay.ts)\" -eq 0'. Write it before registering; it must fail here and its scripts must stay unchanged. With it passing and no metric regressed, the experiment is kept even if nothing moved beyond noise. A measured gain is kept even while the proof still fails (partial progress), and the result says the claimed fix is not complete.",
 				),
 			),
 		}),
@@ -1344,7 +1350,7 @@ export default async function climb(pi: ExtensionAPI) {
 				if (missing.length) throw new Error(`The proof runs ${missing.join(", ")}, which does not exist yet. Write the failing check first, then register.`);
 				say("proof must fail at base");
 				const pr = await proofRuns(root, p.proof, g.id, signal);
-				if (pr.broken) throw new Error(`The proof ${pr.broken}: a proof must be a fast check that runs here and fails for the defect's reason.`);
+				if (pr.broken) throw new Error(`The proof ${pr.broken}: a proof must be a check that runs here and fails for the defect's reason.`);
 				if (pr.passed) throw new Error(`The proof passed ${pr.passed}/2 runs at ${base.slice(0, 8)}: it must fail before the change, or it proves nothing.`);
 				const files = new Set([...(await git(root, "ls-files", "--cached", "--others", "--exclude-standard")).stdout.split("\n").filter(Boolean)]);
 				const scripts = [...new Set([...X.instrumentFiles(p.proof, files).filter(f => !f.endsWith("/")), ...X.scriptPaths(p.proof)])];
@@ -1352,7 +1358,7 @@ export default async function climb(pi: ExtensionAPI) {
 				// the worker could edit the check until it passes.
 				if (!scripts.length && X.indirectRunner(p.proof))
 					throw new Error("Name the check's file in the proof (e.g. 'bun test test/x.test.ts' or 'pytest tests/t.py::case') so it can be frozen; a runner that discovers its own tests freezes nothing.");
-				proof = { cmd: p.proof, files: await hashes(root, scripts) };
+				proof = { cmd: p.proof, files: await hashes(root, scripts), ms: pr.ms };
 				// A git-ignored check is neither versioned nor restorable: if it disappears, the proof is void.
 				if (scripts.length) ignoredProof = (await git(root, "check-ignore", ...scripts)).stdout.split("\n").filter(Boolean);
 			}
@@ -1523,7 +1529,7 @@ export default async function climb(pi: ExtensionAPI) {
 					gates.proof = edited.length ? "void" : "fail";
 					if (!failed) {
 						say("proof");
-						const pr = await proofRuns(root, exp.proof.cmd, g.id, signal);
+						const pr = await proofRuns(root, exp.proof.cmd, g.id, signal, proofLimit(exp.proof));
 						// A check that cannot run is not evidence against the change: decide nothing.
 						if (pr.broken) throw new Error(`The proof ${pr.broken}; nothing was decided and ${exp.id} stays open. Free the machine or fix the environment, then climb_measure again (or abandon).`);
 						if (pr.passed < 2) failed = `proof still fails (${pr.passed}/2 runs passed): ${pr.out}`;

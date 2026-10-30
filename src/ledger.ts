@@ -59,6 +59,8 @@ export interface Gates { guard: "pass" | "fail" | "none"; instrument: "same" | "
 export interface Proof {
 	cmd: string;
 	files: Record<string, string>;
+	/** Its slowest run at registration: a run far longer than that at measurement has hung. */
+	ms?: number;
 }
 export interface ExpE extends Base {
 	kind: "exp";

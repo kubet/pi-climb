@@ -575,6 +575,8 @@ describe("lessons from a live run", () => {
 		const reg = await z.tool("climb_experiment", { lever: "fix", hypothesis: "the bug", prediction: "work_left unchanged; fixed", proof: "bash checks/fixed.sh" });
 		expect(reg).toContain("The proof fails here");
 		expect(reg).not.toContain("git-ignored");
+		// Its runtime is kept: at measurement a run far longer than at registration has hung.
+		expect((L.read(d).filter(e => e.kind === "exp").at(-1) as L.ExpE).proof?.ms).toBeGreaterThanOrEqual(0);
 		expect((await z.emit("tool_call", { toolName: "write", input: { path: path.join(d, "checks/fixed.sh"), content: "true" } }))?.block).toBe(true);
 		await run("echo yes > fixed.txt && git add fixed.txt && git commit -qm fix");
 		const out = await z.tool("climb_measure", {});
