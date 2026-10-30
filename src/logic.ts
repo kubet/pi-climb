@@ -102,7 +102,9 @@ export function pairedVerdict(metrics: Metric[], pairs: Record<string, [number, 
 	}
 	const fmt = (k: string) => `${k} ${stats[k].gain >= 0 ? "+" : ""}${(stats[k].gain * 100).toFixed(1)}% ±${(stats[k].noise * 100).toFixed(1)}%${stats[k].n ? "" : " (unpaired)"}`;
 	const names = Object.keys(stats);
-	const regressed = names.filter(k => stats[k].gain < -stats[k].noise);
+	// A hold tolerates what its scorecard set; pairs only make the call surer, never stricter than that.
+	const tolerance = (k: string) => Math.max(stats[k].noise, metrics.find(m => m.name === k)?.hold ? (metrics.find(m => m.name === k)?.noise ?? 0) : 0);
+	const regressed = names.filter(k => stats[k].gain < -tolerance(k));
 	const improved = metrics.filter(m => !m.hold && stats[m.name] && stats[m.name].gain > stats[m.name].noise).map(m => m.name);
 	const head = `paired with the base, interleaved (${Math.max(...names.map(k => stats[k].n))} pairs for ${names.filter(k => stats[k].n).join(", ")})`;
 	if (regressed.length) return { kept: false, regressed: true, reason: `regressed, ${head}: ${regressed.map(fmt).join(", ")}`, stats };
@@ -172,7 +174,7 @@ export const reached = (g: Goal) => !!g.card && !g.done && g.card.metrics.some(m
 /** Held open by the acceptance review with every target met (or every part achieved): what the review
  *  found missing is all that is left. A split goal's old scorecard is history. Or every target is met
  *  and only a confirmation is missing. */
-const finishing = (st: State, g: Goal) => !umbrella(st, g) && !g.done && !g.open && (!!g.reviewed || reached(g));
+const finishing = (st: State, g: Goal) => !umbrella(st, g) && !g.done && !g.open && (!!g.reviewed || (reached(g) && !parts(st, g).length));
 
 /** "1/3": parts achieved of those still counted (abandoned parts are not). */
 const partsDone = (st: State, g: Goal) => {
@@ -299,7 +301,7 @@ export function nextAction(st: State, g: Goal): string {
 		return `[climb ${g.id}] Split into parts: ${list}. Next, ${next.id}: ${nextAction(st, next)}`;
 	}
 	if (finishing(st, g) && !g.reviewed)
-		return `[climb ${g.id}] Every target is met, yet ${g.id} is not closed${tag}: the re-measurement at closure did not confirm it, or a hold metric looked regressed since its scorecard. Restore any regression, then confirm: climb_scorecard with the same checks (measured again at HEAD; a check that already passes is welcome there, and once every metric meets its target the acceptance review is asked).`;
+		return `[climb ${g.id}] Every target is met, yet ${g.id} is not closed${tag}: the re-measurement at closure did not confirm it, or a hold metric looked regressed since its scorecard. Restore any regression, then confirm: climb_scorecard with the same checks (measured again at HEAD; a check that already passes is welcome there, and once every metric meets its target the acceptance review is asked; one that comes out short is re-baselined there, and the climb goes on with climb_experiment).`;
 	if (finishing(st, g)) {
 		// The review's finding, not a later note (the worker's own included), says what is left.
 		const r = g.reviewed!;

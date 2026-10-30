@@ -417,7 +417,8 @@ export default async function climb(pi: ExtensionAPI) {
 	// whole call (~100s), so the cap is the metric default; once its runtime is known, a proof that runs far
 	// longer than at registration has hung.
 	const PROOF_MS = 600_000;
-	const proofLimit = (proof: L.Proof) => (proof.ms ? Math.min(PROOF_MS, Math.max(120_000, 3 * proof.ms)) : PROOF_MS);
+	// Its runtime at registration is a failing run, and passing can take longer: 5 minutes at least.
+	const proofLimit = (proof: L.Proof) => (proof.ms ? Math.min(PROOF_MS, Math.max(300_000, 3 * proof.ms)) : PROOF_MS);
 	async function proofRuns(root: string, cmd: string, goal: string, signal?: AbortSignal, limit = PROOF_MS): Promise<{ passed: number; out: string; broken?: string; ms: number }> {
 		let passed = 0;
 		let out = "";
@@ -434,6 +435,7 @@ export default async function climb(pi: ExtensionAPI) {
 					out = said(r);
 					if (r.killed) broken = `timed out after ${limit / 1000}s`;
 					else if (r.code === 126 || r.code === 127) broken = `could not start (exit ${r.code}): ${out}`;
+					if (broken) break; // a second try of a check that hung or cannot start only doubles the wait
 				}
 			}
 		} finally {
@@ -567,11 +569,12 @@ export default async function climb(pi: ExtensionAPI) {
 
 	const load = (root: string) => L.fold(L.read(root));
 
-	function pick(st: L.State, id?: string, pred?: (g: L.Goal) => boolean): L.Goal {
+	function pick(st: L.State, id?: string, pred?: (g: L.Goal) => boolean, exact = false): L.Goal {
 		const goals = L.active(st);
 		if (id) {
-			// Ids are cut slugs, so a worker often shortens or completes one: a single open match is meant.
-			const near = goals.filter(x => x.id.startsWith(id) || id.startsWith(x.id));
+			// A worker often shortens a goal id: one open goal starting with it is meant. Never a longer id,
+			// which could name an ancestor (a part's slug extends its parent's).
+			const near = exact ? [] : goals.filter(x => x.id.startsWith(id));
 			const g = st.goals.get(id) ?? (near.length === 1 ? near[0] : undefined);
 			if (g && !g.done) return g;
 			const home = g?.parent ? st.goals.get(g.parent) : undefined;
@@ -635,7 +638,7 @@ export default async function climb(pi: ExtensionAPI) {
 		if (typeof pairs === "string") return `${raw} looks regressed, and the paired check could not finish (${pairs})`;
 		if (!pairs) return `${raw} looks regressed (the scorecard's commit could not be measured alongside)`;
 		const pv = X.pairedVerdict(looks, pairs);
-		return looks.some(m => pv.stats[m.name] && pv.stats[m.name].gain < -pv.stats[m.name].noise) ? `${raw} regressed since the scorecard (${pv.reason})` : undefined;
+		return pv.regressed ? `${raw} regressed beyond its tolerance since the scorecard (${pv.reason})` : undefined;
 	}
 	const unmetText = (u: { unmet: string; next: string }) =>
 		`EVERY TARGET MET, BUT THE INTENT IS NOT DONE (acceptance review): ${u.unmet}\nNEXT: ${u.next}. Put what is missing on the scorecard next to the current metrics (climb_scorecard; a check that already passes is welcome: when every metric meets its target there, the review is asked again).`;
@@ -1099,8 +1102,12 @@ export default async function climb(pi: ExtensionAPI) {
 			// The review is asked about the whole goal: what the held card met must still be on the card, and still met.
 			// Every target met but not closed (a re-measurement missed, or a hold looked regressed): the same checks confirm it.
 			const confirming = !!g.reviewed || (X.reached(g) && !L.parts(st0, g).length);
-			const held = confirming && g.card && !L.parts(st0, g).length ? g.card : undefined;
-			const dropped = held?.metrics.filter(o => !p.metrics!.some(m => m.name === o.name && m.cmd === o.cmd)) ?? [];
+			const prior = confirming && g.card && !L.parts(st0, g).length ? g.card : undefined;
+			// Only a review hold pins the old metrics (the review is asked about the whole goal); a goal that
+			// only awaits confirmation may change its checks, and those it keeps must still be met.
+			const kept = (o: L.Metric) => p.metrics!.some(m => m.name === o.name && m.cmd === o.cmd);
+			const held = prior && { ...prior, metrics: prior.metrics.filter(kept) };
+			const dropped = g.reviewed ? (prior?.metrics.filter(o => !kept(o)) ?? []) : [];
 			if (dropped.length)
 				throw new Error(`Keep ${dropped.map(m => m.name).join(", ")} on the scorecard (same command; hold: true is fine): the acceptance review is asked about the whole goal, so what was met must be shown still met at HEAD.`);
 			if (p.metrics.every(m => m.hold))
@@ -1174,7 +1181,9 @@ export default async function climb(pi: ExtensionAPI) {
 				const fix = capped
 					? `${worst} repeats exactly as the worst value: if it is a cap or a penalty for a failed case, more samples will not steady it. Count those failures in a metric of their own (target 0) and measure the rest without the penalty.`
 					: `${s && s > m.samples ? `Samples: ${s} brings it to ${pct(X.noiseOf(xs, m.baseline, s))}${cost ? ` (${cost})` : ""}` : "More samples will not fix it"}; or steady the command (fixed inputs, warm-up, no sentinel penalties).`;
-				if (m.noise >= way)
+				// A goal confirming a target it met before re-baselines a near miss (it climbs on), it is not refused.
+				const again = confirming && prior?.metrics.some(o => o.name === m.name && o.cmd === m.cmd && o.target === m.target);
+				if (m.noise >= way && !again)
 					return { problem: `${m.name}: noise ${pct(m.noise)} (${aa}) is as large as the whole way to the target (${pct(way)}), so no result could be told apart from luck. ${fix}` };
 				if (m.noise > way / 3) return { warning: `${m.name}: each kept step must beat ${pct(m.noise)}, ${Math.round((m.noise / way) * 100)}% of the way to target (${aa}). ${fix}` };
 				return {};
@@ -1565,12 +1574,18 @@ export default async function climb(pi: ExtensionAPI) {
 			let closedUp: string[] = [];
 			let slid: string | undefined;
 			if (won) {
-				// "Done" is never claimed from a single draw: confirm with fresh samples.
-				const c = await measure(root, g.card.metrics, { phase: "confirm", goal: g.id }, signal, samples, t => say(t && `confirming targets ${t}`));
-				won = !c.errors.length && targetsMet(c.values);
-				if (won) slid = await holdsSlid(root, g.card, c.values, g.id, signal, say);
+				// "Done" is never claimed from a single draw: confirm with fresh samples. The result above is
+				// already recorded: a closing check that is interrupted leaves the goal open to confirm later.
+				let c: Awaited<ReturnType<typeof measure>> | undefined;
+				try {
+					c = await measure(root, g.card.metrics, { phase: "confirm", goal: g.id }, signal, samples, t => say(t && `confirming targets ${t}`));
+					won = !c.errors.length && targetsMet(c.values);
+					if (won) slid = await holdsSlid(root, g.card, c.values, g.id, signal, say);
+				} catch (e) {
+					slid = `the closing check did not finish (${String(e).slice(0, 160)})`;
+				}
 				won &&= !slid;
-				if (won) {
+				if (won && c) {
 					say("acceptance review: is the intent met, not just the scorecard?");
 					({ unmet, closedUp } = await accept(ctx, root, g, c.values));
 					won = !unmet;
@@ -1735,7 +1750,7 @@ export default async function climb(pi: ExtensionAPI) {
 			const st = load(root);
 			const one = (id?: string) => {
 				try {
-					return pick(st, id);
+					return pick(st, id, undefined, true);
 				} catch (e) {
 					ctx.ui.notify((e as Error).message, "error");
 					return undefined;

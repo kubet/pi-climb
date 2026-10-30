@@ -1270,10 +1270,83 @@ describe("acceptance review", () => {
 			const s = L.fold(L.read(d));
 			expect(X.reached(s.goals.get(id)!)).toBe(true);
 			expect(X.nextAction(s, s.goals.get(id)!)).toContain("Every target is met, yet g-shrink-work is not closed");
-			await expect(z.tool("climb_scorecard", { metrics: [w, hold] })).rejects.toThrow("h 100→120 regressed since the scorecard");
+			await expect(z.tool("climb_scorecard", { metrics: [w, hold] })).rejects.toThrow("h 100→120 regressed beyond its tolerance since the scorecard");
 			await run("echo 100 > h.txt && git commit -qam restore");
 			z.h.judge = "VERDICT: achieved\nUNMET: none\nNEXT: none";
 			expect(await z.tool("climb_scorecard", { metrics: [w, hold] })).toContain("GOAL ACHIEVED: g-shrink-work");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
+	test("a hold regressed within its own tolerance, then pushed over by drift at closure, does not keep the goal open", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-hold-tol-"));
+		const ctr = path.join(d, ".git", "ctr");
+		const thr = path.join(d, ".git", "thr");
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		const h = `n=$(cat ${ctr} 2>/dev/null || echo 0); echo $((n+1)) > ${ctr}; v=$(cat h.txt); [ $n -lt $(cat ${thr}) ] && echo $v || echo $((v*110/100))`;
+		try {
+			await run(`git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo 1000 > h.txt && git add -A && git commit -qm init && echo 99999 > ${thr}`);
+			const z = host(d, "main", "hold-tol");
+			await z.load();
+			await z.cmd("shrink work");
+			await z.tool("climb_scorecard", { metrics: [{ name: "w", cmd: "cat work.txt", dir: "down", target: 50, noise: 0.05 }, { name: "h", cmd: h, dir: "down", hold: true, noise: 0.08 }] });
+			await z.tool("climb_experiment", { lever: "halve", hypothesis: "", prediction: "" });
+			// A real 3% hold regression (inside its 8% tolerance); the machine slows 10% from the confirmation on.
+			await run(`echo $(( $(cat ${ctr}) + 1 )) > ${thr} && echo 40 > work.txt && echo 1030 > h.txt && git commit -qam halve`);
+			z.h.judge = "VERDICT: achieved\nUNMET: none\nNEXT: none";
+			expect(await z.tool("climb_measure", {})).toContain("GOAL ACHIEVED: g-shrink-work");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
+	test("confirming a target met once that comes out just short at HEAD re-baselines it, and the climb goes on", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-near-miss-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "near-miss");
+			await z.load();
+			await z.cmd("shrink work");
+			const w = { name: "w", cmd: "cat work.txt", dir: "down", target: 50, noise: 0.05 };
+			await z.tool("climb_scorecard", { metrics: [w] });
+			const id = "g-shrink-work";
+			const base = (await run("git rev-parse HEAD")).stdout.trim();
+			// The kept draw read 49; HEAD is really 51.
+			await run("echo 51 > work.txt && git commit -qam step");
+			const headSha = (await run("git rev-parse HEAD")).stdout.trim();
+			L.append(
+				d,
+				{ ts: L.now(), kind: "exp", goal: id, id: "x1", lever: "halve", hypothesis: "", prediction: "", base, ref: { w: 100 } },
+				{ ts: L.now(), kind: "result", goal: id, exp: "x1", head: headSha, values: { w: 49 }, verdict: "kept", reason: "w 100→49" },
+			);
+			expect(X.nextAction(L.fold(L.read(d)), L.fold(L.read(d)).goals.get(id)!)).toContain("climb_scorecard with the same checks");
+			expect(await z.tool("climb_scorecard", { metrics: [w] })).toContain("climb_experiment");
+			const s = L.fold(L.read(d));
+			expect(X.reached(s.goals.get(id)!)).toBe(false);
+			expect(X.nextAction(s, s.goals.get(id)!)).toContain("Keep climbing");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
+	test("/climb done needs a goal's exact id: a near miss never resolves to a parent", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-done-exact-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > a.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "done-exact");
+			await z.load();
+			await z.cmd("reduce latency");
+			await z.tool("climb_split", { parts: [{ intent: "reduce latency of search" }, { intent: "reduce latency of tts" }] });
+			const ids = [...L.fold(L.read(d)).goals.keys()];
+			const search = ids.find(i => i.includes("search"))!;
+			await z.cmd(`done ${search}`);
+			await z.cmd(`done ${search.slice(0, -3)}`);
+			const s = L.fold(L.read(d));
+			expect([...s.goals.values()].filter(g => !g.done).map(g => g.id).sort()).toEqual(ids.filter(i => i !== search).sort());
+			expect(z.notes.at(-1)).toContain("No active goal");
 		} finally {
 			fs.rmSync(d, { recursive: true, force: true });
 		}
