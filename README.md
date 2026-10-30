@@ -1,4 +1,4 @@
-# pi-climb — `/climb`
+# /climb
 
 <p align="center"><img src="assets/climb.svg" alt="/climb: a little pi climbs a mountain — probe, scorecard, experiment, measure; kept steps go up, dropped ones are reverted; the summit is achieved and reviewed" width="860"></p>
 
