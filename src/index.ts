@@ -1080,7 +1080,10 @@ export default async function climb(pi: ExtensionAPI) {
 						: "At least one metric must have a target to climb; hold metrics only guard.",
 				);
 			const d = await dirty(root);
-			if (d) throw new Error(`Working tree is dirty; commit or stash first so baselines are measured on a commit:\n${d}`);
+			if (d)
+				throw new Error(
+					`Working tree is dirty; commit or stash first so baselines are measured on a commit:\n${d}\nIf these changes are not this climb's (another session's or the user's work), leave them: the climb needs a checkout of its own. Create a clean worktree (git worktree add <path> HEAD) and ask the user to run /climb move <path>, then restart omp there.`,
+				);
 			const metrics: L.Metric[] = p.metrics.map(m => ({
 				name: m.name,
 				cmd: m.cmd,
@@ -1683,7 +1686,7 @@ export default async function climb(pi: ExtensionAPI) {
 
 	pi.registerCommand("climb", {
 		description:
-			"Autonomous hill-climb. /climb <intent> [--beat 30m] [--poke-max 3] starts a goal · /climb shows progress · beat · judge [goal] · pause · resume · done [goal] · export [path] · panel · compact",
+			"Autonomous hill-climb. /climb <intent> [--beat 30m] [--poke-max 3] starts a goal · /climb shows progress · beat · judge [goal] · pause · resume · done [goal] · export [path] · panel · move <path> · compact",
 		handler: async (args, ctx) => {
 			ctxRef = ctx;
 			const root = await repoRoot(ctx.cwd);
@@ -1754,6 +1757,23 @@ export default async function climb(pi: ExtensionAPI) {
 				const x = await writeExport(root, words[1] ? path.resolve(ctx.cwd, words[1]) : undefined);
 				return ctx.ui.notify(`climb export: ${x.file} (${x.rows} metric rows, ${x.findings} findings; schema ${E.SCHEMA})`, "info");
 			}
+			// A climb follows its checkout: carry the ledger to a clean worktree when this one is shared or dirty.
+			if (sub === "move" && words.length === 2) {
+				const dest = await repoRoot(path.resolve(ctx.cwd, words[1].replace(/^~(?=\/|$)/, os.homedir())));
+				if (!dest) return ctx.ui.notify(`climb move: ${words[1]} is not a git checkout.`, "error");
+				if (dest === root) return ctx.ui.notify("climb move: that is this checkout.", "error");
+				if (L.read(dest).length) return ctx.ui.notify(`climb move: ${dest} already has a climb ledger (${path.join(dest, L.DIR)}); move it aside first.`, "error");
+				const d = await dirty(dest);
+				if (d) return ctx.ui.notify(`climb move: ${dest} has uncommitted changes; the climb needs a clean checkout:\n${d}`, "error");
+				fs.mkdirSync(path.join(dest, L.DIR), { recursive: true });
+				for (const f of ["oracle.jsonl", "trace.jsonl"]) if (fs.existsSync(path.join(root, L.DIR, f))) fs.copyFileSync(path.join(root, L.DIR, f), path.join(dest, L.DIR, f));
+				await ensureExcluded(dest);
+				// This copy rests: no heartbeats or stop-blocking here once the climb lives there.
+				append(root, { ts: L.now(), kind: "pause", goal: "*" });
+				stopTimer(ctx);
+				refresh(ctx, root);
+				return ctx.ui.notify(`climb moved to ${dest} (this checkout's copy is paused). Now: /exit, then cd ${dest} && omp, then /climb resume.`, "info");
+			}
 			if (words.length === 1 && sub === "compact") {
 				const before = L.read(root);
 				const after = L.compact(before);
@@ -1788,6 +1808,10 @@ export default async function climb(pi: ExtensionAPI) {
 			ensureTimer(ctx);
 			const g = refresh(ctx, root).goals.get(id)!;
 			ctx.ui.notify(`climb ${id} started · heartbeat every ${Math.round(beat_s / 60) || `${beat_s}s`}${beat_s >= 60 ? "m" : ""} · judge after ${poke_max} stale beats`, "info");
+			// Said on day one, not after hours of refused scorecards: climb measures commits and reverts drops here.
+			const d = await dirty(root);
+			if (d)
+				ctx.ui.notify(`climb: this checkout has uncommitted changes (${d.split("\n").length} files). If they are not this goal's, give the climb its own checkout: git worktree add <path> HEAD, then /climb move <path>.`, "warning");
 			pi.sendUserMessage(X.researchBrief(g));
 			await started(ctx);
 		},

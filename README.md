@@ -23,7 +23,7 @@ omp plugin install github:kubet/pi-goal                          # once public
 omp install /path/to/pi-goal                                     # local checkout (link)
 ```
 
-Requires a git repo with at least one commit. A running session keeps the code it started with; when a newer climb is installed it says so once and the status line shows "↻ restart omp to update climb". The climb resumes from its ledger after `/exit` and `omp -c`.
+Requires a git repo with at least one commit. Climb measures commits and reverts dropped experiments, so it needs a checkout without other uncommitted work: when the checkout is shared, `git worktree add <path> HEAD` and `/climb move <path>`, then run omp there. A running session keeps the code it started with; when a newer climb is installed it says so once and the status line shows "↻ restart omp to update climb". The climb resumes from its ledger after `/exit` and `omp -c`.
 
 ## Use
 
@@ -36,6 +36,7 @@ Requires a git repo with at least one commit. A running session keeps the code i
 /climb done [goal]     close a goal (a split goal closes its open parts too)
 /climb export [path]   write the evidence export (default .climb/export.json)
 /climb panel           .climb/panel.html: goal tree, metrics vs targets, every experiment, knowledge, time (open in a browser)
+/climb move <path>     carry the climb to another (clean) checkout, e.g. a worktree when this one holds other work
 ```
 
 The agent drives the loop through tools:

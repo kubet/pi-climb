@@ -1046,6 +1046,37 @@ describe("paired measurement, crashed", () => {
 	});
 });
 
+describe("move", () => {
+	test("a climb in a shared, dirty checkout says so on day one and moves to a clean worktree with its ledger", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-move-"));
+		const wt = `${d}-wt`;
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo a > other.txt && git add -A && git commit -qm init && echo edited > other.txt");
+			const z = host(d, "main", "move");
+			await z.load();
+			await z.cmd("shrink work");
+			expect(z.notes.some(n => n.includes("uncommitted changes (1 files)") && n.includes("/climb move"))).toBe(true);
+			await expect(z.tool("climb_scorecard", { metrics: [{ name: "w", cmd: "cat work.txt", dir: "down", target: 50 }] })).rejects.toThrow("/climb move <path>");
+			await run(`git worktree add -q ${wt} HEAD`);
+			await z.cmd(`move ${wt}`);
+			expect(z.notes.at(-1)).toContain(`climb moved to ${fs.realpathSync(wt)}`);
+			expect(L.fold(L.read(d)).paused).toBe(true);
+			const there = L.fold(L.read(wt));
+			expect([...there.goals.keys()]).toEqual(["g-shrink-work"]);
+			expect(there.paused).toBeFalsy();
+			const y = host(wt, "main", "move-wt");
+			await y.load();
+			expect(await y.tool("climb_scorecard", { metrics: [{ name: "w", cmd: "cat work.txt", dir: "down", target: 50, noise: 0.05 }] })).toContain("Scorecard set");
+			expect(fs.readFileSync(path.join(d, "other.txt"), "utf8").trim()).toBe("edited");
+		} finally {
+			await run(`git worktree remove --force ${wt}`).catch(() => {});
+			fs.rmSync(wt, { recursive: true, force: true });
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("acceptance review", () => {
 	test("met targets do not close a goal whose intent has an unchecked requirement", async () => {
 		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-"));
