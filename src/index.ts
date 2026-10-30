@@ -570,7 +570,9 @@ export default async function climb(pi: ExtensionAPI) {
 	function pick(st: L.State, id?: string, pred?: (g: L.Goal) => boolean): L.Goal {
 		const goals = L.active(st);
 		if (id) {
-			const g = st.goals.get(id);
+			// Ids are cut slugs, so a worker often shortens or completes one: a single open match is meant.
+			const near = goals.filter(x => x.id.startsWith(id) || id.startsWith(x.id));
+			const g = st.goals.get(id) ?? (near.length === 1 ? near[0] : undefined);
 			if (g && !g.done) return g;
 			const home = g?.parent ? st.goals.get(g.parent) : undefined;
 			const reopen = g?.done && home && !home.done ? ` ${id} is closed (${g.done.result}); new work in its area is a new part: climb_split on ${home.id} with one part.` : g?.done ? ` ${id} is closed (${g.done.result}).` : "";

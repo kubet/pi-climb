@@ -1208,6 +1208,10 @@ describe("acceptance review", () => {
 			expect(fs.readFileSync(path.join(d, ".climb/panel.html"), "utf8")).toContain("✓ achieved · unreviewed");
 			const x = JSON.parse(fs.readFileSync(path.join(d, ".climb/export.json"), "utf8"));
 			expect(x.goals.find((g: { id: string }) => g.id === "g-fast-responses").unreviewed).toContain("side turn refused");
+			// A shortened id that matches one open goal is that goal; an ambiguous one is refused.
+			await z.tool("climb_learn", { goal: "g-good-ans", kind: "fact", text: "Answers are graded by hand." });
+			expect(L.read(d).filter(e => e.kind === "learn").at(-1)?.goal).toBe("g-good-answers");
+			await expect(z.tool("climb_learn", { goal: "g-", kind: "fact", text: "x" })).rejects.toThrow('No active goal "g-"');
 			// New work in a closed part's area goes in a new part, not into a sibling.
 			await expect(z.tool("climb_probe", { goal: "g-fast-responses", name: "p", cmd: "echo 1" })).rejects.toThrow(
 				"g-fast-responses is closed (achieved); new work in its area is a new part: climb_split on g-make-it-fast-and with one part.",
