@@ -131,6 +131,21 @@ describe("ledger fold", () => {
 		expect(X.nextAction(once, once.goals.get("g")!)).toContain("climb_scorecard with the same checks");
 	});
 
+	test("a part with every target met but not closed comes next, however deep it waits", () => {
+		const goal = (id: string, parent?: string): L.Entry => ({ ts: iso(9e6, nowMs), kind: "goal", goal: id, parent, intent: id, cfg: { poke_max: 3, beat_s: 1800 } });
+		const st = L.fold([
+			goal("r"),
+			goal("a", "r"),
+			goal("b", "r"),
+			goal("a1", "a"),
+			goal("a2", "a"),
+			{ ts: iso(4e6, nowMs), kind: "card", goal: "a1", metrics: [metric()] },
+			{ ts: iso(3e6, nowMs), kind: "exp", goal: "a1", id: "x1", lever: "c", hypothesis: "", prediction: "", base: "a", ref: { ms: 100 } },
+			{ ts: iso(2e6, nowMs), kind: "result", goal: "a1", exp: "x1", head: "b", values: { ms: 8 }, verdict: "kept", reason: "" },
+		]);
+		expect(X.nextAction(st, st.goals.get("r")!)).toContain("Next, a1: [climb a1] Every target is met, yet a1 is not closed");
+	});
+
 	test("a part achieved since the last beat is progress for the tree", () => {
 		const entries: L.Entry[] = [
 			{ ts: iso(9e6, nowMs), kind: "goal", goal: "r", intent: "voice", cfg: { poke_max: 3, beat_s: 1800 } },

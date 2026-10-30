@@ -293,7 +293,8 @@ export function nextAction(st: State, g: Goal): string {
 		return `[climb ${g.id}] STALLED: no progress in ${g.lastBeat?.stale ?? "several"} heartbeats. Stop and diagnose before experimenting: is the lever wrong, the metric broken/noisy, something blocked, or are you grid-searching one idea? Call climb_judge with an honest diagnosis and the next move; where an independent judge runs, its verdict releases the stall. State: ${umbrella(st, g) ? `split into ${openParts(st, g).map(p => p.id).join(", ")}` : cardSummary(g)}.`;
 	if (umbrella(st, g)) {
 		const ps = openParts(st, g);
-		const next = ps.find(p => openIn(st, p)) ?? ps.find(p => finishing(st, p)) ?? ps.find(p => !p.card && !umbrella(st, p)) ?? [...ps].sort((a, b) => goalPct(st, a) - goalPct(st, b))[0];
+		// Closing what is all but done is the cheapest win, wherever in the tree it waits.
+		const next = ps.find(p => openIn(st, p)) ?? ps.find(p => subtree(st, p).some(x => finishing(st, x))) ?? ps.find(p => !p.card && !umbrella(st, p)) ?? [...ps].sort((a, b) => goalPct(st, a) - goalPct(st, b))[0];
 		const list = ps.map(p => `${p.id} (${p.card || umbrella(st, p) ? `${goalPct(st, p)}%` : "researching"}${openIn(st, p) ? `, ${openIn(st, p)!.open!.id} open` : ""})`).join(", ");
 		return `[climb ${g.id}] Split into parts: ${list}. Next, ${next.id}: ${nextAction(st, next)}`;
 	}
