@@ -1399,6 +1399,25 @@ describe("acceptance review", () => {
 		}
 	});
 
+	test("a real-sized step under the noise is dropped with the sample count that would resolve it", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-near-miss-step-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "near-miss-step");
+			await z.load();
+			await z.cmd("shrink work");
+			await z.tool("climb_scorecard", { metrics: [{ name: "w", cmd: "cat work.txt", dir: "down", target: 20, noise: 0.2 }] });
+			await z.tool("climb_experiment", { lever: "trim", hypothesis: "", prediction: "" });
+			await run("echo 85 > work.txt && git commit -qam trim");
+			const out = await z.tool("climb_measure", {});
+			expect(out).toContain("DROPPED x1");
+			expect(out).toContain("w moved +15.0%, under its ±20.0% noise at 1 sample: a step this size shows at samples 3");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
 	test("a part the review holds open comes next, with what is missing, not a sibling's climb", async () => {
 		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-part-"));
 		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });

@@ -1532,6 +1532,20 @@ export default async function climb(pi: ExtensionAPI) {
 					noted += ` Note: the ${loadAfter > loadBefore ? "candidate" : "control"} ran under heavier load (${loadAfter} vs ${loadBefore} load average).`;
 				if (eff.notes.length) noted += ` Note: ${eff.notes.join("; ")}.`;
 				({ kept, reason } = v);
+				// A real-sized step under the noise is evidence of neither: say how many samples would resolve it
+				// (noise shrinks with the square root of the samples), or that the instrument needs steadying.
+				if (!kept && !v.regressed && !pairs)
+					for (const m of eff.metrics) {
+						const step = m.hold ? 0 : L.gain(m, exp.ref[m.name], values[m.name]);
+						if (!(step >= m.noise / 2 && step < m.noise)) continue;
+						const need = Math.ceil(m.samples * (m.noise / step) ** 2 * 1.5);
+						const one = T.runMs(traces, g.id, m.name);
+						const size = `${m.name} moved +${(step * 100).toFixed(1)}%, under its ±${(m.noise * 100).toFixed(1)}% noise at ${m.samples} sample${m.samples > 1 ? "s" : ""}`;
+						noted +=
+							need <= 9
+								? ` Note: ${size}: a step this size shows at samples ${need}${one ? ` (~${T.dur(one * need)} a measurement)` : ""}. If steps like this matter, re-score with climb_scorecard at that sample count.`
+								: ` Note: ${size}: even 9 samples would not resolve a step this size; steady the instrument (fixed inputs, fewer moving parts) if steps like this matter.`;
+					}
 				// A registered proof is the experiment's own claim: it must hold for any keep, and
 				// when nothing regressed it keeps a fix the scorecard is too coarse to see.
 				if (!v.regressed && exp.proof) {
