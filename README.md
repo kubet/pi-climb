@@ -2,15 +2,27 @@
 
 <p align="center"><img src="assets/climb.svg" alt="/climb: a little pi climbs a mountain — probe, scorecard, experiment, measure; kept steps go up, dropped ones are reverted; the summit is achieved and reviewed" width="860"></p>
 
-Autonomous hill-climbing for [omp](https://github.com/can1357/oh-my-pi) and pi. You say what should get better. The agent picks metrics and targets, then keeps trying changes until the targets are met.
+Autonomous hill-climbing for pi-based coding agents: [pi](https://github.com/badlogic/pi-mono) and [omp](https://github.com/can1357/oh-my-pi). You say what should get better. The agent picks metrics and targets, then keeps trying changes until the targets are met.
 
 The agent writes the code. The extension measures, decides and keeps the record, so the agent cannot grade its own work or quit early.
 
 ## Install
 
+**pi**
+
+```bash
+pi install git:github.com/kubet/pi-climb
+```
+
+**omp**
+
 ```bash
 omp plugin install git+ssh://git@github.com/kubet/pi-climb.git
 ```
+
+From a local checkout: `pi install ./pi-climb` or `omp install ./pi-climb`.
+
+On omp, a stop hook keeps the agent working and the judge and acceptance review run as independent side turns. pi has neither, so there the heartbeat drives the loop, the agent's own diagnosis stands in for the judge, and achieved goals are marked unreviewed.
 
 Needs a git repo with at least one commit, and a checkout with no other uncommitted work. If the checkout is shared, give the climb its own worktree: `git worktree add ../climb HEAD`, then `/climb move ../climb`.
 
@@ -25,7 +37,7 @@ Needs a git repo with at least one commit, and a checkout with no other uncommit
 /climb move <path>                   carry the climb to another checkout
 ```
 
-After a restart, `omp -c` picks the climb up from its ledger.
+After a restart, continuing the session (`pi -c`, `omp -c`) picks the climb up from its ledger.
 
 ## What happens
 
