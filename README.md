@@ -1,70 +1,82 @@
 # pi-goal — `/climb`
 
-Autonomous hill-climbing for [omp](https://github.com/can1357/oh-my-pi) and pi. You give an intent; the agent researches metrics, sets a scorecard, and climbs toward the targets until they are met or you stop it.
+Autonomous hill-climbing for [omp](https://github.com/can1357/oh-my-pi) and pi. You say what should get better. The agent picks metrics and targets, then keeps trying changes until the targets are met.
 
-The LLM is a stateless worker. The extension is the enforcer:
-
-- **Owns the ledger** (`.climb/oracle.jsonl`, git-excluded). The agent cannot edit it.
-- **Measures everything itself** on clean commits: baselines with an A/A run, a control at pre-registration, and the result after commit. Noise is measured for the decision itself (medians of `samples` runs), so more samples shrink it by √samples. A metric too noisy to ever show reaching its target is refused, with the sample count (and the time) that would fix it. Noise keeps being re-learned from every run of unchanged code, so drift and load the A/A missed raise it. Measuring never leaves the tree dirty, a failed run is retried once (a guard that only passes on the retry is reported as flaky), and an interrupted or crashed measurement decides nothing: the experiment stays open (`abandon` drops it). So does a candidate that fails the guard: a broken build is not evidence against its idea, so the work stays for the fix, and the failure shows the command's full output and names untracked files that took part in the run. A scorecard runs each metric once before its A/A, so a broken command fails in one run. A tree measured in the last 30 minutes (a rejected scorecard, the base restored by a revert) is not measured again.
-- **Decides** kept/dropped. Borderline results, and metrics whose run history shows drift, are re-decided on interleaved pairs: the base commit is checked out in a throwaway worktree outside the repo and measured alternately with the candidate (A B, B A, ...), so drift between the two sides cancels; the decision uses the median paired gain with Student's t over at least 3 pairs. Only the uncertain metrics are paired. The worktree links untracked data, dependencies and env files, never build outputs or mutable environments (`.venv`), and refuses to pair when a dependency links back into the repo's code; then it falls back to re-measuring. Outside commits that look like regressions get the same paired check before being refused. Dropped experiments are reverted with a revert commit. "Achieved" is confirmed with a second measurement, then checked by an independent acceptance review against the goal's intent: a scorecard can be met while a requirement of the intent never made it onto it, and then the goal stays open with the missing requirement as the next step. That requirement can go on the scorecard next to the metrics the review saw met (which must still meet their targets at HEAD), even when it already passes: once every metric meets its target there, the review is asked again. Only the review releases a goal it held (one that cannot run keeps it open); a review that cannot run on a goal it never held (no independent judge on the host, or the side turn fails) lets the goal close, marked unreviewed in the result, the report, the panel and the export, never passed off as reviewed. A hold is not a stall verdict, so it never resets the stall, drop-streak or STUCK gates. A split goal the review holds can add a single part. Hold metrics guard; they never count as a gain, and they never hold a goal open on drift: at closure (and when a goal is confirmed again), a hold that looks regressed against its scorecard's baseline is measured in pairs against the scorecard's commit, and pairs never hold it to less than its own tolerance. A goal whose targets are all met but which did not close (the confirmation missed, or a hold really regressed) comes next in its tree, with the same checks on a scorecard as the way to close it; a target that comes out just short there is re-baselined and climbed on.
-- **Proofs** for fixes the scorecard is too coarse to see: an experiment can carry a check that must fail at registration and pass after. A proof may replay a whole session (up to 10 minutes); at measurement it gets three times its registration runtime (at least 5 minutes) before it counts as hung, and a hung proof is not run twice. With the proof passing and no metric regressed, the experiment is kept even if nothing moved beyond noise. A proof only adds keeps: a measured gain stands while the proof still fails (8 errors → 6 is progress toward 0), and the result says the claimed fix is not complete. A proof keep does not count as progress, so a run of fixes that never moves the scorecard still reaches the judge.
-- **Freezes the instrument**: an experiment that touches the bench or test scripts is dropped. Commits climb never measured cannot enter the baseline: the guard runs first (cheap refusal), then the control is compared against everything measured on the baseline tree, with a paired check before any refusal. Commits that only touch test sources or the proof's own scripts are adopted without a comparison.
-- **Never lets it quit** while a goal is open (`session_stop` block). An agent that keeps stopping without progress is rested and handed to the heartbeat.
-- **Heartbeat** every 30m audits the ledger: was anything kept since the last beat? It skips while the agent is busy and forces a check-in at 2× as a watchdog. After `poke-max` stale beats, an independent **judge** diagnoses the stall and redirects the agent. The judge is a side turn on the current model, outside the agent's history. The agent can record its own diagnosis, but only the judge or you clear a stall. A judge cut off by a restart or a hang (5 min) is re-run, never waited on forever.
-- **Focus**: at most 2 goals, 3 metrics per goal, and 1 open experiment. Three drops in a row summon the judge before the next try, and renaming the lever doesn't reset that.
-- **Decomposition**: `climb_split` turns a goal into 2-4 parts (two levels at most), each a goal with its own research, scorecard, experiments and knowledge. The parent climbs only through its parts and is achieved when every part is. One heartbeat, stall count and judge cover the whole tree, and a part's kept change that regresses a sibling's metric is caught at the sibling's next experiment.
-- **Knowledge**: `climb_learn` records facts, traps ("X looks like Y; check Z") and dead ends. They survive compaction and restarts, are repeated with the worker's next step, reach the judge, and flow to parts from their parents.
+The agent writes the code. The extension measures, decides and keeps the record, so the agent cannot grade its own work or quit early.
 
 ## Install
 
 ```bash
-omp plugin install git+ssh://git@github.com/kubet/pi-goal.git   # private repo: SSH
-omp plugin install github:kubet/pi-goal                          # once public
-omp install /path/to/pi-goal                                     # local checkout (link)
+omp plugin install git+ssh://git@github.com/kubet/pi-goal.git
 ```
 
-Requires a git repo with at least one commit. Climb measures commits and reverts dropped experiments, so it needs a checkout without other uncommitted work: when the checkout is shared, `git worktree add <path> HEAD` and `/climb move <path>`, then run omp there. A running session keeps the code it started with; when a newer climb is installed it says so once and the status line shows "↻ restart omp to update climb". The climb resumes from its ledger after `/exit` and `omp -c`.
+Needs a git repo with at least one commit, and a checkout with no other uncommitted work. If the checkout is shared, give the climb its own worktree: `git worktree add ../climb HEAD`, then `/climb move ../climb`.
 
 ## Use
 
 ```
-/climb make the API p50 under 50ms --beat 30m --poke-max 3
-/climb                 progress report: values vs targets, sparkline, velocity, ETA
-/climb beat            heartbeat now
-/climb judge [goal]    run the judge now
-/climb pause | resume  stop/restart heartbeats and stop-blocking; resume also un-sticks a STUCK goal
-/climb done [goal]     close a goal (a split goal closes its open parts too)
-/climb export [path]   write the evidence export (default .climb/export.json)
-/climb panel           .climb/panel.html: goal tree, metrics vs targets, every experiment, knowledge, time (open in a browser)
-/climb move <path>     carry the climb to another (clean) checkout, e.g. a worktree when this one holds other work
+/climb make the API p50 under 50ms   start a goal (optional: --beat 30m --poke-max 3)
+/climb                               progress report
+/climb pause | resume                stop / restart the loop
+/climb done [goal]                   close a goal
+/climb panel                         write .climb/panel.html
+/climb move <path>                   carry the climb to another checkout
 ```
 
-The agent drives the loop through tools:
+After a restart, `omp -c` picks the climb up from its ledger.
 
-1. **Research, itemized:** `climb_probe` registers each candidate metric (`timeout_s` for slow ones). The extension runs it and records the number, and each probe counts as progress before a scorecard exists.
-2. **Climb:** `climb_scorecard` → `climb_experiment` (optional `proof`) → commit → `climb_measure` (or `abandon`), plus `climb_judge` and `climb_status`. Long measurements stream progress to the tool output and the status line.
-3. **Structure:** `climb_split` (parts) and `climb_learn` (facts, traps, dead ends).
+## What happens
 
-Metrics are whatever the agent defines: any command that prints a number, such as runtime, memory, test count, bundle size, or itemized findings (`grep -c '^- ' findings.md`). A metric with `hold: true` is a constraint ("no slower"): it has no target, and any regression beyond noise drops the experiment.
-
-**omp vs upstream pi:** on omp, the stop hook keeps the agent working and the judge is an independent side turn. Upstream pi has neither, so the heartbeat drives the loop and the agent's own diagnosis stands in for the judge.
-
-## Tracking
-
-- **Self:** `.climb/oracle.jsonl` holds every decision as JSON. `/climb` shows a sparkline, velocity and ETA, and the status line shows live progress.
-- **Traces:** `.climb/trace.jsonl` records the work behind the decisions: every benchmark, guard, proof and probe run (phase, duration, exit code, value, retries), every reuse of a recent measurement, every climb tool call with its duration and refusal reason, every judge call. Runs record the git tree, a command fingerprint, the load average and free memory; a verdict notes when control and candidate ran under very different load. `/climb`, `climb_status` and the judge's prompt carry a summary: time per tool, time wasted on refused calls and why, flaky metrics, cost per run, guard cost, reuse savings, experiments per hour.
-- **External in:** a metric is any command that prints a number, so it can `curl` Prometheus, CI or an API.
-- **External out:** set `CLIMB_SINK` and every ledger event goes out as `{text, content, repo, entry}`:
-
-```bash
-CLIMB_SINK=https://hooks.slack.com/services/...  omp   # http(s): JSON POST (Slack/Discord read text/content)
-CLIMB_SINK='cat >> ~/climb.log'                  omp   # anything else: shell command, JSON on stdin
+```mermaid
+flowchart TD
+  A["/climb intent"] --> R["Research<br/>climb_probe: one number per candidate metric"]
+  R --> S["Scorecard<br/>climb_scorecard: metrics + targets<br/>extension runs A/A: baseline and noise"]
+  S --> E["Experiment<br/>climb_experiment: one lever, one hypothesis<br/>extension measures the control"]
+  E --> C["agent edits and commits"]
+  C --> M["climb_measure<br/>extension measures the commit"]
+  M --> D{"gain beats noise,<br/>nothing regressed?"}
+  D -- no --> X["DROPPED<br/>auto-reverted"] --> E
+  D -- yes --> K["KEPT"] --> T{"every target met?"}
+  T -- no --> E
+  T -- yes --> V["measured again +<br/>independent acceptance review"]
+  V -- "intent met" --> W["ACHIEVED"]
+  V -- "something missing" --> S
 ```
 
-Other extensions can subscribe with `pi.events.on("climb", …)`.
+Alongside the loop:
 
-- **Panel:** `.climb/panel.html` is rewritten with the export after every decision: the goal tree with progress, each metric from baseline toward target with its trend and noise, every experiment with what it measured against its noise and why it was decided, recorded knowledge, and where the time went. Self-contained; light and dark.
-- **Evidence export:** `.climb/export.json` (schema `climb.export/1`) is rewritten after every decision, in the benchmaxx evidence shape: one row per decided experiment and scorecard metric, with `record_id`, `metric_id`, unit, direction, before/after medians and `raw_before`/`raw_after` runs, sample counts, `baseline_commit`/`candidate_commit`, the measured noise, the `qualification` actually earned (`statistical_win`, kept, by proof, limits), the `correctness` gate, the instrument hash, the environment hash and evidence pointers. Around the rows: the goal tree, all recorded knowledge and independent diagnoses, provenance (`source_ledger_sha256`) and the rules the rows follow. Every card records the instrument (a hash over its commands and frozen files) and the machine; every run records load and free memory.
+```mermaid
+flowchart LR
+  H["heartbeat<br/>every 30 min"] --> P{"anything kept<br/>since last beat?"}
+  P -- yes --> H
+  P -- "no, 3 beats" --> J["independent judge<br/>continue / pivot / stuck"] --> H
+  Q["agent tries to stop"] --> O{"goal open?"}
+  O -- yes --> B["blocked: next step sent back"]
+```
+
+## Rules the extension enforces
+
+- **It measures, on commits.** The agent never reports its own numbers. A run that crashes decides nothing.
+- **Noise is measured, not guessed.** A gain must beat it. Borderline or drifting metrics are re-run interleaved with the base commit (A B B A), so machine drift cancels out.
+- **Drops revert themselves.** An experiment that touches the benchmark is dropped.
+- **Holds guard.** A `hold: true` metric ("no slower") has no target; a real regression drops the experiment.
+- **Proofs.** An experiment can carry a check that fails before the change and passes after; that keeps a fix the metrics are too coarse to see.
+- **Focus.** One open experiment, at most 3 metrics per goal. Three drops in a row call the judge.
+- **Big goals split.** `climb_split` makes 2-4 parts, each with its own scorecard. `climb_learn` records facts, traps and dead ends that survive restarts.
+- **Achieved means checked.** Targets met twice, then an independent review of the intent. If no review could run, the goal is marked unreviewed.
+
+## Files
+
+Everything lives in `.climb/` (excluded from git):
+
+| File | What |
+|---|---|
+| `oracle.jsonl` | every decision, append-only |
+| `trace.jsonl` | every run and tool call, with timing and refusals |
+| `panel.html` | goal tree, metrics vs targets, experiments |
+| `export.json` | evidence rows (benchmaxx schema `climb.export/1`) |
+
+Set `CLIMB_SINK=<https url or shell command>` to stream each decision out. Other extensions can listen with `pi.events.on("climb", …)`.
 
 ## Develop
 
