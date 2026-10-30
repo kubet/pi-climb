@@ -1371,6 +1371,15 @@ describe("acceptance review", () => {
 			const out = await z.tool("climb_measure", { goal: "g-fast-responses" });
 			expect(out).toContain("That completes g-make-it-fast-and");
 			expect(L.fold(L.read(d)).goals.get("g-make-it-fast-and")!.done?.result).toBe("achieved");
+			// The other order: the last open part is dropped after its sibling was achieved.
+			await z.cmd("make it small and quick");
+			await z.tool("climb_split", { goal: "g-make-it-small-and", parts: [{ intent: "small bundle" }, { intent: "quick start" }] });
+			await z.tool("climb_scorecard", { goal: "g-small-bundle", metrics: [{ name: "kb", cmd: "cat a.txt", dir: "down", target: 30, noise: 0.05 }] });
+			await z.tool("climb_experiment", { goal: "g-small-bundle", lever: "shrink", hypothesis: "", prediction: "" });
+			await run("echo 20 > a.txt && git commit -qam shrink");
+			expect(await z.tool("climb_measure", { goal: "g-small-bundle" })).toContain("GOAL ACHIEVED: g-small-bundle");
+			await z.cmd("done g-quick-start");
+			expect(L.fold(L.read(d)).goals.get("g-make-it-small-and")!.done?.result).toBe("achieved");
 		} finally {
 			fs.rmSync(d, { recursive: true, force: true });
 		}

@@ -1809,7 +1809,8 @@ export default async function climb(pi: ExtensionAPI) {
 				const won = (x: L.Goal) => !!x.card && x.card.metrics.every(m => L.met(m, x.best[m.name]));
 				const tree = L.subtree(st, g).filter(x => !x.done).reverse();
 				for (const x of tree) append(root, { ts: L.now(), kind: "done", goal: x.id, result: won(x) ? "achieved" : "abandoned", values: x.best });
-				const up = won(g) ? await rollUp(ctx, root, g.id) : [];
+				// A dropped part no longer counts, so its siblings may now complete the parent.
+				const up = g.parent ? await rollUp(ctx, root, g.id) : [];
 				await writeExport(root);
 				const now = refresh(ctx, root);
 				if (!L.active(now).length) stopTimer(ctx);
