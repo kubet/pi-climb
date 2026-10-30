@@ -117,7 +117,7 @@ function stateChip(st: State, g: Goal): string {
 	const busy = openIn(st, g);
 	if (busy) return `<span class="chip neutral">● ${esc(busy.open!.id)} running</span>`;
 	if (g.reviewed) return `<span class="chip warning">⚠ ${parts(st, g).length ? "parts achieved" : "targets met"} · review holds it</span>`;
-	if (reached(g)) return `<span class="chip warning">⚠ targets met · not confirmed</span>`;
+	if (reached(g) && !parts(st, g).length) return `<span class="chip warning">⚠ targets met · not confirmed</span>`;
 	return g.card ? `<span class="chip neutral">climbing</span>` : `<span class="chip neutral">researching</span>`;
 }
 

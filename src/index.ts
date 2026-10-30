@@ -1096,7 +1096,7 @@ export default async function climb(pi: ExtensionAPI) {
 			}
 			// The review is asked about the whole goal: what the held card met must still be on the card, and still met.
 			// Every target met but not closed (a re-measurement missed, or a hold looked regressed): the same checks confirm it.
-			const confirming = !!g.reviewed || X.reached(g);
+			const confirming = !!g.reviewed || (X.reached(g) && !L.parts(st0, g).length);
 			const held = confirming && g.card && !L.parts(st0, g).length ? g.card : undefined;
 			const dropped = held?.metrics.filter(o => !p.metrics!.some(m => m.name === o.name && m.cmd === o.cmd)) ?? [];
 			if (dropped.length)
