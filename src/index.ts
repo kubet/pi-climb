@@ -1744,11 +1744,14 @@ export default async function climb(pi: ExtensionAPI) {
 
 	// --- user command ------------------------------------------------------------------
 
+	const USAGE =
+		"Autonomous hill-climb. /climb <intent> [--beat 30m] [--poke-max 3] starts a goal · /climb shows progress · beat · judge [goal] · pause · resume · done [goal] · export [path] · panel · move <path> · compact";
 	pi.registerCommand("climb", {
-		description:
-			"Autonomous hill-climb. /climb <intent> [--beat 30m] [--poke-max 3] starts a goal · /climb shows progress · beat · judge [goal] · pause · resume · done [goal] · export [path] · panel · move <path> · compact",
+		description: USAGE,
 		handler: async (args, ctx) => {
 			ctxRef = ctx;
+			// "help" is never a goal.
+			if (/^(help|-h|--help|\?)$/i.test(args.trim())) return ctx.ui.notify(USAGE, "info");
 			const root = await repoRoot(ctx.cwd);
 			if (!root) return ctx.ui.notify("climb needs a git repository with a commit: git is the source of truth.", "error");
 			const words = args.trim().split(/\s+/).filter(Boolean);

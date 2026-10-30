@@ -1375,6 +1375,20 @@ describe("acceptance review", () => {
 		}
 	});
 
+	test("/climb help shows usage and never starts a goal", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-help-"));
+		try {
+			await exec("bash", ["-c", "git init -q && git config user.email t@t && git config user.name t && echo x > a && git add -A && git commit -qm init"], { cwd: d });
+			const z = host(d, "main", "help");
+			await z.load();
+			await z.cmd("help");
+			expect(z.notes.at(-1)).toContain("/climb <intent>");
+			expect(L.read(d).length).toBe(0);
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
 	test("a part the review holds open comes next, with what is missing, not a sibling's climb", async () => {
 		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-part-"));
 		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
