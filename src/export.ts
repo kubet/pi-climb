@@ -49,13 +49,13 @@ export function build(entries: Entry[], repo: { name: string; remote?: string },
 	const cardOf = new Map<string, CardE>(); // goal|exp -> card it was measured against
 	const exps = new Map<string, ExpE>();
 	const rows: Row[] = [];
-	const goals: { id: string; parent?: string; intent: string; done?: string; created: string }[] = [];
+	const goals: { id: string; parent?: string; intent: string; done?: string; unreviewed?: string; created: string }[] = [];
 	const knowledge: { goal: string; ts: string; kind: string; text: string; evidence?: string; by: string }[] = [];
 	for (const [line, e] of entries.entries()) {
 		if (e.kind === "goal") goals.push({ id: e.goal, parent: e.parent, intent: e.intent, created: e.ts });
 		else if (e.kind === "done") {
 			const g = goals.find(x => x.id === e.goal);
-			if (g) g.done = e.result;
+			if (g) Object.assign(g, { done: e.result, unreviewed: e.unreviewed });
 		} else if (e.kind === "card") cards.set(e.goal, e);
 		else if (e.kind === "exp") {
 			exps.set(`${e.goal}|${e.id}`, e);

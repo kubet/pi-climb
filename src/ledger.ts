@@ -97,7 +97,13 @@ export interface StallE extends Base { kind: "stall"; stale: number }
 /** A research item: a candidate metric the extension ran during research. */
 export interface ProbeE extends Base { kind: "probe"; name: string; cmd: string; value?: number; error?: string; note?: string }
 export interface JudgeE extends Base { kind: "judge"; by: "judge" | "worker" | "human" | "fallback"; verdict: Verdict; diagnosis: string; next: string; /** the acceptance review held the goal open */ review?: true }
-export interface DoneE extends Base { kind: "done"; result: "achieved" | "abandoned"; values: Values }
+export interface DoneE extends Base {
+	kind: "done";
+	result: "achieved" | "abandoned";
+	values: Values;
+	/** Achieved without the acceptance review, and why it did not run. */
+	unreviewed?: string;
+}
 export interface PauseE extends Base { kind: "pause" | "resume" }
 export interface RollupE extends Base { kind: "rollup"; cd: number; n: number; from: string; to: string; progress: number; stale: number; values?: Values }
 /** Knowledge: a fact about the system or instrument, a trap (X looks like Y; check Z), or a dead end. */

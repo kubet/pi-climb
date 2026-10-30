@@ -106,7 +106,12 @@ function metricRow(g: Goal, m: Metric): string {
 }
 
 function stateChip(st: State, g: Goal): string {
-	if (g.done) return g.done.result === "achieved" ? `<span class="chip good">✓ achieved</span>` : `<span class="chip neutral">closed</span>`;
+	if (g.done)
+		return g.done.result !== "achieved"
+			? `<span class="chip neutral">closed</span>`
+			: g.done.unreviewed
+				? `<span class="chip warning" title="the acceptance review did not run: ${esc(g.done.unreviewed)}">✓ achieved · unreviewed</span>`
+				: `<span class="chip good">✓ achieved</span>`;
 	if (g.stallPending) return `<span class="chip warning">⚠ stalled · judge reviewing</span>`;
 	if (g.judge?.verdict === "stuck" && g.progressSeq < g.judgeSeq) return `<span class="chip critical">✕ stuck · needs you</span>`;
 	const busy = openIn(st, g);

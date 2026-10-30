@@ -566,7 +566,9 @@ export default async function climb(pi: ExtensionAPI) {
 		if (id) {
 			const g = st.goals.get(id);
 			if (g && !g.done) return g;
-			throw new Error(`No active goal "${id}". Active: ${goals.map(g => g.id).join(", ") || "none"}.`);
+			const home = g?.parent ? st.goals.get(g.parent) : undefined;
+			const reopen = g?.done && home && !home.done ? ` ${id} is closed (${g.done.result}); new work in its area is a new part: climb_split on ${home.id} with one part.` : g?.done ? ` ${id} is closed (${g.done.result}).` : "";
+			throw new Error(`No active goal "${id}".${reopen} Active: ${goals.map(g => g.id).join(", ") || "none"}.`);
 		}
 		const leaves = goals.filter(g => !L.umbrella(st, g));
 		const preferred = pred ? leaves.filter(pred) : [];
@@ -587,12 +589,12 @@ export default async function climb(pi: ExtensionAPI) {
 			const ps = L.parts(st, parent);
 			if (!ps.every(c => c.done?.result === "achieved")) break;
 			const r = await review(ctx, root, parent);
-			if (!r && parent.reviewed) break;
-			if (r && !r.achieved) {
+			if (typeof r === "string" && parent.reviewed) break;
+			if (typeof r === "object" && !r.achieved) {
 				append(root, { ts: L.now(), kind: "judge", goal: parent.id, by: "judge", review: true, verdict: "continue", diagnosis: `Every part is achieved, but not the intent: ${r.unmet}`, next: r.next });
 				break;
 			}
-			append(root, { ts: L.now(), kind: "done", goal: parent.id, result: "achieved", values: {} });
+			append(root, { ts: L.now(), kind: "done", goal: parent.id, result: "achieved", values: {}, unreviewed: typeof r === "string" ? r : undefined });
 			closed.push(parent.id);
 			st = load(root);
 		}
@@ -603,23 +605,28 @@ export default async function climb(pi: ExtensionAPI) {
 	 *  maybe its parents); otherwise what is missing is recorded and the goal stays open. */
 	async function accept(ctx: Ctx, root: string, g: L.Goal, values: L.Values): Promise<{ unmet?: { unmet: string; next: string }; closedUp: string[] }> {
 		const r = await review(ctx, root, g);
-		// A review that cannot run does not hold a goal open, unless it already held this one: then only it can release it.
-		if (!r && g.reviewed)
+		// A review that cannot run does not hold a goal open (the closure says it was not reviewed),
+		// unless it already held this one: then only it can release it.
+		if (typeof r === "string" && g.reviewed)
 			return { unmet: { unmet: "the acceptance review could not run this time, and it held this goal before, so the goal stays open", next: "ask it again: climb_scorecard with the same checks" }, closedUp: [] };
-		if (r && !r.achieved) {
+		if (typeof r === "object" && !r.achieved) {
 			append(root, { ts: L.now(), kind: "judge", goal: g.id, by: "judge", review: true, verdict: "continue", diagnosis: `Every target is met, but not the intent: ${r.unmet}`, next: r.next });
 			return { unmet: r, closedUp: [] };
 		}
-		append(root, { ts: L.now(), kind: "done", goal: g.id, result: "achieved", values });
+		append(root, { ts: L.now(), kind: "done", goal: g.id, result: "achieved", values, unreviewed: typeof r === "string" ? r : undefined });
 		return { closedUp: await rollUp(ctx, root, g.id) };
 	}
 	const unmetText = (u: { unmet: string; next: string }) =>
 		`EVERY TARGET MET, BUT THE INTENT IS NOT DONE (acceptance review): ${u.unmet}\nNEXT: ${u.next}. Put what is missing on the scorecard next to the current metrics (climb_scorecard; a check that already passes is welcome: when every metric meets its target there, the review is asked again).`;
 	function achievedText(st: L.State, ctx: Ctx, g: L.Goal, closedUp: string[]): string {
-		let text = `GOAL ACHIEVED: ${g.id}, every target met.${g.card?.parked?.length ? ` Parked metrics remain: ${g.card.parked.join(", ")}.` : ""}${closedUp.length ? ` That completes ${closedUp.join(" and ")}: every part achieved.` : ""}`;
+		// Closed without the acceptance review: said here, on the panel and in the export, never passed off as reviewed.
+		const why = st.goals.get(g.id)?.done?.unreviewed;
+		const unchecked = [g.id, ...closedUp].filter(id => st.goals.get(id)?.done?.unreviewed);
+		const caveat = unchecked.length ? ` Nothing checked the intent beyond the scorecard for ${unchecked.join(" and ")}: the acceptance review did not run (${why ?? st.goals.get(unchecked[0])?.done?.unreviewed}).` : "";
+		let text = `GOAL ACHIEVED: ${g.id}, every target met.${g.card?.parked?.length ? ` Parked metrics remain: ${g.card.parked.join(", ")}.` : ""}${closedUp.length ? ` That completes ${closedUp.join(" and ")}: every part achieved.` : ""}${caveat}`;
 		const rest = L.roots(st);
 		if (rest.length) text += `\n${rest.map(r => X.nextAction(st, r)).join("\n")}`;
-		ctx.ui?.notify?.(`climb ${g.id} achieved`, "info");
+		ctx.ui?.notify?.(`climb ${g.id} achieved${unchecked.length ? `, unreviewed: the acceptance review did not run (${why ?? st.goals.get(unchecked[0])?.done?.unreviewed})` : ""}`, unchecked.length ? "warning" : "info");
 		if (!L.active(st).length) stopTimer(ctx);
 		return text;
 	}
@@ -858,10 +865,10 @@ export default async function climb(pi: ExtensionAPI) {
 	}
 
 	/** Before a goal closes on met targets, an independent check that its intent is met too: a scorecard
-	 *  can be achieved while a requirement of the intent never made it onto it. Undefined: no judge here. */
-	async function review(ctx: Ctx, root: string, g: L.Goal): Promise<{ achieved: boolean; unmet: string; next: string } | undefined> {
+	 *  can be achieved while a requirement of the intent never made it onto it. A string: why it could not run. */
+	async function review(ctx: Ctx, root: string, g: L.Goal): Promise<{ achieved: boolean; unmet: string; next: string } | string> {
 		const turn = ctx.runEphemeralTurn?.bind(ctx);
-		if (!turn) return undefined;
+		if (!turn) return "no independent review on this host";
 		const t0 = performance.now();
 		try {
 			const st = load(root);
@@ -871,7 +878,7 @@ export default async function climb(pi: ExtensionAPI) {
 			return X.parseReview(reply);
 		} catch (e) {
 			T.append(root, { ts: L.now(), kind: "judge", goal: g.id, ms: Math.round(performance.now() - t0), ok: false, error: String(e).slice(0, 300), why: "acceptance review" });
-			return undefined; // a review that cannot run does not hold the goal open
+			return `it failed: ${String(e).slice(0, 160)}`; // a review that cannot run does not hold the goal open
 		}
 	}
 

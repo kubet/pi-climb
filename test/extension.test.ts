@@ -1182,6 +1182,39 @@ describe("acceptance review", () => {
 		}
 	});
 
+	test("a review that cannot run closes the goal marked unreviewed, never as reviewed; a closed goal points to a new part", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-failed-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > a.txt && echo 10 > b.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "accept-failed");
+			await z.load();
+			await z.cmd("make it fast and good");
+			await z.tool("climb_split", { parts: [{ intent: "fast responses" }, { intent: "good answers" }] });
+			await z.tool("climb_scorecard", { goal: "g-fast-responses", metrics: [{ name: "ms", cmd: "cat a.txt", dir: "down", target: 50, noise: 0.05 }] });
+			z.h.judgeThrows = true;
+			await z.tool("climb_experiment", { goal: "g-fast-responses", lever: "halve", hypothesis: "", prediction: "" });
+			await run("echo 40 > a.txt && git commit -qam halve");
+			const out = await z.tool("climb_measure", { goal: "g-fast-responses" });
+			expect(out).toContain("GOAL ACHIEVED: g-fast-responses");
+			expect(out).toContain("Nothing checked the intent beyond the scorecard for g-fast-responses: the acceptance review did not run (it failed: Error: side turn refused synchronously)");
+			expect(z.notes.at(-1)).toContain("g-fast-responses achieved, unreviewed");
+			const done = L.fold(L.read(d)).goals.get("g-fast-responses")!.done!;
+			expect(done.result).toBe("achieved");
+			expect(done.unreviewed).toContain("side turn refused");
+			expect(X.report(L.fold(L.read(d)), Date.now())).toContain("g-fast-responses — DONE (achieved, unreviewed)");
+			expect(fs.readFileSync(path.join(d, ".climb/panel.html"), "utf8")).toContain("✓ achieved · unreviewed");
+			const x = JSON.parse(fs.readFileSync(path.join(d, ".climb/export.json"), "utf8"));
+			expect(x.goals.find((g: { id: string }) => g.id === "g-fast-responses").unreviewed).toContain("side turn refused");
+			// New work in a closed part's area goes in a new part, not into a sibling.
+			await expect(z.tool("climb_probe", { goal: "g-fast-responses", name: "p", cmd: "echo 1" })).rejects.toThrow(
+				"g-fast-responses is closed (achieved); new work in its area is a new part: climb_split on g-make-it-fast-and with one part.",
+			);
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
 	test("a part the review holds open comes next, with what is missing, not a sibling's climb", async () => {
 		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-part-"));
 		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });

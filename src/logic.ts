@@ -211,7 +211,7 @@ export function report(st: State, nowMs = clock.ms()): string {
 function section(st: State, g: Goal, nowMs: number): string[] {
 	const out: string[] = [];
 	{
-		const state = g.done ? `DONE (${g.done.result})` : stuck(g) ? "STUCK — needs you" : g.stallPending ? "STALLED — judge pending" : umbrella(st, g) ? `split into ${parts(st, g).length} parts, ${goalPct(st, g)}%` : g.card ? "climbing" : "researching";
+		const state = g.done ? `DONE (${g.done.result}${g.done.unreviewed ? ", unreviewed" : ""})` : stuck(g) ? "STUCK — needs you" : g.stallPending ? "STALLED — judge pending" : umbrella(st, g) ? `split into ${parts(st, g).length} parts, ${goalPct(st, g)}%` : g.card ? "climbing" : "researching";
 		out.push(`${g.parent ? "↳" : "##"} ${g.id} — ${state}`, `"${g.intent}"${g.why ? ` (why: ${g.why})` : ""}`);
 		const learned = g.learned;
 		if (learned.length) {
@@ -426,7 +426,7 @@ export function describe(e: Entry): string {
 		case "judge":
 			return `${g} judge (${e.by}): ${e.verdict.toUpperCase()} — ${e.diagnosis} → ${e.next}`;
 		case "done":
-			return `${g} DONE (${e.result}): ${Object.entries(e.values).map(([k, v]) => `${k}=${v}`).join(", ")}`;
+			return `${g} DONE (${e.result}${e.unreviewed ? `, unreviewed: ${e.unreviewed}` : ""}): ${Object.entries(e.values).map(([k, v]) => `${k}=${v}`).join(", ")}`;
 		case "pause":
 		case "resume":
 			return `[climb] ${e.kind}d`;
