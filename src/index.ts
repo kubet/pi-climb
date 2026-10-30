@@ -138,13 +138,14 @@ export default async function climb(pi: ExtensionAPI) {
 		pi.exec("bash", ["-c", cmd], { cwd: root, timeout: timeoutMs, signal });
 	const git = (root: string, ...args: string[]) => pi.exec("git", args, { cwd: root, timeout: 60_000 });
 	/** sh, traced: every benchmark, guard, proof and probe run lands in .climb/trace.jsonl with its duration. */
-	async function run(root: string, cmd: string, timeoutMs: number, tag: Tag, signal?: AbortSignal, retry = false) {
+	/** `ledger`: the repo whose trace records the run (a base worktree's runs belong to the repo). */
+	async function run(root: string, cmd: string, timeoutMs: number, tag: Tag, signal?: AbortSignal, retry = false, ledger = root) {
 		const t0 = performance.now();
 		const r = await sh(root, cmd, timeoutMs, signal);
 		const value = r.code === 0 && tag.metric ? X.parseNumber(r.stdout) : undefined;
 		const load = Math.round(os.loadavg()[0] * 100) / 100; // contention is the first suspect for a noisy run
 		const free_mb = Math.round(os.freemem() / 2 ** 20);
-		T.append(root, { ts: L.now(), kind: "run", ...tag, ms: Math.round(performance.now() - t0), code: r.code, value, retry: retry || undefined, killed: r.killed || undefined, load, free_mb });
+		T.append(ledger, { ts: L.now(), kind: "run", ...tag, ms: Math.round(performance.now() - t0), code: r.code, value, retry: retry || undefined, killed: r.killed || undefined, load, free_mb });
 		return r;
 	}
 	const tail = (s: string) => s.replace(/[ \t]{2,}/g, " ").replace(/\n\s*\n/g, "\n").trim().slice(-400);
@@ -370,7 +371,10 @@ export default async function climb(pi: ExtensionAPI) {
 
 	/** Base and candidate measured interleaved (A B, B A, ...): drift between the two sides cancels.
 	 *  Undefined if the base cannot be checked out or a run fails (the caller falls back). */
-	async function paired(root: string, base: string, metrics: L.Metric[], goal: string, signal?: AbortSignal, progress?: Progress) {
+	/** Pairs per metric; undefined when the base cannot be checked out or cannot run the command at all (its
+	 *  first run fails); a string when a later run failed even on a retry: one bad run must not throw the
+	 *  pairs away and leave the decision to a single draw. */
+	async function paired(root: string, base: string, metrics: L.Metric[], goal: string, signal?: AbortSignal, progress?: Progress): Promise<Record<string, [number, number][]> | string | undefined> {
 		const [baseTree, candTree] = await Promise.all([tree(root, base), tree(root)]);
 		try {
 			return await withBase(root, base, async dir => {
@@ -381,11 +385,20 @@ export default async function climb(pi: ExtensionAPI) {
 					for (let i = 0; i < n; i++) {
 						const v: { a?: number; b?: number } = {};
 						for (const side of i % 2 ? (["b", "a"] as const) : (["a", "b"] as const)) {
-							progress?.(`${m.name} pair ${i + 1}/${n}, ${side === "a" ? "base" : "candidate"}`);
-							const r = await run(side === "a" ? dir : root, m.cmd, m.timeout_s * 1000, { phase: "paired", goal, metric: m.name, tree: side === "a" ? baseTree : candTree, cmd: cmdId(m.cmd) }, signal);
-							if (signal?.aborted) throw new Error("Measurement interrupted; nothing was decided and the experiment stays open.");
-							const x = r.code === 0 ? X.parseNumber(r.stdout) : undefined;
-							if (x === undefined || !Number.isFinite(x)) return undefined;
+							const who = side === "a" ? "base" : "candidate";
+							progress?.(`${m.name} pair ${i + 1}/${n}, ${who}`);
+							let x: number | undefined;
+							let r: Awaited<ReturnType<typeof run>> | undefined;
+							for (let attempt = 0; attempt < 2 && x === undefined; attempt++) {
+								r = await run(side === "a" ? dir : root, m.cmd, m.timeout_s * 1000, { phase: "paired", goal, metric: m.name, tree: side === "a" ? baseTree : candTree, cmd: cmdId(m.cmd) }, signal, attempt > 0, root);
+								if (signal?.aborted) throw new Error("Measurement interrupted; nothing was decided and the experiment stays open.");
+								const y = r.code === 0 ? X.parseNumber(r.stdout) : undefined;
+								if (y !== undefined && Number.isFinite(y)) x = y;
+							}
+							if (x === undefined) {
+								if (side === "a" && i === 0 && !Object.keys(out).length) return undefined; // the base cannot run it here
+								return `${m.name}, ${who} run of pair ${i + 1}: ${r!.code === 0 ? "no number in its output" : `exit ${r!.code}${r!.killed ? " (killed/timeout)" : ""}: ${said(r!)}`}`;
+							}
 							v[side] = x;
 						}
 						ps.push([v.a!, v.b!]);
@@ -1356,7 +1369,8 @@ export default async function climb(pi: ExtensionAPI) {
 				let checked = "";
 				if (worse.length) {
 					const pairs = await paired(root, g.baseRef!, worse, g.id, signal, t => say(t && `paired check of the commits since ${unmeasured}: ${t}`));
-					if (pairs) {
+					if (typeof pairs === "string") checked = ` The paired check could not finish (${pairs}).`;
+					else if (pairs) {
 						const pv = X.pairedVerdict(worse, pairs);
 						worse = worse.filter(m => pv.stats[m.name] && pv.stats[m.name].gain < -pv.stats[m.name].noise);
 						checked = ` A paired check (base and HEAD interleaved) found ${worse.length ? "a real regression" : "drift, not a regression"}: ${pv.reason.replace(/^[^:]*: /, "")}.`;
@@ -1445,7 +1459,15 @@ export default async function climb(pi: ExtensionAPI) {
 				// be checked out, fall back to measuring the candidate again.
 				// Only the uncertain metrics pay for pairs: borderline here, or drifting in their history.
 				const uncertain = r.errors.length ? [] : g.card.metrics.filter((m, i) => X.borderline([eff.metrics[i]], exp.ref, r.values) || eff.metrics[i].noise > m.noise);
-				if (uncertain.length) pairs = await paired(root, exp.base, uncertain, g.id, signal, t => say(t && `paired with the base: ${t}`));
+				if (uncertain.length) {
+					const p = await paired(root, exp.base, uncertain, g.id, signal, t => say(t && `paired with the base: ${t}`));
+					// These metrics need pairs to be told apart from luck: a paired run that crashes decides nothing.
+					if (typeof p === "string")
+						throw new Error(
+							`Measurement failed in the paired check (base and candidate interleaved), even after retrying the run once; nothing was decided and ${exp.id} stays open:\n${p}\nFlaky: call climb_measure again. Broken by your change: fix it, commit, measure again.`,
+						);
+					pairs = p;
+				}
 				if (uncertain.length && !pairs && X.borderline(eff.metrics, exp.ref, r.values))
 					r = await measure(root, g.card.metrics, { phase: "recheck", goal: g.id, tree: candidate }, signal, r.samples, t => say(t && `re-measure (borderline) ${t}`));
 				// A crashed instrument is not evidence against the change: decide nothing.

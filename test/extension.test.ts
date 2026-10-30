@@ -984,6 +984,7 @@ describe("paired measurement", () => {
 		// Every run reads 10 higher than the one before: the machine keeps getting slower. The command also
 		// needs an untracked data file (linked into the base) and must not see the candidate's build output.
 		const cmd = `test -f data/seed && test -f "données.csv" && test ! -f dist/candidate && n=$(cat ${ctr} 2>/dev/null || echo 0); echo $((n+1)) > ${ctr}; echo $(( $(cat work.txt) + n * 10 ))`;
+		const bases = new Set(fs.readdirSync(os.tmpdir()).filter(f => f.startsWith("climb-base-"))); // a live climb may have its own
 		try {
 			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo x > README.md && printf 'data/\\ndist/\\n' > .gitignore && git add -A && git commit -qm init && mkdir -p data && touch data/seed && touch données.csv");
 			const z = host(d, "main", "paired");
@@ -1004,11 +1005,43 @@ describe("paired measurement", () => {
 			expect(halve).toContain("paired with the base");
 			const result = L.read(d).filter(e => e.kind === "result").at(-1) as L.ResultE;
 			expect(Object.values(result.paired ?? {})[0]?.length).toBeGreaterThanOrEqual(2);
-			expect(fs.readdirSync(os.tmpdir()).some(f => f.startsWith("climb-base-"))).toBe(false); // worktrees cleaned up
+			expect(fs.readdirSync(os.tmpdir()).filter(f => f.startsWith("climb-base-") && !bases.has(f))).toEqual([]); // worktrees cleaned up
+			// Both sides' runs are traced in the repo (the base side runs in a throwaway worktree).
+			const since = (L.read(d).filter(e => e.kind === "exp").at(-1) as L.ExpE).ts;
+			const runs = T.read(d).filter((t): t is T.RunT => t.kind === "run" && t.phase === "paired" && t.ts > since);
+			expect(runs).toHaveLength(2 * Object.values(result.paired!)[0].length);
 			expect((await run("git worktree list")).stdout.trim().split("\n")).toHaveLength(1);
 		} finally {
 			fs.rmSync(d, { recursive: true, force: true });
 			fs.rmSync(ctr, { force: true });
+		}
+	});
+});
+
+describe("paired measurement, crashed", () => {
+	test("a paired run that crashes after pairs were collected decides nothing; the experiment stays open", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-paircrash-"));
+		const ctr = path.join(os.tmpdir(), `climb-paircrash-ctr-${process.pid}`);
+		const bctr = `${ctr}-base`;
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		// Drifts like the test above, so the decision needs pairs; the base side dies after its first run.
+		const cmd = `case "$PWD" in *climb-base-*) b=$(cat ${bctr} 2>/dev/null || echo 0); echo $((b+1)) > ${bctr}; [ $b -ge 1 ] && exit 7;; esac; n=$(cat ${ctr} 2>/dev/null || echo 0); echo $((n+1)) > ${ctr}; echo $(( $(cat work.txt) + n * 10 ))`;
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo x > README.md && git add -A && git commit -qm init");
+			const z = host(d, "main", "paircrash");
+			await z.load();
+			await z.cmd("faster");
+			await z.tool("climb_scorecard", { metrics: [{ name: "ms", cmd, dir: "down", target: 10, noise: 0.05, samples: 3 }] });
+			await z.tool("climb_experiment", { lever: "noop", hypothesis: "", prediction: "" });
+			await run("echo y >> README.md && git commit -qam noop");
+			await expect(z.tool("climb_measure", {})).rejects.toThrow("Measurement failed in the paired check");
+			const st = L.fold(L.read(d)).goals.get("g-faster")!;
+			expect(st.open?.id).toBe("x1");
+			expect(st.results).toHaveLength(0);
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+			fs.rmSync(ctr, { force: true });
+			fs.rmSync(bctr, { force: true });
 		}
 	});
 });
