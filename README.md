@@ -1,5 +1,7 @@
 # pi-goal — `/climb`
 
+<p align="center"><img src="assets/climb.svg" alt="/climb: a little pi climbs a mountain — probe, scorecard, experiment, measure; kept steps go up, dropped ones are reverted; the summit is achieved and reviewed" width="860"></p>
+
 Autonomous hill-climbing for [omp](https://github.com/can1357/oh-my-pi) and pi. You say what should get better. The agent picks metrics and targets, then keeps trying changes until the targets are met.
 
 The agent writes the code. The extension measures, decides and keeps the record, so the agent cannot grade its own work or quit early.
@@ -27,32 +29,13 @@ After a restart, `omp -c` picks the climb up from its ledger.
 
 ## What happens
 
-```mermaid
-flowchart TD
-  A["/climb intent"] --> R["Research<br/>climb_probe: one number per candidate metric"]
-  R --> S["Scorecard<br/>climb_scorecard: metrics + targets<br/>extension runs A/A: baseline and noise"]
-  S --> E["Experiment<br/>climb_experiment: one lever, one hypothesis<br/>extension measures the control"]
-  E --> C["agent edits and commits"]
-  C --> M["climb_measure<br/>extension measures the commit"]
-  M --> D{"gain beats noise,<br/>nothing regressed?"}
-  D -- no --> X["DROPPED<br/>auto-reverted"] --> E
-  D -- yes --> K["KEPT"] --> T{"every target met?"}
-  T -- no --> E
-  T -- yes --> V["measured again +<br/>independent acceptance review"]
-  V -- "intent met" --> W["ACHIEVED"]
-  V -- "something missing" --> S
-```
+1. **Probe**: the agent finds candidate metrics; the extension runs each and records the number.
+2. **Scorecard**: up to 3 metrics with targets; the extension measures baseline and noise (A/A).
+3. **Experiment**: one lever, one hypothesis; the agent edits and commits.
+4. **Measure**: the extension measures the commit (A B B A against the base when it's close). Beat the noise: **kept**. Otherwise: **dropped** and auto-reverted. Back to 3.
+5. **Summit**: every target met, measured again, then an independent review of the intent: **achieved**.
 
-Alongside the loop:
-
-```mermaid
-flowchart LR
-  H["heartbeat<br/>every 30 min"] --> P{"anything kept<br/>since last beat?"}
-  P -- yes --> H
-  P -- "no, 3 beats" --> J["independent judge<br/>continue / pivot / stuck"] --> H
-  Q["agent tries to stop"] --> O{"goal open?"}
-  O -- yes --> B["blocked: next step sent back"]
-```
+Meanwhile a heartbeat checks every 30 min; three quiet beats call an independent judge (continue / pivot / stuck). The agent cannot stop while a goal is open.
 
 ## Rules the extension enforces
 

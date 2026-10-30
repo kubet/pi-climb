@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 440" width="960" height="440" role="img" aria-label="/climb: a little pi climbs a mountain. Stations on the trail: probe, scorecard, experiment, measure. Kept steps go up, dropped ones are reverted. The summit flag is achieved and reviewed. A heartbeat calls the judge after quiet beats, and stopping is blocked while a goal is open.">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0d1526"/>
+      <stop offset="1" stop-color="#1c2b46"/>
+    </linearGradient>
+    <linearGradient id="peak" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a5480"/>
+      <stop offset="1" stop-color="#22355a"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff7aa2" stop-opacity="0"/>
+      <stop offset=".25" stop-color="#ff7aa2"/>
+      <stop offset="1" stop-color="#ff7aa2" stop-opacity=".2"/>
+    </linearGradient>
+    <style>
+      .t { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .lbl { font: 600 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #e9f0fb; }
+      .sub { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #9fb3d1; }
+    </style>
+  </defs>
+
+  <rect width="960" height="440" rx="22" fill="url(#sky)"/>
+
+  <!-- stars and moon -->
+  <g fill="#dfe8ff">
+    <circle cx="430" cy="40" r="1.4"/><circle cx="520" cy="72" r="1"/><circle cx="600" cy="30" r="1.6"/>
+    <circle cx="700" cy="58" r="1.1"/><circle cx="760" cy="26" r="1.3"/><circle cx="905" cy="140" r="1"/>
+    <circle cx="470" cy="118" r="1"/><circle cx="380" cy="150" r="1.2"/><circle cx="820" cy="110" r="1.4"/>
+  </g>
+  <circle cx="862" cy="70" r="24" fill="#f6e7b6"/>
+  <circle cx="872" cy="62" r="22" fill="#18253d"/>
+
+  <!-- title -->
+  <text x="40" y="66" class="t" font-size="40" font-weight="700" fill="#ffffff">/climb</text>
+  <text x="42" y="94" class="sub" font-size="14">the agent climbs · the extension measures, decides, keeps score</text>
+
+  <!-- heartbeat -->
+  <polyline points="40,138 120,138 132,124 142,154 152,112 162,138 250,138 262,126 270,148 278,138 340,138" fill="none" stroke="url(#glow)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+  <text x="42" y="168" class="sub">heartbeat · 30 min · 3 quiet beats → judge</text>
+
+  <!-- back range -->
+  <polygon points="0,330 120,262 210,300 330,214 410,262 470,236 560,300 700,250 800,290 960,226 960,440 0,440" fill="#17233a"/>
+
+  <!-- main peak -->
+  <polygon points="60,440 250,330 300,342 380,276 430,288 620,92 700,178 750,160 860,290 960,330 960,440" fill="url(#peak)"/>
+  <polygon points="620,92 596,128 610,124 622,138 636,122 652,134" fill="#e8eef7"/>
+
+  <!-- trail -->
+  <polyline points="110,432 220,410 560,388 300,340 620,296 420,250 600,200 560,140 620,100" fill="none" stroke="#cfe0ff" stroke-opacity=".55" stroke-width="2.5" stroke-dasharray="2 7" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- stations -->
+  <g>
+    <circle cx="220" cy="410" r="7" fill="#8fb3ff"/>
+    <text x="234" y="415" class="lbl">probe</text>
+    <text x="234" y="431" class="sub">find the numbers</text>
+
+    <circle cx="560" cy="388" r="7" fill="#8fb3ff"/>
+    <text x="574" y="393" class="lbl">scorecard</text>
+    <text x="574" y="409" class="sub">targets + measured noise</text>
+
+    <circle cx="300" cy="340" r="7" fill="#8fb3ff"/>
+    <text x="150" y="345" class="lbl">experiment</text>
+    <text x="150" y="361" class="sub">one lever, commit</text>
+
+    <circle cx="620" cy="296" r="7" fill="#8fb3ff"/>
+    <text x="634" y="301" class="lbl">measure</text>
+    <text x="634" y="317" class="sub">A B B A vs the base</text>
+
+    <circle cx="420" cy="250" r="7" fill="#7ee08a"/>
+    <text x="280" y="245" class="lbl">kept ✓</text>
+    <text x="280" y="261" class="sub">beat the noise</text>
+
+    <circle cx="600" cy="200" r="7" fill="#7ee08a"/>
+    <circle cx="560" cy="140" r="7" fill="#7ee08a"/>
+  </g>
+
+  <!-- dropped: slides back down -->
+  <path d="M 616 307 C 606 340 628 366 676 366" fill="none" stroke="#ff8a7a" stroke-width="2.5" stroke-linecap="round"/>
+  <polygon points="674,359 688,366 674,373" fill="#ff8a7a"/>
+  <text x="696" y="364" class="lbl" style="fill:#ffb3a8">dropped</text>
+  <text x="696" y="380" class="sub">auto-reverted</text>
+
+  <!-- stop sign -->
+  <g transform="translate(784 146)">
+    <polygon points="-11,-26 11,-26 26,-11 26,11 11,26 -11,26 -26,11 -26,-11" fill="#e8546b"/>
+    <text x="0" y="5" text-anchor="middle" class="t" font-size="12" font-weight="700" fill="#fff">STOP?</text>
+    <text x="36" y="-3" class="lbl">not while a</text>
+    <text x="36" y="13" class="lbl">goal is open</text>
+  </g>
+
+  <!-- summit flag -->
+  <line x1="620" y1="94" x2="620" y2="44" stroke="#e9f0fb" stroke-width="3" stroke-linecap="round"/>
+  <polygon points="621,45 662,56 621,68" fill="#7ee08a"/>
+  <text x="672" y="54" class="lbl">achieved</text>
+  <text x="672" y="70" class="sub">met twice + reviewed</text>
+
+  <!-- the climber: a little pi -->
+  <g transform="translate(508 246) rotate(-14)">
+    <ellipse cx="0" cy="34" rx="18" ry="4" fill="#0b1220" opacity=".35"/>
+    <path d="M -9 -2 C -9 12 -11 22 -16 30" fill="none" stroke="#ffcf5c" stroke-width="7" stroke-linecap="round"/>
+    <path d="M 9 -2 C 9 12 10 22 14 30" fill="none" stroke="#ffcf5c" stroke-width="7" stroke-linecap="round"/>
+    <rect x="-24" y="-16" width="48" height="16" rx="8" fill="#ffcf5c"/>
+    <circle cx="-7" cy="-8" r="2.4" fill="#1a2238"/>
+    <circle cx="7" cy="-8" r="2.4" fill="#1a2238"/>
+    <circle cx="-14" cy="-5" r="2.4" fill="#ff9aa8" opacity=".8"/>
+    <circle cx="14" cy="-5" r="2.4" fill="#ff9aa8" opacity=".8"/>
+    <path d="M -3 -4 Q 0 -1 3 -4" fill="none" stroke="#1a2238" stroke-width="1.4" stroke-linecap="round"/>
+    <path d="M 24 -10 L 38 -26" stroke="#c9a46a" stroke-width="3" stroke-linecap="round"/>
+  </g>
+</svg>
