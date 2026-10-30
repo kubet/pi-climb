@@ -1418,6 +1418,22 @@ describe("acceptance review", () => {
 		}
 	});
 
+	test("a metric pinned at one value far from its target (a cap or failure penalty) is called out", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-pinned-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 75000 > p90.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "pinned");
+			await z.load();
+			await z.cmd("faster answers");
+			const out = await z.tool("climb_scorecard", { metrics: [{ name: "answer_p90_ms", cmd: "cat p90.txt", dir: "down", target: 1500, noise: 0.01 }] });
+			expect(out).toContain("answer_p90_ms read exactly 75000 on every A/A run, 50× its target");
+			expect(out).toContain("count those failures in a metric of their own (target 0)");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
 	test("a part the review holds open comes next, with what is missing, not a sibling's climb", async () => {
 		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-part-"));
 		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });

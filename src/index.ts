@@ -1187,6 +1187,13 @@ export default async function climb(pi: ExtensionAPI) {
 				if (m.noise >= way && !again)
 					return { problem: `${m.name}: noise ${pct(m.noise)} (${aa}) is as large as the whole way to the target (${pct(way)}), so no result could be told apart from luck. ${fix}` };
 				if (m.noise > way / 3) return { warning: `${m.name}: each kept step must beat ${pct(m.noise)}, ${Math.round((m.noise / way) * 100)}% of the way to target (${aa}). ${fix}` };
+				// Every run on one value far from the target looks like a pinned cap or failure penalty: nothing under it
+				// can show until every case passes, so no speed-up is ever kept.
+				const pinned = xs.length >= 3 && xs.every(x => x === xs[0]) && m.target > 0 && xs[0] > 0 && (m.dir === "down" ? xs[0] >= 10 * m.target : m.target >= 10 * xs[0]);
+				if (pinned)
+					return {
+						warning: `${m.name} read exactly ${xs[0]} on every A/A run, ${m.dir === "down" ? `${Math.round(xs[0] / m.target)}× its target` : `1/${Math.round(m.target / xs[0])} of its target`}. If that is a cap or a penalty for a failed case, no improvement under it can show until every case passes: count those failures in a metric of their own (target 0) and measure this over the cases that pass.`,
+					};
 				return {};
 			};
 			const cached = "Runs on this commit are cached for 30 minutes, so a retry only measures what changed.";
