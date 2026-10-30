@@ -162,6 +162,12 @@ describe("ledger fold", () => {
 		expect(X.nextAction(st, st.goals.get("b")!)).toContain("split it into parts with climb_split");
 	});
 
+	test("a target met from the start (a review re-ask card) reads 100%, never negative", () => {
+		expect(X.progressPct(metric({ dir: "up", baseline: 13, target: 10 }), 16)).toBe(100);
+		expect(X.progressPct(metric({ dir: "up", baseline: 13, target: 10 }), 9)).toBe(0);
+		expect(X.progressPct(metric({ dir: "down", baseline: 100, target: 10 }), 55)).toBe(50);
+	});
+
 	test("a part achieved since the last beat is progress for the tree", () => {
 		const entries: L.Entry[] = [
 			{ ts: iso(9e6, nowMs), kind: "goal", goal: "r", intent: "voice", cfg: { poke_max: 3, beat_s: 1800 } },

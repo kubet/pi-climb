@@ -123,8 +123,10 @@ export function progressPct(m: Metric, best: number | undefined): number {
 	if (best === undefined) return 0;
 	if (m.hold) return met(m, best) ? 100 : -100;
 	const total = m.dir === "down" ? m.baseline - m.target : m.target - m.baseline;
+	// A card that re-checks a target met from the start (a review re-ask) has no way to go: met is all of it.
+	if (total <= 0) return met(m, best) ? 100 : 0;
 	const moved = m.dir === "down" ? m.baseline - best : best - m.baseline;
-	return total ? Math.round((moved / total) * 100) : 100;
+	return Math.round((moved / total) * 100);
 }
 
 const SPARK = "▁▂▃▄▅▆▇█";
