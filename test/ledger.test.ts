@@ -146,6 +146,15 @@ describe("ledger fold", () => {
 		expect(X.nextAction(st, st.goals.get("r")!)).toContain("Next, a1: [climb a1] Every target is met, yet a1 is not closed");
 	});
 
+	test("a judge's PIVOT after an experiment opened travels with every nudge to finish it", () => {
+		const exp: L.Entry = { ts: iso(3e6, nowMs), kind: "exp", goal: "g", id: "x1", lever: "c", hypothesis: "h", prediction: "", base: "a", ref: { ms: 100 } };
+		const judge = (t: number): L.Entry => ({ ts: iso(t, nowMs), kind: "judge", goal: "g", by: "judge", verdict: "pivot", diagnosis: "same idea", next: "trace one request end to end." });
+		const after = L.fold([...base(), exp, judge(2e6)]);
+		expect(X.nextAction(after, after.goals.get("g")!)).toContain("The judge said PIVOT after x1 opened: trace one request end to end. If x1 is not that");
+		const before = L.fold([...base(), judge(3.5e6), exp]);
+		expect(X.nextAction(before, before.goals.get("g")!)).not.toContain("PIVOT");
+	});
+
 	test("a part achieved since the last beat is progress for the tree", () => {
 		const entries: L.Entry[] = [
 			{ ts: iso(9e6, nowMs), kind: "goal", goal: "r", intent: "voice", cfg: { poke_max: 3, beat_s: 1800 } },

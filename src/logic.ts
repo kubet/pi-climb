@@ -315,8 +315,14 @@ export function nextAction(st: State, g: Goal): string {
 		const judged = g.judge ? ` Judge (${g.judge.verdict}): ${g.judge.diagnosis} → ${g.judge.next}.` : "";
 		return `[climb ${g.id}] Researching "${g.intent}"${tag} (${n} candidate metrics probed).${judged} Itemize the research: register each candidate metric with climb_probe (the extension runs it). Then call climb_scorecard with the 1-${MAX_METRICS} that matter, each with a direction and an ambitious target. If the intent needs metrics with different instruments, split it into parts with climb_split.${lessons(st, g)}`;
 	}
-	if (g.open)
-		return `[climb ${g.id}] Experiment ${g.open.id} is open (lever "${g.open.lever}": ${g.open.hypothesis}). Finish it: implement, commit, then call climb_measure${tag}. State: ${cardSummary(g)}.`;
+	if (g.open) {
+		// A judge's PIVOT after the experiment opened outranks "finish it": the nudges must not contradict it.
+		const line: Goal[] = [];
+		for (let x: Goal | undefined = g; x; x = x.parent ? st.goals.get(x.parent) : undefined) line.push(x);
+		const pivot = line.map(x => x.judge).filter(j => j?.verdict === "pivot" && j.ts > g.open!.ts).sort((a, b) => b!.ts.localeCompare(a!.ts))[0];
+		const turn = pivot ? ` The judge said PIVOT after ${g.open.id} opened: ${pivot.next.replace(/[.\s]+$/, "")}. If ${g.open.id} is not that, measure what it has or drop it (climb_measure with abandon), then do that.` : "";
+		return `[climb ${g.id}] Experiment ${g.open.id} is open (lever "${g.open.lever}": ${g.open.hypothesis}). Finish it: implement, commit, then call climb_measure${tag}.${turn} State: ${cardSummary(g)}.`;
+	}
 	const tried = [...g.levers.entries()].map(([k, l]) => `${k} (${l.kept}/${l.tried} kept)`).join(", ");
 	const judged = g.diagnosis ? ` Last diagnosis (${g.diagnosis.by}): ${g.diagnosis.verdict} — ${g.diagnosis.next}.` : "";
 	return `[climb ${g.id}] Keep climbing${tag}. State: ${cardSummary(g)}.${tried ? ` Levers tried: ${tried}.` : ""}${judged}${lessons(st, g)} Pick the lever with the highest expected gain on the metric furthest from target and call climb_experiment.`;
