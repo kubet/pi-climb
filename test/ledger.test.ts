@@ -121,13 +121,14 @@ describe("ledger fold", () => {
 		const held = (card: Partial<L.CardE>) => L.fold([...base(), review("g", 3.5e6), { ts: iso(3e6, nowMs), kind: "card", goal: "g", metrics: [metric()], ...card } as L.Entry]).goals.get("g")!.reviewed;
 		expect(held({ reask: true })).toBeDefined();
 		expect(held({})).toBeUndefined();
-		// Targets met once and not confirmed: keep climbing, with the state.
+		// Targets met once and not confirmed: the same checks on a scorecard confirm it (or re-baseline a lucky draw).
 		const once = L.fold([
 			...base(),
 			{ ts: iso(3e6, nowMs), kind: "exp", goal: "g", id: "x1", lever: "c", hypothesis: "", prediction: "", base: "a", ref: { ms: 100 } },
 			{ ts: iso(2e6, nowMs), kind: "result", goal: "g", exp: "x1", head: "b", values: { ms: 8 }, verdict: "kept", reason: "" },
 		]);
-		expect(X.nextAction(once, once.goals.get("g")!)).toContain("Keep climbing. State: ms 8");
+		expect(X.nextAction(once, once.goals.get("g")!)).toContain("Every target is met, yet g is not closed");
+		expect(X.nextAction(once, once.goals.get("g")!)).toContain("climb_scorecard with the same checks");
 	});
 
 	test("a part achieved since the last beat is progress for the tree", () => {

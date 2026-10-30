@@ -616,6 +616,19 @@ export default async function climb(pi: ExtensionAPI) {
 		append(root, { ts: L.now(), kind: "done", goal: g.id, result: "achieved", values, unreviewed: typeof r === "string" ? r : undefined });
 		return { closedUp: await rollUp(ctx, root, g.id) };
 	}
+	/** Holds that look regressed against the card they were set on, checked against that card's commit
+	 *  interleaved: the machine drifts between then and now, and only pairs tell drift from a regression.
+	 *  What really regressed, as text; undefined when nothing did. */
+	async function holdsSlid(root: string, card: L.CardE, values: L.Values, goal: string, signal: AbortSignal | undefined, say: Progress): Promise<string | undefined> {
+		const looks = card.metrics.filter(m => m.hold && values[m.name] !== undefined && !L.met(m, values[m.name]));
+		if (!looks.length) return undefined;
+		const raw = looks.map(m => `${m.name} ${+m.baseline.toPrecision(6)}→${+values[m.name].toPrecision(6)}`).join(", ");
+		const pairs = card.head ? await paired(root, card.head, looks, goal, signal, t => say(t && `paired check of ${looks.map(m => m.name).join(", ")} against the scorecard's commit: ${t}`)) : undefined;
+		if (typeof pairs === "string") return `${raw} looks regressed, and the paired check could not finish (${pairs})`;
+		if (!pairs) return `${raw} looks regressed (the scorecard's commit could not be measured alongside)`;
+		const pv = X.pairedVerdict(looks, pairs);
+		return looks.some(m => pv.stats[m.name] && pv.stats[m.name].gain < -pv.stats[m.name].noise) ? `${raw} regressed since the scorecard (${pv.reason})` : undefined;
+	}
 	const unmetText = (u: { unmet: string; next: string }) =>
 		`EVERY TARGET MET, BUT THE INTENT IS NOT DONE (acceptance review): ${u.unmet}\nNEXT: ${u.next}. Put what is missing on the scorecard next to the current metrics (climb_scorecard; a check that already passes is welcome: when every metric meets its target there, the review is asked again).`;
 	function achievedText(st: L.State, ctx: Ctx, g: L.Goal, closedUp: string[]): string {
@@ -1076,7 +1089,9 @@ export default async function climb(pi: ExtensionAPI) {
 				names.add(m.name);
 			}
 			// The review is asked about the whole goal: what the held card met must still be on the card, and still met.
-			const held = g.reviewed && g.card && !L.parts(st0, g).length ? g.card : undefined;
+			// Every target met but not closed (a re-measurement missed, or a hold looked regressed): the same checks confirm it.
+			const confirming = !!g.reviewed || X.reached(g);
+			const held = confirming && g.card && !L.parts(st0, g).length ? g.card : undefined;
 			const dropped = held?.metrics.filter(o => !p.metrics!.some(m => m.name === o.name && m.cmd === o.cmd)) ?? [];
 			if (dropped.length)
 				throw new Error(`Keep ${dropped.map(m => m.name).join(", ")} on the scorecard (same command; hold: true is fine): the acceptance review is asked about the whole goal, so what was met must be shown still met at HEAD.`);
@@ -1139,7 +1154,7 @@ export default async function climb(pi: ExtensionAPI) {
 				}
 				// Once the acceptance review held the goal open, a check that already passes is what it asked for.
 				if (L.met(m, m.baseline))
-					return g.reviewed ? {} : { problem: `${m.name} already meets its target (${m.baseline}, ${m.dir} ${m.target}): set an ambitious target, or hold: true if it is a constraint to keep.` };
+					return confirming ? {} : { problem: `${m.name} already meets its target (${m.baseline}, ${m.dir} ${m.target}): set an ambitious target, or hold: true if it is a constraint to keep.` };
 				// The bar every kept step must clear, against the whole way to the target.
 				const way = L.gain(m, m.baseline, m.target);
 				const s = X.samplesFor(xs, m.baseline, way / 3) ?? X.samplesFor(xs, m.baseline, way);
@@ -1189,13 +1204,15 @@ export default async function climb(pi: ExtensionAPI) {
 			// the A/A runs are the confirmation, and the review decides again.
 			const baselines = Object.fromEntries(metrics.map(m => [m.name, m.baseline]));
 			const allMet = metrics.every(m => L.met(m, m.baseline));
-			// Everything on the card met, but a metric the review saw met has slipped since: nothing here could climb it back.
-			const slipped = held?.metrics.filter(o => !L.met(o, baselines[o.name])) ?? [];
-			if (g.reviewed && allMet && slipped.length)
+			// Everything on the card met, but a metric met before has slipped since: nothing here could climb it back.
+			// A hold is judged in pairs against its old card's commit, never raw against a baseline the machine drifted from.
+			const slipped = held?.metrics.filter(o => !o.hold && !L.met(o, baselines[o.name])) ?? [];
+			const slidHolds = held && allMet ? await holdsSlid(root, held, baselines, g.id, signal, say) : undefined;
+			if (allMet && (slipped.length || slidHolds))
 				throw new Error(
-					`${slipped.map(o => `${o.name} is ${baselines[o.name]} at HEAD, ${o.hold ? `a regression from ${o.baseline}` : `short of its target ${o.target}`}`).join("; ")}: a commit since the review undid it. Put it on the scorecard with its target to climb it back, or restore it first.\n${cached}`,
+					`${[...slipped.map(o => `${o.name} is ${baselines[o.name]} at HEAD, short of its target ${o.target}`), ...(slidHolds ? [slidHolds] : [])].join("; ")}: a commit since it was met undid it. Put it on the scorecard with its target to climb it back, or restore it first.\n${cached}`,
 				);
-			const reask = !!g.reviewed && allMet;
+			const reask = confirming && allMet;
 			append(root, { ts: L.now(), kind: "card", goal: g.id, metrics, guard: p.guard, frozen, head: h, parked: p.parked, axioms: p.axioms, instrument, env: ENV, reask: reask || undefined });
 			let verdict = "Next: call climb_experiment with your highest-expected-gain lever.";
 			if (reask) {
@@ -1532,13 +1549,19 @@ export default async function climb(pi: ExtensionAPI) {
 				else reason += ` — auto-revert failed (${rv.err}); restore by hand: git revert --no-commit ${exp.base.slice(0, 8)}..HEAD && git commit`;
 			}
 			append(root, { ts: L.now(), kind: "result", goal: g.id, exp: exp.id, head: h, values, verdict: kept ? "kept" : "dropped", reason: reason!, reverted, proof: byProof || undefined, runs: samples, paired: pairs, gates, env: ENV.hash });
-			let won = kept && g.card.metrics.every(m => L.met(m, values[m.name]));
+			// Targets close a goal; a hold only must not have regressed, and its raw value against an old
+			// baseline is mostly the machine's drift, so one that looks regressed is checked in pairs.
+			const targetsMet = (vals: L.Values) => g.card!.metrics.every(m => m.hold || L.met(m, vals[m.name]));
+			let won = kept && targetsMet(values);
 			let unmet: { unmet: string; next: string } | undefined;
 			let closedUp: string[] = [];
+			let slid: string | undefined;
 			if (won) {
 				// "Done" is never claimed from a single draw: confirm with fresh samples.
 				const c = await measure(root, g.card.metrics, { phase: "confirm", goal: g.id }, signal, samples, t => say(t && `confirming targets ${t}`));
-				won = !c.errors.length && g.card.metrics.every(m => L.met(m, c.values[m.name]));
+				won = !c.errors.length && targetsMet(c.values);
+				if (won) slid = await holdsSlid(root, g.card, c.values, g.id, signal, say);
+				won &&= !slid;
 				if (won) {
 					say("acceptance review: is the intent met, not just the scorecard?");
 					({ unmet, closedUp } = await accept(ctx, root, g, c.values));
@@ -1555,7 +1578,8 @@ export default async function climb(pi: ExtensionAPI) {
 				// The review's finding is the next step; the tree's routing would only repeat it.
 				if (unmet) text += `\n${unmetText(unmet)}`;
 				else {
-					if (kept && g.card.metrics.every(m => L.met(m, values[m.name]))) text += "\nTargets met once but not confirmed on re-measurement; keep climbing.";
+					if (slid) text += `\nEvery target is met, but ${g.id} stays open: ${slid}. Restore it, then confirm with climb_scorecard (same checks).`;
+					else if (kept && targetsMet(values)) text += `\nTargets met once but not confirmed on re-measurement.`;
 					text += `\n${X.nextAction(st, L.rootOf(st, st.goals.get(g.id)!))}`;
 				}
 			}

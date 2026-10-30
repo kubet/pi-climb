@@ -165,9 +165,14 @@ export function goalPct(st: State, g: Goal): number {
 	return Math.min(...(goals.length ? goals : g.card.metrics).map(m => progressPct(m, g.best[m.name])));
 }
 
+/** Every target met by a kept result, yet still open: the re-measurement at closure missed, or a hold looked
+ *  regressed. The same checks on a scorecard confirm it. */
+export const reached = (g: Goal) => !!g.card && !g.done && g.card.metrics.some(m => !m.hold) && g.card.metrics.every(m => m.hold || met(m, g.best[m.name]));
+
 /** Held open by the acceptance review with every target met (or every part achieved): what the review
- *  found missing is all that is left. A split goal's old scorecard is history. */
-const finishing = (st: State, g: Goal) => !umbrella(st, g) && !g.done && !g.open && !!g.reviewed;
+ *  found missing is all that is left. A split goal's old scorecard is history. Or every target is met
+ *  and only a confirmation is missing. */
+const finishing = (st: State, g: Goal) => !umbrella(st, g) && !g.done && !g.open && (!!g.reviewed || reached(g));
 
 /** "1/3": parts achieved of those still counted (abandoned parts are not). */
 const partsDone = (st: State, g: Goal) => {
@@ -292,6 +297,8 @@ export function nextAction(st: State, g: Goal): string {
 		const list = ps.map(p => `${p.id} (${p.card || umbrella(st, p) ? `${goalPct(st, p)}%` : "researching"}${openIn(st, p) ? `, ${openIn(st, p)!.open!.id} open` : ""})`).join(", ");
 		return `[climb ${g.id}] Split into parts: ${list}. Next, ${next.id}: ${nextAction(st, next)}`;
 	}
+	if (finishing(st, g) && !g.reviewed)
+		return `[climb ${g.id}] Every target is met, yet ${g.id} is not closed${tag}: the re-measurement at closure did not confirm it, or a hold metric looked regressed since its scorecard. Restore any regression, then confirm: climb_scorecard with the same checks (measured again at HEAD; a check that already passes is welcome there, and once every metric meets its target the acceptance review is asked).`;
 	if (finishing(st, g)) {
 		// The review's finding, not a later note (the worker's own included), says what is left.
 		const r = g.reviewed!;

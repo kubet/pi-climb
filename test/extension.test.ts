@@ -1215,6 +1215,64 @@ describe("acceptance review", () => {
 		}
 	});
 
+	test("a hold that only looks regressed at closure (the machine drifted) is checked in pairs and does not keep the goal open", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-hold-drift-"));
+		const ctr = path.join(d, ".git", "ctr");
+		const thr = path.join(d, ".git", "thr");
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		// From run `thr` on, every run of the hold reads 30% slower: the machine, not the code (the base side reads it too).
+		const h = `n=$(cat ${ctr} 2>/dev/null || echo 0); echo $((n+1)) > ${ctr}; [ $n -lt $(cat ${thr}) ] && echo 1000 || echo 1300`;
+		try {
+			await run(`git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && git add -A && git commit -qm init && echo 99999 > ${thr}`);
+			const z = host(d, "main", "hold-drift");
+			await z.load();
+			await z.cmd("shrink work");
+			await z.tool("climb_scorecard", { metrics: [{ name: "w", cmd: "cat work.txt", dir: "down", target: 50, noise: 0.05 }, { name: "h", cmd: h, dir: "down", hold: true, noise: 0.05 }] });
+			await z.tool("climb_experiment", { lever: "halve", hypothesis: "", prediction: "" });
+			await run(`echo $(( $(cat ${ctr}) + 1 )) > ${thr} && echo 40 > work.txt && git commit -qam halve`);
+			z.h.judge = "VERDICT: achieved\nUNMET: none\nNEXT: none";
+			const out = await z.tool("climb_measure", {});
+			expect(out).toContain("KEPT x1");
+			expect(out).toContain("GOAL ACHIEVED: g-shrink-work");
+			expect(T.read(d).some(t => t.kind === "run" && t.phase === "paired" && t.metric === "h")).toBe(true);
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
+	test("a goal with every target met but not closed is routed to confirm it; a hold that really regressed since its card is refused in pairs", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-reached-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo 100 > h.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "reached");
+			await z.load();
+			await z.cmd("shrink work");
+			const w = { name: "w", cmd: "cat work.txt", dir: "down", target: 50, noise: 0.05 };
+			const hold = { name: "h", cmd: "cat h.txt", dir: "down", hold: true, noise: 0.05 };
+			await z.tool("climb_scorecard", { metrics: [w, hold] });
+			const id = "g-shrink-work";
+			const base = (await run("git rev-parse HEAD")).stdout.trim();
+			// Kept with every target met, but the closure did not confirm it (the state the live climb was left in).
+			await run("echo 40 > work.txt && echo 120 > h.txt && git commit -qam both");
+			const headSha = (await run("git rev-parse HEAD")).stdout.trim();
+			L.append(
+				d,
+				{ ts: L.now(), kind: "exp", goal: id, id: "x1", lever: "halve", hypothesis: "", prediction: "", base, ref: { w: 100, h: 100 } },
+				{ ts: L.now(), kind: "result", goal: id, exp: "x1", head: headSha, values: { w: 40, h: 100 }, verdict: "kept", reason: "w 100→40" },
+			);
+			const s = L.fold(L.read(d));
+			expect(X.reached(s.goals.get(id)!)).toBe(true);
+			expect(X.nextAction(s, s.goals.get(id)!)).toContain("Every target is met, yet g-shrink-work is not closed");
+			await expect(z.tool("climb_scorecard", { metrics: [w, hold] })).rejects.toThrow("h 100→120 regressed since the scorecard");
+			await run("echo 100 > h.txt && git commit -qam restore");
+			z.h.judge = "VERDICT: achieved\nUNMET: none\nNEXT: none";
+			expect(await z.tool("climb_scorecard", { metrics: [w, hold] })).toContain("GOAL ACHIEVED: g-shrink-work");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
 	test("a part the review holds open comes next, with what is missing, not a sibling's climb", async () => {
 		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-part-"));
 		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
