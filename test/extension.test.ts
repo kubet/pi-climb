@@ -241,15 +241,16 @@ describe("climb extension", () => {
 	});
 
 	test("three drops in a row block experiments until diagnosis; renaming the lever does not dodge it", async () => {
+		const judged = ledger().filter(e => e.kind === "judge" && e.by === "judge").length;
+		let last = "";
 		for (const lever of ["bloat", "bloat v2", "padding"]) {
 			await x.tool("climb_experiment", { lever, hypothesis: "?", prediction: "?" });
 			await commit(90, lever);
-			expect(await x.tool("climb_measure", {})).toContain("DROPPED");
+			last = await x.tool("climb_measure", {});
+			expect(last).toContain("DROPPED");
 		}
-		await x.tool("climb_judge", { verdict: "pivot", diagnosis: "every attempt added work", next: "delete instead" });
-		const judged = ledger().filter(e => e.kind === "judge" && e.by === "judge").length;
-		// self-grading does not clear the gate; tripping it summons the independent judge
-		await expect(x.tool("climb_experiment", { lever: "brand new idea", hypothesis: "?", prediction: "?" })).rejects.toThrow("in a row");
+		// The drop that trips the gate summons the independent judge at once (self-grading never clears it: ledger tests).
+		expect(last).toContain("3 experiments dropped in a row: that is grid search. The independent judge is reviewing now");
 		await until(() => ledger().filter(e => e.kind === "judge" && e.by === "judge").length > judged);
 		expect(await x.tool("climb_experiment", { lever: "noop", hypothesis: "?", prediction: "?" })).toContain("Registered");
 		await commit(50, "noop");

@@ -1594,9 +1594,12 @@ export default async function climb(pi: ExtensionAPI) {
 			}
 			await writeExport(root);
 			const st = refresh(ctx, root);
+			// The drop that trips the grid-search gate summons the judge now: its verdict is ready before the next try.
+			const blocked = !kept && X.streakBlocked(st.goals.get(g.id)!);
+			if (blocked && hasJudge(ctx)) void judge(ctx, root, g.id, "drop streak");
 			let text = kept
 				? `KEPT ${exp.id}${byProof ? " by proof" : ""}: ${reason}.${byProof ? " A verified fix, but the scorecard has not moved: it does not count as progress." : ""}`
-				: `DROPPED ${exp.id}: ${reason}.${reverted ? ` Reverted in ${reverted.slice(0, 8)}.` : ""}`;
+				: `DROPPED ${exp.id}: ${reason}.${reverted ? ` Reverted in ${reverted.slice(0, 8)}.` : ""}${blocked && hasJudge(ctx) ? ` ${blocked} The independent judge is reviewing now; its verdict arrives as a message before your next experiment.` : ""}`;
 			if (won) text += `\n${achievedText(st, ctx, g, closedUp)}`;
 			else {
 				// The review's finding is the next step; the tree's routing would only repeat it.
