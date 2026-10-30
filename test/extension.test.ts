@@ -1434,6 +1434,23 @@ describe("acceptance review", () => {
 		}
 	});
 
+	test("a small, noisy failure count is refused with advice that fits counts", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-small-count-"));
+		const ctr = path.join(d, ".git", "ctr");
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo x > a && git add -A && git commit -qm init");
+			const z = host(d, "main", "small-count");
+			await z.load();
+			await z.cmd("no missed answers");
+			// 0, 1, 2, 0, 1, 2 ... misses per run
+			const cmd = `n=$(cat ${ctr} 2>/dev/null || echo 0); echo $((n+1)) > ${ctr}; echo $((n % 3))`;
+			await expect(z.tool("climb_scorecard", { metrics: [{ name: "missed", cmd, dir: "down", target: 0 }] })).rejects.toThrow("A count this small is coarse: count over more cases per run");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
 	test("a part the review holds open comes next, with what is missing, not a sibling's climb", async () => {
 		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-part-"));
 		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
