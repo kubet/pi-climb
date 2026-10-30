@@ -1,4 +1,4 @@
-# pi-goal — `/climb`
+# pi-climb — `/climb`
 
 <p align="center"><img src="assets/climb.svg" alt="/climb: a little pi climbs a mountain — probe, scorecard, experiment, measure; kept steps go up, dropped ones are reverted; the summit is achieved and reviewed" width="860"></p>
 
@@ -9,7 +9,7 @@ The agent writes the code. The extension measures, decides and keeps the record,
 ## Install
 
 ```bash
-omp plugin install git+ssh://git@github.com/kubet/pi-goal.git
+omp plugin install git+ssh://git@github.com/kubet/pi-climb.git
 ```
 
 Needs a git repo with at least one commit, and a checkout with no other uncommitted work. If the checkout is shared, give the climb its own worktree: `git worktree add ../climb HEAD`, then `/climb move ../climb`.

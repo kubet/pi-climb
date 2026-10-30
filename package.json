@@ -1,5 +1,5 @@
 {
-	"name": "pi-goal",
+	"name": "pi-climb",
 	"version": "0.2.0",
 	"description": "/climb — autonomous hill-climbing for pi and omp. The extension owns the ledger, measures every metric itself, decides kept/dropped, reverts losers, blocks the agent from quitting, and calls a judge when progress stalls.",
 	"type": "module",
