@@ -597,8 +597,9 @@ export default async function climb(pi: ExtensionAPI) {
 		for (let g = st.goals.get(id); g?.parent; g = st.goals.get(g.parent)) {
 			const parent = st.goals.get(g.parent);
 			if (!parent || parent.done) break;
-			const ps = L.parts(st, parent);
-			if (!ps.every(c => c.done?.result === "achieved")) break;
+			// Abandoned parts were dropped (by the user): the rest decide, and the review checks the parent's intent.
+			const ps = L.parts(st, parent).filter(c => c.done?.result !== "abandoned");
+			if (!ps.length || !ps.every(c => c.done?.result === "achieved")) break;
 			const r = await review(ctx, root, parent);
 			if (typeof r === "string" && parent.reviewed) break;
 			if (typeof r === "object" && !r.achieved) {
@@ -1672,7 +1673,12 @@ export default async function climb(pi: ExtensionAPI) {
 			const g = pick(st, p.goal);
 			const busy = X.openIn(st, g);
 			if (busy) throw new Error(`Experiment ${busy.open!.id} on ${busy.id} is open; finish it with climb_measure before splitting.`);
-			if (L.depth(st, g) + 1 > X.MAX_DEPTH) throw new Error(`${g.id} is already ${X.MAX_DEPTH - 1} level(s) deep; split its parent differently instead.`);
+			if (L.depth(st, g) + 1 > X.MAX_DEPTH) {
+				const home = g.parent ? st.goals.get(g.parent) : undefined;
+				throw new Error(
+					`${g.id} is ${L.depth(st, g)} levels deep, the deepest a part goes. Climb it with one scorecard (up to ${X.MAX_METRICS} metrics, holds included)${home ? `, or add what it needs beside it: climb_split on ${home.id} (it already has parts, so one more is fine)` : ""}.`,
+				);
+			}
 			const open = L.openParts(st, g).length;
 			const intents = (p.parts ?? []).map(x => x.intent?.trim()).filter(Boolean);
 			if (intents.length !== (p.parts ?? []).length || new Set(intents).size !== intents.length) throw new Error("Each part needs its own non-empty intent.");

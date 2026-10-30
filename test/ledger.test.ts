@@ -155,6 +155,13 @@ describe("ledger fold", () => {
 		expect(X.nextAction(before, before.goals.get("g")!)).not.toContain("PIVOT");
 	});
 
+	test("a researching part as deep as parts go is pointed beside it, not at a split it cannot make", () => {
+		const goal = (id: string, parent?: string): L.Entry => ({ ts: iso(9e6, nowMs), kind: "goal", goal: id, parent, intent: id, cfg: { poke_max: 3, beat_s: 1800 } });
+		const st = L.fold([goal("r"), goal("a", "r"), goal("a1", "a"), goal("b", "r")]);
+		expect(X.nextAction(st, st.goals.get("a1")!)).toContain("It is as deep as parts go: what one scorecard cannot hold goes in a part beside it (climb_split on a).");
+		expect(X.nextAction(st, st.goals.get("b")!)).toContain("split it into parts with climb_split");
+	});
+
 	test("a part achieved since the last beat is progress for the tree", () => {
 		const entries: L.Entry[] = [
 			{ ts: iso(9e6, nowMs), kind: "goal", goal: "r", intent: "voice", cfg: { poke_max: 3, beat_s: 1800 } },

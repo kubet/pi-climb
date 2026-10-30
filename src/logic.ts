@@ -9,6 +9,7 @@ import {
 	type LearnE,
 	active,
 	clock,
+	depth,
 	epoch,
 	gain,
 	knowledge,
@@ -313,7 +314,7 @@ export function nextAction(st: State, g: Goal): string {
 	if (!g.card) {
 		const n = g.probes.filter(p => p.value !== undefined).length;
 		const judged = g.judge ? ` Judge (${g.judge.verdict}): ${g.judge.diagnosis} → ${g.judge.next}.` : "";
-		return `[climb ${g.id}] Researching "${g.intent}"${tag} (${n} candidate metrics probed).${judged} Itemize the research: register each candidate metric with climb_probe (the extension runs it). Then call climb_scorecard with the 1-${MAX_METRICS} that matter, each with a direction and an ambitious target. If the intent needs metrics with different instruments, split it into parts with climb_split.${lessons(st, g)}`;
+		return `[climb ${g.id}] Researching "${g.intent}"${tag} (${n} candidate metrics probed).${judged} Itemize the research: register each candidate metric with climb_probe (the extension runs it). Then call climb_scorecard with the 1-${MAX_METRICS} that matter, each with a direction and an ambitious target. ${depth(st, g) < MAX_DEPTH ? "If the intent needs metrics with different instruments, split it into parts with climb_split." : `It is as deep as parts go: what one scorecard cannot hold goes in a part beside it (climb_split on ${g.parent}).`}${lessons(st, g)}`;
 	}
 	if (g.open) {
 		// A judge's PIVOT after the experiment opened outranks "finish it": the nudges must not contradict it.

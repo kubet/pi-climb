@@ -1352,6 +1352,29 @@ describe("acceptance review", () => {
 		}
 	});
 
+	test("a parent whose open parts are achieved closes even when the user dropped another part", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-dropped-part-"));
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > a.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "dropped-part");
+			await z.load();
+			await z.cmd("make it fast and good");
+			await z.tool("climb_split", { parts: [{ intent: "fast responses" }, { intent: "good answers" }] });
+			await z.cmd("done g-good-answers");
+			expect(L.fold(L.read(d)).goals.get("g-good-answers")!.done?.result).toBe("abandoned");
+			await z.tool("climb_scorecard", { goal: "g-fast-responses", metrics: [{ name: "ms", cmd: "cat a.txt", dir: "down", target: 50, noise: 0.05 }] });
+			z.h.judge = "VERDICT: achieved\nUNMET: none\nNEXT: none";
+			await z.tool("climb_experiment", { goal: "g-fast-responses", lever: "halve", hypothesis: "", prediction: "" });
+			await run("echo 40 > a.txt && git commit -qam halve");
+			const out = await z.tool("climb_measure", { goal: "g-fast-responses" });
+			expect(out).toContain("That completes g-make-it-fast-and");
+			expect(L.fold(L.read(d)).goals.get("g-make-it-fast-and")!.done?.result).toBe("achieved");
+		} finally {
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+
 	test("a part the review holds open comes next, with what is missing, not a sibling's climb", async () => {
 		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-accept-part-"));
 		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
