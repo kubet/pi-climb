@@ -184,6 +184,8 @@ describe("ledger fold", () => {
 		expect(X.progressPct(metric({ dir: "up", baseline: 13, target: 10 }), 16)).toBe(100);
 		expect(X.progressPct(metric({ dir: "up", baseline: 13, target: 10 }), 9)).toBe(0);
 		expect(X.progressPct(metric({ dir: "down", baseline: 100, target: 10 }), 55)).toBe(50);
+		expect(X.progressPct(metric({ dir: "down", baseline: 4581, target: 0 }), 2)).toBe(99);
+		expect(X.progressPct(metric({ dir: "down", baseline: 4581, target: 0 }), 0)).toBe(100);
 	});
 
 	test("a part achieved since the last beat is progress for the tree", () => {

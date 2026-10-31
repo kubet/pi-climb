@@ -126,7 +126,9 @@ export function progressPct(m: Metric, best: number | undefined): number {
 	// A card that re-checks a target met from the start (a review re-ask) has no way to go: met is all of it.
 	if (total <= 0) return met(m, best) ? 100 : 0;
 	const moved = m.dir === "down" ? m.baseline - best : best - m.baseline;
-	return Math.round((moved / total) * 100);
+	// 4581 -> 2 of a target of 0 rounds to 100: only a met target reads as done.
+	const pct = Math.round((moved / total) * 100);
+	return met(m, best) ? pct : Math.min(pct, 99);
 }
 
 const SPARK = "▁▂▃▄▅▆▇█";
