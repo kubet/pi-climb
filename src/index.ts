@@ -680,8 +680,18 @@ export default async function climb(pi: ExtensionAPI) {
 
 	// One measurement at a time: concurrent benchmarks corrupt each other's numbers.
 	let measuring: Promise<unknown> = Promise.resolve();
+	/** Climb tools measuring right now. */
+	let inFlight = 0;
 	function exclusive<T>(fn: () => Promise<T>): Promise<T> {
-		const run = measuring.then(fn, fn);
+		const counted = async () => {
+			inFlight++;
+			try {
+				return await fn();
+			} finally {
+				inFlight--;
+			}
+		};
+		const run = measuring.then(counted, counted);
 		measuring = run.catch(() => {});
 		return run;
 	}
@@ -849,9 +859,11 @@ export default async function climb(pi: ExtensionAPI) {
 		const busy = X.openIn(st, g);
 		const note = busy ? `${busy.open!.id} open${busy !== g ? ` on ${busy.id}` : ""}` : !g.card && !L.umbrella(st, g) ? "no scorecard yet" : !idle ? "worker busy" : undefined;
 		const progress = L.treeProgressSinceBeat(st, g);
-		// An independent verdict restarts the count, so the judge runs once per stall, not every beat.
-		const stale = progress ? 0 : (L.judgedSinceBeat(g) ? 0 : (g.lastBeat?.stale ?? 0)) + 1;
-		append(root, { ts: L.now(), kind: "beat", goal: g.id, head: h, progress, stale, note });
+		// An independent verdict restarts the count, so the judge runs once per stall, not every beat. An hour the
+		// extension spends measuring is its own instrument's time, not the worker's: it holds the count.
+		const count = L.judgedSinceBeat(g) ? 0 : (g.lastBeat?.stale ?? 0);
+		const stale = progress ? 0 : inFlight ? count : count + 1;
+		append(root, { ts: L.now(), kind: "beat", goal: g.id, head: h, progress, stale, note: inFlight ? `${note ? `${note} · ` : ""}measuring` : note });
 
 		const after = load(root).goals.get(g.id)!;
 		if (paused || L.stuck(after)) return;

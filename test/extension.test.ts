@@ -1578,3 +1578,44 @@ describe("flaky guard", () => {
 		}
 	});
 });
+
+describe("heartbeat while the extension measures", () => {
+	test("an hour spent measuring holds the stale count; the next empty hour counts", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-measuring-"));
+		const hold = `${d}-hold`;
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		const real = L.clock.ms;
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "measuring");
+			await z.load();
+			await z.cmd("shrink work --beat 30m --poke-max 3");
+			await z.tool("climb_scorecard", { metrics: [{ name: "work", cmd: `while [ -f ${hold} ]; do sleep 0.05; done; cat work.txt`, dir: "down", target: 10, noise: 0.05 }] });
+			const t0 = real();
+			const beats = () => L.read(d).filter((e): e is L.BeatE => e.kind === "beat");
+			const fire = async (min: number) => {
+				L.clock.ms = () => t0 + min * 60_000 + (real() - t0);
+				z.h.idle = false;
+				z.h.timerFn!();
+				await Bun.sleep(300);
+			};
+			await fire(61);
+			expect(beats().at(-1)).toMatchObject({ progress: true, stale: 0 }); // the first scorecard
+			await z.tool("climb_experiment", { lever: "nothing", hypothesis: "", prediction: "" });
+			await run("git commit -q --allow-empty -m noop");
+			fs.writeFileSync(hold, "");
+			const measured = z.tool("climb_measure", {});
+			await Bun.sleep(300);
+			await fire(122);
+			expect(beats().at(-1)).toMatchObject({ progress: false, stale: 0, note: "x1 open · measuring" });
+			fs.rmSync(hold);
+			expect(await measured).toContain("DROPPED x1");
+			await fire(183);
+			expect(beats().at(-1)).toMatchObject({ progress: false, stale: 1 });
+		} finally {
+			L.clock.ms = real;
+			fs.rmSync(hold, { force: true });
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+});
