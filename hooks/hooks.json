@@ -1,0 +1,78 @@
+{
+	"description": "climb: every hook reaches the session's climb server (one extension instance per session).",
+	"hooks": {
+		"UserPromptSubmit": [
+			{
+				"hooks": [
+					{
+						"type": "mcp_tool",
+						"server": "plugin:climb:climb",
+						"tool": "climb_hook",
+						"input": { "event": "UserPromptSubmit", "prompt": "${prompt}" },
+						"timeout": 600
+					}
+				]
+			}
+		],
+		"PreToolUse": [
+			{
+				"hooks": [
+					{
+						"type": "mcp_tool",
+						"server": "plugin:climb:climb",
+						"tool": "climb_hook",
+						"input": {
+							"event": "PreToolUse",
+							"tool_name": "${tool_name}",
+							"file_path": "${tool_input.file_path}",
+							"notebook_path": "${tool_input.notebook_path}",
+							"command": "${tool_input.command}",
+							"agent_id": "${agent_id}"
+						},
+						"timeout": 60
+					}
+				]
+			}
+		],
+		"PostToolUse": [
+			{
+				"hooks": [
+					{
+						"type": "mcp_tool",
+						"server": "plugin:climb:climb",
+						"tool": "climb_hook",
+						"input": { "event": "PostToolUse", "agent_id": "${agent_id}" },
+						"timeout": 60
+					}
+				]
+			}
+		],
+		"Stop": [
+			{
+				"hooks": [
+					{
+						"type": "mcp_tool",
+						"server": "plugin:climb:climb",
+						"tool": "climb_hook",
+						"input": { "event": "Stop" },
+						"timeout": 600
+					}
+				]
+			}
+		],
+		"SessionStart": [
+			{
+				"matcher": "compact|clear",
+				"hooks": [
+					{
+						"type": "mcp_tool",
+						"server": "plugin:climb:climb",
+						"tool": "climb_hook",
+						"input": { "event": "SessionStart" },
+						"timeout": 60
+					}
+				]
+			}
+		]
+	}
+}

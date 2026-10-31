@@ -33,7 +33,7 @@ interface Base {
 	goal: string;
 }
 /** A goal; with `parent`, a part of a decomposed goal (its own research, scorecard and experiments). */
-export interface GoalE extends Base { kind: "goal"; intent: string; cfg: Cfg; parent?: string; why?: string }
+export interface GoalE extends Base { kind: "goal"; intent: string; cfg: Cfg; parent?: string; why?: string; harness?: string }
 export interface CardE extends Base {
 	kind: "card";
 	metrics: Metric[];
@@ -51,7 +51,7 @@ export interface CardE extends Base {
 	/** Passing checks put to the acceptance review again: the hold it answers stands until the review does. */
 	reask?: true;
 }
-export interface Env { host: string; os: string; arch: string; cpus: number; cpu: string; mem_gb: number; runtime: string; hash: string }
+export interface Env { host: string; os: string; arch: string; cpus: number; cpu: string; mem_gb: number; runtime: string; harness?: string; hash: string }
 /** How each gate came out, so a result can be audited without parsing its reason. */
 export interface Gates { guard: "pass" | "fail" | "none"; instrument: "same" | "changed"; proof?: "pass" | "fail" | "void" }
 /** A check that failed at the base and must pass once the change works, with the

@@ -106,8 +106,9 @@ export function leaksIntoRepo(root: string, rel: string, linked: string[]): bool
 	}
 	return false;
 }
-/** The machine measurements run on: a result is "metric M on commit C, instrument I, environment E". */
-const ENV: L.Env = (() => {
+/** The machine measurements run on: a result is "metric M on commit C, instrument I, environment E".
+ *  The harness driving the climb is recorded beside it; the hash stays the machine's. */
+const envOf = (harness: string): L.Env => {
 	const cpus = os.cpus();
 	const facts = {
 		host: os.hostname(),
@@ -118,8 +119,8 @@ const ENV: L.Env = (() => {
 		mem_gb: Math.round(os.totalmem() / 2 ** 30),
 		runtime: process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.versions.node}`,
 	};
-	return { ...facts, hash: sha(JSON.stringify(facts)).slice(0, 12) };
-})();
+	return { ...facts, harness, hash: sha(JSON.stringify(facts)).slice(0, 12) };
+};
 
 /** Newest modification time of this extension's sources: a running session compares it with what it loaded. */
 function sourceStamp(): number {
@@ -137,6 +138,9 @@ export default async function climb(pi: ExtensionAPI) {
 	const loadedStamp = sourceStamp();
 	let staleCode = false;
 	const omp = "zod" in pi && !!(pi as { zod?: unknown }).zod;
+	// omp, pi, or a host shim that names itself (Claude Code's): one scorecard climbed by two harnesses compares from the exports.
+	const harness = (pi as { harness?: string }).harness ?? (omp ? "omp" : "pi");
+	const ENV = envOf(harness);
 	const roots = new Map<string, string>();
 	const judging = new Set<string>();
 	let ctxRef: Ctx | undefined;
@@ -1832,7 +1836,7 @@ export default async function climb(pi: ExtensionAPI) {
 				taken.add(id);
 				return id;
 			});
-			append(root, ...p.parts.map((x, i) => ({ ts: L.now(), kind: "goal" as const, goal: ids[i], intent: intents[i], cfg: g.cfg, parent: g.id, why: x.why })));
+			append(root, ...p.parts.map((x, i) => ({ ts: L.now(), kind: "goal" as const, goal: ids[i], intent: intents[i], cfg: g.cfg, parent: g.id, why: x.why, harness })));
 			const after = refresh(ctx, root);
 			return ok(`Split ${g.id} into ${ids.join(", ")}. Each part is a goal: probe it, give it a scorecard, climb it (pass goal: <part> to the climb tools).\n${X.nextAction(after, after.goals.get(g.id)!)}`);
 		}),
@@ -2007,7 +2011,7 @@ export default async function climb(pi: ExtensionAPI) {
 			if (!(await head(root))) return ctx.ui.notify("climb needs at least one commit.", "error");
 			await ensureExcluded(root);
 			const id = X.slug(intent, new Set(st.goals.keys()));
-			append(root, { ts: L.now(), kind: "goal", goal: id, intent, cfg: { poke_max, beat_s } });
+			append(root, { ts: L.now(), kind: "goal", goal: id, intent, cfg: { poke_max, beat_s }, harness });
 			if (st.paused) append(root, { ts: L.now(), kind: "resume", goal: "*" });
 			lease(root, ctx, true);
 			ensureTimer(ctx);

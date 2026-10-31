@@ -41,6 +41,8 @@ export interface Row {
 	correctness: { gate: "PASS" | "FAIL" | "NONE"; scope: string | null };
 	instrument: string | null;
 	environment: string | null;
+	/** The harness the scorecard was measured under: omp, pi, claude-code. */
+	harness: string | null;
 	evidence: { path: string; line?: number; commit?: string }[];
 }
 
@@ -49,10 +51,10 @@ export function build(entries: Entry[], repo: { name: string; remote?: string },
 	const cardOf = new Map<string, CardE>(); // goal|exp -> card it was measured against
 	const exps = new Map<string, ExpE>();
 	const rows: Row[] = [];
-	const goals: { id: string; parent?: string; intent: string; done?: string; unreviewed?: string; created: string }[] = [];
+	const goals: { id: string; parent?: string; intent: string; done?: string; unreviewed?: string; created: string; harness?: string }[] = [];
 	const knowledge: { goal: string; ts: string; kind: string; text: string; evidence?: string; by: string }[] = [];
 	for (const [line, e] of entries.entries()) {
-		if (e.kind === "goal") goals.push({ id: e.goal, parent: e.parent, intent: e.intent, created: e.ts });
+		if (e.kind === "goal") goals.push({ id: e.goal, parent: e.parent, intent: e.intent, created: e.ts, harness: e.harness });
 		else if (e.kind === "done") {
 			const g = goals.find(x => x.id === e.goal);
 			if (g) Object.assign(g, { done: e.result, unreviewed: e.unreviewed });
@@ -137,6 +139,7 @@ function row(r: ResultE, exp: ExpE, card: CardE, m: CardE["metrics"][number], li
 		correctness: { gate: ({ fail: "FAIL", pass: "PASS", none: "NONE" } as const)[guardOf(r, card)], scope: card.guard || null },
 		instrument: card.instrument ?? null,
 		environment: r.env ?? null,
+		harness: card.env?.harness ?? null,
 		evidence: [{ path: ".climb/oracle.jsonl", line: line + 1 }, { path: ".climb/trace.jsonl" }, { path: "git", commit: r.head }, ...(r.reverted ? [{ path: "git", commit: r.reverted }] : [])],
 	};
 }

@@ -2,7 +2,7 @@
 
 <p align="center"><img src="assets/climb.svg" alt="/climb: a little pi climbs a mountain — probe, scorecard, experiment, measure; kept steps go up, dropped ones are reverted; the summit is achieved and reviewed" width="860"></p>
 
-Autonomous hill-climbing for pi-based coding agents: [pi](https://github.com/badlogic/pi-mono) and [omp](https://github.com/can1357/oh-my-pi). You say what should get better. The agent picks metrics and targets, then keeps trying changes until the targets are met.
+Autonomous hill-climbing for coding agents: [pi](https://github.com/badlogic/pi-mono), [omp](https://github.com/can1357/oh-my-pi) and [Claude Code](https://code.claude.com). You say what should get better. The agent picks metrics and targets, then keeps trying changes until the targets are met.
 
 The agent writes the code. The extension measures, decides and keeps the record, so the agent cannot grade its own work or quit early.
 
@@ -20,9 +20,18 @@ pi install git:github.com/kubet/pi-climb
 omp plugin install git+ssh://git@github.com/kubet/pi-climb.git
 ```
 
-From a local checkout: `pi install ./pi-climb` or `omp install ./pi-climb`.
+**Claude Code** (needs [bun](https://bun.sh))
+
+```bash
+claude plugin marketplace add kubet/pi-climb
+claude plugin install climb@pi-climb
+```
+
+From a local checkout: `claude --plugin-dir ./pi-climb`.
 
 On omp, a stop hook keeps the agent working and the judge and acceptance review run as independent side turns. pi has neither, so there the heartbeat drives the loop, the agent's own diagnosis stands in for the judge, and achieved goals are marked unreviewed.
+
+On Claude Code the same extension runs inside the plugin's MCP server, one per session, and the plugin's hooks call it: the Stop hook keeps Claude working, and the judge and acceptance review are a separate `claude -p` with no tools. The command is `/climb:climb` (Claude Code namespaces plugin commands). Claude Code cannot start a turn on its own, so a session the climb let rest resumes on your next message. It moves tool calls longer than two minutes to the background; the plugin holds edits until a measurement returns, and `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` makes Claude wait for it as omp does. Every goal and scorecard records its harness (`omp`, `pi`, `claude-code`), and so does each `export.json` row, so one scorecard climbed by two harnesses compares from the exports.
 
 Needs a git repo with at least one commit, and a checkout with no other uncommitted work. If the checkout is shared, give the climb its own worktree: `git worktree add ../climb HEAD`, then `/climb move ../climb`.
 
@@ -37,7 +46,7 @@ Needs a git repo with at least one commit, and a checkout with no other uncommit
 /climb move <path>                   carry the climb to another checkout
 ```
 
-After a restart, continuing the session (`pi -c`, `omp -c`) picks the climb up from its ledger.
+After a restart, continuing the session (`pi -c`, `omp -c`, `claude -c`) picks the climb up from its ledger.
 
 ## What happens
 
