@@ -33,11 +33,13 @@ export interface RunT extends Base {
 	load?: number;
 	free_mb?: number;
 }
-/** Runs not executed because the same tree and command were measured minutes ago. */
+/** Runs not executed because the same tree and command were measured minutes ago, or a cut-off measurement had finished them. */
 export interface ReuseT extends Base { kind: "reuse"; phase: Phase; metric: string; runs: number }
+/** One finished pair of an interleaved measurement: base and candidate, back to back. */
+export interface PairT extends Base { kind: "pair"; metric: string; cmd: string; base: string; cand: string; a: number; b: number }
 export interface ToolT extends Base { kind: "tool"; tool: string; ms: number; ok: boolean; error?: string }
 export interface JudgeT extends Base { kind: "judge"; ms: number; ok: boolean; error?: string; why: string }
-export type Trace = RunT | ReuseT | ToolT | JudgeT;
+export type Trace = RunT | ReuseT | PairT | ToolT | JudgeT;
 
 const file = (root: string) => path.join(root, DIR, FILE);
 
@@ -130,6 +132,18 @@ export function pooledSd(traces: Trace[], goal: string, metric: string, sinceMs:
 		trees++;
 	}
 	return dof >= 4 ? { sd: Math.sqrt(ss / dof), runs, trees } : undefined;
+}
+
+/** Good values of one tree in one phase since `sinceMs`, in order. */
+export function runsOf(traces: Trace[], goal: string, metric: string, phase: Phase, tree: string, sinceMs: number, cmd: string): number[] {
+	return good(traces, goal, metric, sinceMs, cmd).filter(r => r.phase === phase && r.tree === tree).map(r => r.value);
+}
+
+/** Pairs of these two trees and this command finished since `sinceMs`, in order. */
+export function pairsOf(traces: Trace[], goal: string, metric: string, cmd: string, base: string, cand: string, sinceMs: number): [number, number][] {
+	return traces
+		.filter((x): x is PairT => x.kind === "pair" && x.goal === goal && x.metric === metric && x.cmd === cmd && x.base === base && x.cand === cand && epoch(x.ts) >= sinceMs)
+		.map(x => [x.a, x.b]);
 }
 
 /** Median of every good run of one tree since `sinceMs`: a steadier reference than a single window. */

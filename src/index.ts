@@ -26,6 +26,7 @@ const JUDGE_MS = 5 * 60_000;
 const LEDGER_GUARD = "The climb ledger (.climb/) is append-only and owned by the climb extension. Read it with climb_status.";
 // Measuring runs every sample of every metric: it can outlast a script's or eval cell's timeout (omp's eval stops at one hour).
 const DIRECT = " Call it directly, not from eval or a script: measuring can outlast their timeouts.";
+const RESUMES = " The runs it finished count: climb_measure resumes from them.";
 
 type Ctx = ExtensionContext;
 type Progress = (text: string) => void;
@@ -252,7 +253,7 @@ export default async function climb(pi: ExtensionAPI) {
 					throw new Error(
 						["control", "aa", "smoke"].includes(tag.phase)
 							? "Measurement interrupted; nothing was registered."
-							: "Measurement interrupted; nothing was decided and the experiment stays open.",
+							: `Measurement interrupted; nothing was decided and the experiment stays open.${["result", "recheck"].includes(tag.phase) ? RESUMES : ""}`,
 					);
 				if (r.code !== 0) {
 					errors.push(`${m.name}: exit ${r.code}${r.killed ? " (killed/timeout)" : ""}: ${said(r)}`);
@@ -375,16 +376,19 @@ export default async function climb(pi: ExtensionAPI) {
 	 *  Undefined if the base cannot be checked out or a run fails (the caller falls back). */
 	/** Pairs per metric; undefined when the base cannot be checked out or cannot run the command at all (its
 	 *  first run fails); a string when a later run failed even on a retry: one bad run must not throw the
-	 *  pairs away and leave the decision to a single draw. */
-	async function paired(root: string, base: string, metrics: L.Metric[], goal: string, signal?: AbortSignal, progress?: Progress): Promise<Record<string, [number, number][]> | string | undefined> {
+	 *  pairs away and leave the decision to a single draw. With `since` (an open experiment's start), pairs
+	 *  finished since then count: a measurement that was cut off resumes, and a retry cannot re-roll them. */
+	async function paired(root: string, base: string, metrics: L.Metric[], goal: string, signal?: AbortSignal, progress?: Progress, since?: number): Promise<Record<string, [number, number][]> | string | undefined> {
 		const [baseTree, candTree] = await Promise.all([tree(root, base), tree(root)]);
+		const traces = since === undefined ? [] : T.read(root);
 		try {
 			return await withBase(root, base, async dir => {
 				const out: Record<string, [number, number][]> = {};
 				for (const m of metrics) {
 					const n = Math.max(3, Math.min(6, m.samples + 2));
-					const ps: [number, number][] = [];
-					for (let i = 0; i < n; i++) {
+					const ps = since !== undefined && baseTree && candTree ? T.pairsOf(traces, goal, m.name, cmdId(m.cmd), baseTree, candTree, since).slice(0, n) : [];
+					if (ps.length) T.append(root, { ts: L.now(), kind: "reuse", phase: "paired", goal, metric: m.name, runs: 2 * ps.length });
+					for (let i = ps.length; i < n; i++) {
 						const v: { a?: number; b?: number } = {};
 						for (const side of i % 2 ? (["b", "a"] as const) : (["a", "b"] as const)) {
 							const who = side === "a" ? "base" : "candidate";
@@ -393,7 +397,7 @@ export default async function climb(pi: ExtensionAPI) {
 							let r: Awaited<ReturnType<typeof run>> | undefined;
 							for (let attempt = 0; attempt < 2 && x === undefined; attempt++) {
 								r = await run(side === "a" ? dir : root, m.cmd, m.timeout_s * 1000, { phase: "paired", goal, metric: m.name, tree: side === "a" ? baseTree : candTree, cmd: cmdId(m.cmd) }, signal, attempt > 0, root);
-								if (signal?.aborted) throw new Error("Measurement interrupted; nothing was decided and the experiment stays open.");
+								if (signal?.aborted) throw new Error(`Measurement interrupted; nothing was decided and the experiment stays open.${since === undefined ? "" : RESUMES}`);
 								const y = r.code === 0 ? X.parseNumber(r.stdout) : undefined;
 								if (y !== undefined && Number.isFinite(y)) x = y;
 							}
@@ -404,8 +408,11 @@ export default async function climb(pi: ExtensionAPI) {
 							v[side] = x;
 						}
 						ps.push([v.a!, v.b!]);
+						if (baseTree && candTree) T.append(root, { ts: L.now(), kind: "pair", goal, metric: m.name, cmd: cmdId(m.cmd), base: baseTree, cand: candTree, a: v.a!, b: v.b! });
 					}
 					out[m.name] = ps;
+					// The base's side is an unbiased sample of its tree: when a drop restores it, the next control reuses it.
+					if (baseTree) runs.set(`${baseTree}\0${m.cmd}`, { ts: L.clock.ms(), xs: ps.map(p => p[0]) });
 				}
 				return out;
 			});
@@ -1527,15 +1534,30 @@ export default async function climb(pi: ExtensionAPI) {
 			let pairs: Record<string, [number, number][]> | undefined;
 			if (!reason) {
 				const candidate = await tree(root);
-				const eff = effective(root, g);
-				let r = await measure(root, g.card.metrics, { phase: "result", goal: g.id, tree: candidate }, signal, {}, say);
+				const history = T.read(root);
+				const eff = effective(root, g, history);
+				const opened = L.epoch(exp.ts);
+				// Runs this experiment already finished on this tree count: a measurement that was cut off resumes
+				// where it stopped, and calling again cannot re-roll them.
+				const resumed = (phase: T.Phase, ms: L.Metric[], prior: Record<string, number[]> = {}) => {
+					const done = ms.map(m => (candidate ? T.runsOf(history, g.id, m.name, phase, candidate, opened, cmdId(m.cmd)).slice(0, m.samples) : []));
+					ms.forEach((m, i) => done[i].length && T.append(root, { ts: L.now(), kind: "reuse", phase, goal: g.id, metric: m.name, runs: done[i].length }));
+					return { plan: ms.map((m, i) => ({ ...m, samples: m.samples - done[i].length })), prior: Object.fromEntries(ms.map((m, i) => [m.name, [...(prior[m.name] ?? []), ...done[i]]])) };
+				};
+				const plain = (phase: T.Phase, ms: L.Metric[], prior?: Record<string, number[]>, progress: Progress = say) => {
+					const x = resumed(phase, ms, prior);
+					return measure(root, x.plan, { phase, goal: g.id, tree: candidate }, signal, x.prior, progress);
+				};
+				// A metric whose history shows drift is decided in pairs whatever its plain runs say: it skips them.
+				const drifting = g.card.metrics.filter((m, i) => eff.metrics[i].noise > m.noise);
+				let r = await plain("result", g.card.metrics.filter(m => !drifting.includes(m)));
 				// Borderline, or a metric whose history shows drift: the control was measured at another
 				// time, so measure base and candidate interleaved and let drift cancel. If the base cannot
 				// be checked out, fall back to measuring the candidate again.
 				// Only the uncertain metrics pay for pairs: borderline here, or drifting in their history.
-				const uncertain = r.errors.length ? [] : g.card.metrics.filter((m, i) => X.borderline([eff.metrics[i]], exp.ref, r.values) || eff.metrics[i].noise > m.noise);
+				const uncertain = r.errors.length ? [] : g.card.metrics.filter((m, i) => drifting.includes(m) || X.borderline([eff.metrics[i]], exp.ref, r.values));
 				if (uncertain.length) {
-					const p = await paired(root, exp.base, uncertain, g.id, signal, t => say(t && `paired with the base: ${t}`));
+					const p = await paired(root, exp.base, uncertain, g.id, signal, t => say(t && `paired with the base: ${t}`), opened);
 					// These metrics need pairs to be told apart from luck: a paired run that crashes decides nothing.
 					if (typeof p === "string")
 						throw new Error(
@@ -1543,8 +1565,20 @@ export default async function climb(pi: ExtensionAPI) {
 						);
 					pairs = p;
 				}
-				if (uncertain.length && !pairs && X.borderline(eff.metrics, exp.ref, r.values))
-					r = await measure(root, g.card.metrics, { phase: "recheck", goal: g.id, tree: candidate }, signal, r.samples, t => say(t && `re-measure (borderline) ${t}`));
+				if (pairs)
+					// A metric decided in pairs reads as its candidate side.
+					for (const m of drifting) {
+						r.samples[m.name] = pairs[m.name].map(p => p[1]);
+						r.values[m.name] = X.median(r.samples[m.name]);
+					}
+				else if (uncertain.length) {
+					// No pairs (the base cannot be checked out): the drifting metrics get their plain runs after all.
+					if (drifting.length) {
+						const x = resumed("result", drifting, r.samples);
+						r = await measure(root, [...g.card.metrics.filter(m => !drifting.includes(m)).map(m => ({ ...m, samples: 0 })), ...x.plan], { phase: "result", goal: g.id, tree: candidate }, signal, { ...r.samples, ...x.prior }, say);
+					}
+					if (!r.errors.length && X.borderline(eff.metrics, exp.ref, r.values)) r = await plain("recheck", g.card.metrics, r.samples, t => say(t && `re-measure (borderline) ${t}`));
+				}
 				// A crashed instrument is not evidence against the change: decide nothing.
 				if (r.errors.length)
 					throw new Error(

@@ -1619,3 +1619,55 @@ describe("heartbeat while the extension measures", () => {
 		}
 	});
 });
+
+// Live: voice's x5 measurement was cut off after an hour of runs (eval's timeout) and the retry measured it all again;
+// its drifting metrics paid 40 minutes of plain runs that the pairs then overruled, and each control re-measured the base.
+describe("resumed measurement", () => {
+	test("a drifting metric goes straight to pairs, a cut-off measurement resumes from its finished pairs, and a drop's base side is the next control", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-resume-"));
+		const [ctr, hold, at] = [`${d}-ctr`, `${d}-hold`, `${d}-at`];
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		// Every run reads 10 higher than the one before (drift); the run numbered in `at` waits while `hold` exists.
+		const cmd = `n=$(cat ${ctr} 2>/dev/null || echo 0); echo $((n+1)) > ${ctr}; if [ "$n" = "$(cat ${at} 2>/dev/null)" ]; then while [ -f ${hold} ]; do sleep 0.05; done; fi; echo $(( $(cat work.txt) + n * 10 ))`;
+		const count = () => Number(fs.readFileSync(ctr, "utf8"));
+		const clock = L.clock.ms;
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && echo x > README.md && git add -A && git commit -qm init");
+			const z = host(d, "main", "resume");
+			await z.load();
+			await z.cmd("faster");
+			await z.tool("climb_scorecard", { metrics: [{ name: "ms", cmd, dir: "down", target: 10, noise: 0.05, samples: 3 }] });
+			await z.tool("climb_experiment", { lever: "noop", hypothesis: "", prediction: "" });
+			await run("echo y >> README.md && git commit -qam noop");
+			L.clock.ms = () => clock() + 31 * 60_000; // the base's A/A and control runs are stale now
+			expect(await z.tool("climb_measure", {})).toContain("DROPPED x1");
+			// The revert restored the base tree: its side of x1's pairs is x2's control.
+			const before = count();
+			expect(await z.tool("climb_experiment", { lever: "halve", hypothesis: "", prediction: "" })).toContain("reused runs of this tree");
+			expect(count()).toBe(before);
+			await run("echo 50 > work.txt && git commit -qam halve");
+			// Cut off in the second pair, once the first has finished.
+			fs.writeFileSync(at, String(count() + 3));
+			fs.writeFileSync(hold, "");
+			const ac = new AbortController();
+			const cut = z.toolWith("climb_measure", {}, ac.signal).catch((e: Error) => e.message);
+			await until(() => count() > Number(fs.readFileSync(at, "utf8")));
+			ac.abort();
+			fs.rmSync(hold);
+			expect(await cut).toContain("climb_measure resumes from them");
+			const resumedAt = count();
+			expect(await z.tool("climb_measure", {})).toContain("KEPT x2");
+			const exp = L.read(d).filter((e): e is L.ExpE => e.kind === "exp").at(-1)!;
+			const pairs = (L.read(d).filter((e): e is L.ResultE => e.kind === "result").at(-1)!.paired ?? {}).ms ?? [];
+			const traced = T.read(d).filter(t => t.ts > exp.ts);
+			expect(traced.filter(t => t.kind === "run" && t.phase === "result")).toHaveLength(0); // drifting: no plain runs
+			expect(traced.find(t => t.kind === "reuse" && t.phase === "paired")).toMatchObject({ runs: 2 });
+			expect(pairs.length).toBeGreaterThanOrEqual(3);
+			expect(count() - resumedAt).toBe(2 * (pairs.length - 1)); // only the pairs not finished before the cut
+		} finally {
+			L.clock.ms = clock;
+			for (const f of [ctr, hold, at]) fs.rmSync(f, { force: true });
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+});
