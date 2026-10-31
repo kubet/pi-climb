@@ -158,6 +158,8 @@ export interface Goal {
 	/** Itemized research: every candidate metric probed, measured by the extension. */
 	probes: ProbeE[];
 	lastProbeSeq: number;
+	/** Ledger line of the goal's first scorecard: the research it closes counts as progress. */
+	firstCardSeq: number;
 	seq: number;
 	done?: DoneE;
 	series: Map<string, Point[]>;
@@ -227,6 +229,7 @@ function newGoal(e: GoalE): Goal {
 		progressSeq: -1,
 		probes: [],
 		lastProbeSeq: -1,
+		firstCardSeq: -1,
 		seq: -1,
 		series: new Map(),
 		nextExp: 1,
@@ -269,6 +272,7 @@ export function fold(entries: Entry[]): State {
 		if (!g) continue;
 		switch (e.kind) {
 			case "card":
+				if (!g.card) g.firstCardSeq = seq;
 				g.card = e;
 				if (!e.reask) g.reviewed = undefined;
 				g.origin ??= {};
@@ -400,12 +404,14 @@ export const stuck = (g: Goal) => g.judge?.verdict === "stuck" && g.progressSeq 
 
 /** Since the last heartbeat (or goal start): was anything kept, did a judge speak? */
 export const keptSinceBeat = (g: Goal) => g.lastKeptSeq > (g.lastBeat?.seq ?? g.seq);
+/** Research that ends in a goal's first scorecard counts, and so does that scorecard: landing it does not erase it. Re-baselines do not. */
+const researched = (g: Goal, since: number) => (!g.card && g.lastProbeSeq > since) || g.firstCardSeq > since;
 /** Progress for the heartbeat: kept results; before a scorecard exists, measured research items count. */
-export const progressSinceBeat = (g: Goal) => keptSinceBeat(g) || (!g.card && g.lastProbeSeq > (g.lastBeat?.seq ?? g.seq));
+export const progressSinceBeat = (g: Goal) => keptSinceBeat(g) || researched(g, g.lastBeat?.seq ?? g.seq);
 /** The same over a root and all its parts, measured from the root's last beat. */
 export function treeProgressSinceBeat(st: State, root: Goal): boolean {
 	const since = root.lastBeat?.seq ?? root.seq;
-	return subtree(st, root).some(g => g.lastKeptSeq > since || (!g.card && g.lastProbeSeq > since));
+	return subtree(st, root).some(g => g.lastKeptSeq > since || researched(g, since));
 }
 export const judgedSinceBeat = (g: Goal) => g.judgeSeq > (g.lastBeat?.seq ?? g.seq);
 

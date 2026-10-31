@@ -181,6 +181,21 @@ describe("ledger fold", () => {
 		expect(r([...entries, { ts: iso(6e6, nowMs), kind: "done", goal: "a", result: "abandoned", values: {} }])).toBe(false);
 	});
 
+	test("research that lands a part's first scorecard within a beat is progress; a re-baseline is not", () => {
+		const entries: L.Entry[] = [
+			{ ts: iso(9e6, nowMs), kind: "goal", goal: "r", intent: "voice", cfg: { poke_max: 3, beat_s: 1800 } },
+			{ ts: iso(8e6, nowMs), kind: "goal", goal: "a", parent: "r", intent: "a", cfg: { poke_max: 3, beat_s: 1800 } },
+			{ ts: iso(7e6, nowMs), kind: "beat", goal: "r", head: "h", progress: false, stale: 1 },
+			{ ts: iso(6e6, nowMs), kind: "probe", goal: "a", name: "ms", cmd: "echo 1", value: 1 },
+			{ ts: iso(5e6, nowMs), kind: "card", goal: "a", metrics: [metric()] },
+		];
+		const r = (e: L.Entry[]) => { const s = L.fold(e); return L.treeProgressSinceBeat(s, s.goals.get("r")!); };
+		expect(r(entries)).toBe(true);
+		const later: L.Entry[] = [...entries, { ts: iso(4e6, nowMs), kind: "beat", goal: "r", head: "h", progress: true, stale: 0 }];
+		expect(r(later)).toBe(false);
+		expect(r([...later, { ts: iso(3e6, nowMs), kind: "card", goal: "a", metrics: [metric({ baseline: 90 })] }])).toBe(false);
+	});
+
 	test("a later card keeps each metric's first baseline while its command is unchanged", () => {
 		const st = L.fold([
 			...base(),
