@@ -1185,7 +1185,7 @@ export default async function climb(pi: ExtensionAPI) {
 					? `${worst} repeats exactly as the worst value: if it is a cap or a penalty for a failed case, more samples will not steady it. Count those failures in a metric of their own (target 0) and measure the rest without the penalty.`
 					: smallCount
 						? `A count this small is coarse: count over more cases per run (repeat the scenario inside the command and print the total), or make it a hold metric (it then guards against more failures) and put the target on a finer metric; an experiment's proof can show zero failures.`
-						: `${s && s > m.samples ? `Samples: ${s} brings it to ${pct(X.noiseOf(xs, m.baseline, s))}${cost ? ` (${cost})` : ""}` : "More samples will not fix it"}; or steady the command (fixed inputs, warm-up, no sentinel penalties).`;
+						: `${s && s > m.samples ? `Samples: ${s} brings it to ${pct(X.noiseOf(xs, m.baseline, s))}${cost ? ` (${cost})` : ""}` : "More samples will not fix it"}; measure more cases per run (a median over 27 calls is steadier than over 9), or steady the command (fixed inputs, warm-up, no sentinel penalties).`;
 				// A goal confirming a target it met before re-baselines a near miss (it climbs on), it is not refused.
 				const again = confirming && prior?.metrics.some(o => o.name === m.name && o.cmd === m.cmd && o.target === m.target);
 				if (m.noise >= way && !again)
