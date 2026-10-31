@@ -186,6 +186,17 @@ describe("ledger fold", () => {
 		expect(X.progressPct(metric({ dir: "down", baseline: 100, target: 10 }), 55)).toBe(50);
 		expect(X.progressPct(metric({ dir: "down", baseline: 4581, target: 0 }), 2)).toBe(99);
 		expect(X.progressPct(metric({ dir: "down", baseline: 4581, target: 0 }), 0)).toBe(100);
+		const goal = (id: string, parent?: string): L.Entry => ({ ts: iso(9e6, nowMs), kind: "goal", goal: id, parent, intent: id, cfg: { poke_max: 3, beat_s: 1800 } });
+		const st = L.fold([
+			goal("r"),
+			goal("a", "r"),
+			goal("b", "r"),
+			{ ts: iso(5e6, nowMs), kind: "done", goal: "a", result: "achieved", values: {} },
+			{ ts: iso(4e6, nowMs), kind: "card", goal: "b", metrics: [metric({ baseline: 4581, target: 0 })] },
+			{ ts: iso(3e6, nowMs), kind: "exp", goal: "b", id: "x1", lever: "c", hypothesis: "", prediction: "", base: "a", ref: { ms: 4581 } },
+			{ ts: iso(2e6, nowMs), kind: "result", goal: "b", exp: "x1", head: "h", values: { ms: 2 }, verdict: "kept", reason: "" },
+		]);
+		expect(X.goalPct(st, st.goals.get("r")!)).toBe(99);
 	});
 
 	test("a part achieved since the last beat is progress for the tree", () => {

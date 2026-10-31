@@ -166,7 +166,10 @@ const ago = (ts: string | undefined, nowMs: number) => {
 /** Progress toward targets; a split goal's is the mean of its parts' (abandoned parts excluded). */
 export function goalPct(st: State, g: Goal): number {
 	const ps = parts(st, g).filter(c => c.done?.result !== "abandoned");
-	if (ps.length) return Math.round(ps.reduce((sum, c) => sum + (c.done ? 100 : goalPct(st, c)), 0) / ps.length);
+	if (ps.length) {
+		const pct = Math.round(ps.reduce((sum, c) => sum + (c.done ? 100 : goalPct(st, c)), 0) / ps.length);
+		return ps.every(c => c.done) ? pct : Math.min(pct, 99);
+	}
 	if (!g.card) return 0;
 	const goals = g.card.metrics.filter(m => !m.hold);
 	return Math.min(...(goals.length ? goals : g.card.metrics).map(m => progressPct(m, g.best[m.name])));
