@@ -27,6 +27,20 @@ const LEDGER_GUARD = "The climb ledger (.climb/) is append-only and owned by the
 // Measuring runs every sample of every metric: it can outlast a script's or eval cell's timeout (omp's eval stops at one hour).
 const DIRECT = " Call it directly, not from eval or a script: measuring can outlast their timeouts.";
 const RESUMES = " The runs it finished count: climb_measure resumes from them.";
+// An instrument that keeps outputs per run (voice's call recordings: 9 GB a day) fills a disk over nights of measuring.
+const DISK_MIN = 2 * 2 ** 30;
+/** Free bytes on a directory's disk (replaceable, like L.clock, for tests). */
+export const disk = {
+	free(dir: string): number {
+		try {
+			const s = fs.statfsSync(dir);
+			return s.bavail * s.bsize;
+		} catch {
+			return Number.POSITIVE_INFINITY;
+		}
+	},
+};
+const gib = (b: number) => `${(b / 2 ** 30).toFixed(1)} GiB`;
 
 type Ctx = ExtensionContext;
 type Progress = (text: string) => void;
@@ -143,6 +157,11 @@ export default async function climb(pi: ExtensionAPI) {
 	/** sh, traced: every benchmark, guard, proof and probe run lands in .climb/trace.jsonl with its duration. */
 	/** `ledger`: the repo whose trace records the run (a base worktree's runs belong to the repo). */
 	async function run(root: string, cmd: string, timeoutMs: number, tag: Tag, signal?: AbortSignal, retry = false, ledger = root) {
+		// A full disk breaks the instrument, git and the ledger at once: measuring stops first, deciding nothing.
+		if (tag.metric && disk.free(root) < DISK_MIN)
+			throw new Error(
+				`The disk is nearly full (${gib(disk.free(root))} free): measuring stopped before it fills it, and nothing was decided. Free space, often an instrument's per-run outputs (recordings, logs) among the repo's git-ignored files, then call again.`,
+			);
 		const t0 = performance.now();
 		const r = await sh(root, cmd, timeoutMs, signal);
 		const value = r.code === 0 && tag.metric ? X.parseNumber(r.stdout) : undefined;
@@ -1544,6 +1563,7 @@ export default async function climb(pi: ExtensionAPI) {
 			const h = await head(root);
 			if (!h || h === exp.base) throw new Error(`HEAD is still the base commit ${exp.base.slice(0, 8)}; commit ${exp.id} first.`);
 			const say = progressTo(ctx, root, onUpdate, `${g.id} ${exp.id}`);
+			const free0 = disk.free(root);
 			let values: L.Values = {};
 			let samples: Record<string, number[]> = {};
 			let kept = false;
@@ -1725,6 +1745,9 @@ export default async function climb(pi: ExtensionAPI) {
 					text += `\n${X.nextAction(st, L.rootOf(st, st.goals.get(g.id)!))}`;
 				}
 			}
+			const used = free0 - disk.free(root);
+			if (used > 2 ** 30)
+				text += `\nNote: the disk lost ${gib(used)} while this measured (${gib(disk.free(root))} free). If the instrument keeps outputs per run (recordings, logs), keep fewer: measuring stops below ${gib(DISK_MIN)}.`;
 			return ok(text);
 		})),
 	});

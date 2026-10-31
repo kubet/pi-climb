@@ -54,6 +54,7 @@ Meanwhile a heartbeat checks every 30 min; three quiet beats call an independent
 - **It measures, on commits.** The agent never reports its own numbers. A run that crashes decides nothing.
 - **Noise is measured, not guessed.** A gain must beat it. Borderline or drifting metrics are re-run interleaved with the base commit (A B B A), so machine drift cancels out. A metric whose pairs are noisier than the whole way to its target can keep nothing: experiments on it wait until the instrument is steadier (or carry a proof).
 - **Measuring resumes.** A measurement that is cut off keeps its finished runs and pairs; calling again continues, and cannot re-roll them.
+- **The disk never fills.** Measuring stops below 2 GiB free, deciding nothing; a measurement that used over 1 GiB says so.
 - **Drops revert themselves.** An experiment that touches the benchmark is dropped.
 - **Holds guard.** A `hold: true` metric ("no slower") has no target; a real regression drops the experiment.
 - **Proofs.** An experiment can carry a check that fails before the change and passes after; that keeps a fix the metrics are too coarse to see.

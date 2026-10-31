@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import climb, { DERIVED, ENVS, leaksIntoRepo } from "../src/index";
+import climb, { DERIVED, disk, ENVS, leaksIntoRepo } from "../src/index";
 import * as L from "../src/ledger";
 import * as X from "../src/logic";
 import * as T from "../src/trace";
@@ -1704,6 +1704,41 @@ describe("an instrument noisier than its target", () => {
 		} finally {
 			L.clock.ms = clock;
 			fs.rmSync(ctr, { force: true });
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+});
+
+// Live: voice's measurements kept every call's recordings, 9 GB a day, with 16 GB left on the disk.
+describe("disk", () => {
+	test("measuring stops before the disk fills, deciding nothing; a measurement that ate the disk says so", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-disk-"));
+		const [free, next] = [`${d}-free`, `${d}-next`];
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		const real = disk.free;
+		// Free space in GiB comes from a file; the metric command sets it from `next`, like an instrument writing outputs.
+		disk.free = () => Number(fs.readFileSync(free, "utf8")) * 2 ** 30;
+		try {
+			fs.writeFileSync(free, "50");
+			fs.writeFileSync(next, "50");
+			await run("git init -q && git config user.email t@t && git config user.name t && echo 100 > work.txt && git add -A && git commit -qm init");
+			const z = host(d, "main", "disk");
+			await z.load();
+			await z.cmd("shrink work");
+			await z.tool("climb_scorecard", { metrics: [{ name: "work", cmd: `cat ${next} > ${free}; cat work.txt`, dir: "down", target: 10, noise: 0.05 }] });
+			await z.tool("climb_experiment", { lever: "halve", hypothesis: "", prediction: "" });
+			await run("echo 50 > work.txt && git commit -qam halve");
+			fs.writeFileSync(free, "1.5");
+			await expect(z.tool("climb_measure", {})).rejects.toThrow("The disk is nearly full (1.5 GiB free)");
+			expect(L.fold(L.read(d)).goals.get("g-shrink-work")!.open?.id).toBe("x1");
+			fs.writeFileSync(free, "50");
+			fs.writeFileSync(next, "48");
+			const out = await z.tool("climb_measure", {});
+			expect(out).toContain("KEPT x1");
+			expect(out).toContain("the disk lost 2.0 GiB while this measured");
+		} finally {
+			disk.free = real;
+			for (const f of [free, next]) fs.rmSync(f, { force: true });
 			fs.rmSync(d, { recursive: true, force: true });
 		}
 	});
