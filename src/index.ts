@@ -24,6 +24,8 @@ import * as T from "./trace";
 const TICK_MS = 15_000;
 const JUDGE_MS = 5 * 60_000;
 const LEDGER_GUARD = "The climb ledger (.climb/) is append-only and owned by the climb extension. Read it with climb_status.";
+// Measuring runs every sample of every metric: it can outlast a script's or eval cell's timeout (omp's eval stops at one hour).
+const DIRECT = " Call it directly, not from eval or a script: measuring can outlast their timeouts.";
 
 type Ctx = ExtensionContext;
 type Progress = (text: string) => void;
@@ -691,6 +693,7 @@ export default async function climb(pi: ExtensionAPI) {
 	function logged<P, R>(tool: string, fn: (id: string, p: P, signal: AbortSignal | undefined, onUpdate: Update | undefined, ctx: Ctx) => Promise<R>) {
 		return async (id: string, p: P, signal: AbortSignal | undefined, onUpdate: Update | undefined, ctx: Ctx): Promise<R> => {
 			const t0 = performance.now();
+			const c0 = L.clock.ms();
 			const note = async (ok: boolean, error?: string) => {
 				const root = await repoRoot(ctx.cwd).catch(() => undefined);
 				if (root && fs.existsSync(path.join(root, L.DIR)))
@@ -701,6 +704,10 @@ export default async function climb(pi: ExtensionAPI) {
 				await note(true);
 				return r;
 			} catch (e) {
+				const ms = L.clock.ms() - c0;
+				// Cut off after minutes of measuring: most likely a caller's timeout (voice's eval cell, at 3600 s), not a person.
+				if (signal?.aborted && ms >= 300_000 && e instanceof Error && /interrupted/.test(e.message))
+					e.message += ` It was cut off after ${Math.round(ms / 60_000)} min: if eval or a script called it, its timeout stopped it (eval stops a cell at one hour). Call ${tool} directly; a direct call runs to the end.`;
 				await note(false, e instanceof Error ? e.message : String(e));
 				throw e;
 			}
@@ -1056,7 +1063,7 @@ export default async function climb(pi: ExtensionAPI) {
 		name: "climb_scorecard",
 		label: "Climb: scorecard",
 		description:
-			"Define or replace the scorecard of a climb goal: 1-3 metrics (focus on the few that matter; park the rest). Each metric is a shell command run from the repo root whose output's last number is the value. The extension runs every command itself to measure the baseline on the current commit (the working tree must be clean). Optional guard: a command (usually the test suite) that must exit 0 for any experiment to be kept.",
+			"Define or replace the scorecard of a climb goal: 1-3 metrics (focus on the few that matter; park the rest). Each metric is a shell command run from the repo root whose output's last number is the value. The extension runs every command itself to measure the baseline on the current commit (the working tree must be clean). Optional guard: a command (usually the test suite) that must exit 0 for any experiment to be kept." + DIRECT,
 		parameters: S.obj({
 			goal: S.opt(S.str("Goal id; optional when one goal is active")),
 			metrics: S.arr(
@@ -1311,7 +1318,7 @@ export default async function climb(pi: ExtensionAPI) {
 		name: "climb_experiment",
 		label: "Climb: experiment",
 		description:
-			"Pre-register one experiment before touching code: the lever (kind of change, reused across attempts), hypothesis, and predicted metric movement. The extension measures the control on the current clean commit. Then implement, commit, and call climb_measure. One experiment at a time: one working tree measures one change. Scorecard metrics decide; for a defect fix they are too coarse to see, add a proof.",
+			"Pre-register one experiment before touching code: the lever (kind of change, reused across attempts), hypothesis, and predicted metric movement. The extension measures the control on the current clean commit. Then implement, commit, and call climb_measure. One experiment at a time: one working tree measures one change. Scorecard metrics decide; for a defect fix they are too coarse to see, add a proof." + DIRECT,
 		parameters: S.obj({
 			goal: S.opt(S.str("Goal id; optional when one goal is active")),
 			lever: S.str("Short lever name, e.g. 'caching' or 'sieve algorithm'"),
@@ -1456,7 +1463,7 @@ export default async function climb(pi: ExtensionAPI) {
 		name: "climb_measure",
 		label: "Climb: measure",
 		description:
-			"Close the open experiment: the extension runs the guard and every metric on the committed HEAD, compares against the pre-registered control, and decides kept or dropped (noise-aware). Dropped experiments are reverted with a revert commit. Requires a clean tree and at least one commit since registration. A measurement that crashes decides nothing: the experiment stays open. abandon drops and reverts it without measuring.",
+			"Close the open experiment: the extension runs the guard and every metric on the committed HEAD, compares against the pre-registered control, and decides kept or dropped (noise-aware). Dropped experiments are reverted with a revert commit. Requires a clean tree and at least one commit since registration. A measurement that crashes decides nothing: the experiment stays open. abandon drops and reverts it without measuring." + DIRECT,
 		parameters: S.obj({
 			goal: S.opt(S.str("Goal id; optional")),
 			abandon: S.opt(S.str("Drop and revert the open experiment without measuring, giving the reason (e.g. its instrument is broken)")),

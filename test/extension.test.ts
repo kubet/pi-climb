@@ -407,9 +407,28 @@ describe("reviewer regressions", () => {
 		await rsh("echo 50 > work.txt && git commit -qam halve");
 		const ac = new AbortController();
 		ac.abort();
-		await expect(y.toolWith("climb_measure", {}, ac.signal)).rejects.toThrow("interrupted");
+		const quick = await y.toolWith("climb_measure", {}, ac.signal).catch((e: Error) => e.message);
+		expect(quick).toContain("interrupted");
+		expect(quick).not.toContain("cut off"); // a person's interrupt, not a caller's timeout
 		expect(L.fold(L.read(rdir)).goals.get("g-shrink-work")!.open?.id).toBe("x1");
 		expect(await y.tool("climb_measure", {})).toContain("KEPT x1");
+	});
+
+	test("a measurement cut off after an hour says a caller's timeout stopped it and to call the tool directly", async () => {
+		await y.tool("climb_experiment", { lever: "halve again", hypothesis: "", prediction: "" });
+		await rsh("echo 25 > work.txt && git commit -qam halve");
+		const ac = new AbortController();
+		ac.abort();
+		const real = L.clock.ms;
+		const t = real();
+		let first = true;
+		L.clock.ms = () => (first ? ((first = false), t) : t + 60 * 60_000);
+		try {
+			await expect(y.toolWith("climb_measure", {}, ac.signal)).rejects.toThrow("cut off after 60 min: if eval or a script called it");
+		} finally {
+			L.clock.ms = real;
+		}
+		expect(await y.tool("climb_measure", { abandon: "test over" })).toContain("DROPPED x2"); // later tests climb from 50
 	});
 
 	test("commits climb never measured cannot become the baseline", async () => {
