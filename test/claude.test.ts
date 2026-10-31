@@ -138,7 +138,7 @@ describe("Claude Code plugin", () => {
 	test("the judge is a separate headless claude -p with no tools, settings or MCP servers", async () => {
 		const bin = fs.mkdtempSync(path.join(os.tmpdir(), "climb-fake-claude-"));
 		const seen = path.join(bin, "seen");
-		fs.writeFileSync(path.join(bin, "claude"), `#!/bin/bash\nprintf '%s\\n' "$@" > ${seen}.args\ncat > ${seen}.prompt\npwd > ${seen}.cwd\nprintf 'VERDICT: pivot\\nDIAGNOSIS: the same lever three times\\nNEXT: try caching instead\\n'\n`, { mode: 0o755 });
+		fs.writeFileSync(path.join(bin, "claude"), `#!/bin/bash\nprintf '%s\\n' "$@" > ${seen}.args\ncat > ${seen}.prompt\npwd > ${seen}.cwd\nenv > ${seen}.env\nprintf 'VERDICT: pivot\\nDIAGNOSIS: the same lever three times\\nNEXT: try caching instead\\n'\n`, { mode: 0o755 });
 		const s = setup("judge", bin);
 		try {
 			await s.ready;
@@ -151,6 +151,8 @@ describe("Claude Code plugin", () => {
 			expect(args).toEqual(expect.arrayContaining(["-p", "--tools", "", "--strict-mcp-config", "--setting-sources", "--no-session-persistence"]));
 			expect(fs.readFileSync(`${seen}.prompt`, "utf8")).toContain("VERDICT");
 			expect(fs.realpathSync(fs.readFileSync(`${seen}.cwd`, "utf8").trim())).not.toBe(fs.realpathSync(s.dir)); // outside the repo
+			// Nothing of the parent session (its id, messaging socket, effort; here its CLAUDE_PROJECT_DIR) reaches the side turn.
+			expect(fs.readFileSync(`${seen}.env`, "utf8").split("\n").filter(l => /^CLAUDE/.test(l) && !l.startsWith("CLAUDE_CONFIG_DIR="))).toEqual([]);
 		} finally {
 			s.close();
 			fs.rmSync(bin, { recursive: true, force: true });

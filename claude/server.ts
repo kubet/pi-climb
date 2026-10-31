@@ -89,8 +89,9 @@ const claudeBin = Bun.which("claude");
 /** The judge's and the acceptance review's side turn: a separate headless Claude outside the repo, with no
  *  tools, settings, plugins or MCP servers, so it sees only the prompt the extension built. */
 async function sideTurn(o: { promptText: string }): Promise<{ replyText: string }> {
-	const env = { ...process.env };
-	delete env.CLAUDECODE;
+	// Only the account's config travels. The parent session's id, messaging socket and effort are its own: an inherited
+	// CLAUDE_EFFORT=xhigh kept a real acceptance review thinking past its 5 minutes.
+	const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("CLAUDE") || k === "CLAUDE_CONFIG_DIR"));
 	const args = ["-p", "--tools", "", "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence", "--output-format", "text"];
 	const r = await exec(claudeBin!, args, { cwd: os.tmpdir(), env, input: o.promptText, timeout: SIDE_TURN_MS });
 	if (r.code !== 0 || !r.stdout.trim()) throw new Error(`claude -p ${r.killed ? "timed out" : `exit ${r.code}`}: ${(r.stderr || r.stdout).trim().slice(-200)}`);

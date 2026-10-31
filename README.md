@@ -27,7 +27,7 @@ claude plugin marketplace add kubet/pi-climb
 claude plugin install climb@pi-climb
 ```
 
-From a local checkout: `claude --plugin-dir ./pi-climb`.
+From a local checkout: `claude --plugin-dir ./pi-climb`. Approve the climb tools when asked, or allow `mcp__plugin_climb_climb__*` in your permissions: a headless `claude -p` refuses tools nobody approved.
 
 On omp, a stop hook keeps the agent working and the judge and acceptance review run as independent side turns. pi has neither, so there the heartbeat drives the loop, the agent's own diagnosis stands in for the judge, and achieved goals are marked unreviewed.
 
