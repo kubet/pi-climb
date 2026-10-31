@@ -160,6 +160,8 @@ export interface Goal {
 	lastProbeSeq: number;
 	/** Ledger line of the goal's first scorecard: the research it closes counts as progress. */
 	firstCardSeq: number;
+	/** Ledger line of the latest work on this goal itself (probe, scorecard, experiment, result). */
+	workSeq: number;
 	seq: number;
 	done?: DoneE;
 	series: Map<string, Point[]>;
@@ -230,6 +232,7 @@ function newGoal(e: GoalE): Goal {
 		probes: [],
 		lastProbeSeq: -1,
 		firstCardSeq: -1,
+		workSeq: -1,
 		seq: -1,
 		series: new Map(),
 		nextExp: 1,
@@ -270,6 +273,7 @@ export function fold(entries: Entry[]): State {
 		}
 		const g = st.goals.get(e.goal);
 		if (!g) continue;
+		if (e.kind === "probe" || e.kind === "card" || e.kind === "exp" || e.kind === "result") g.workSeq = seq;
 		switch (e.kind) {
 			case "card":
 				if (!g.card) g.firstCardSeq = seq;

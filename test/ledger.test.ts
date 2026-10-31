@@ -146,6 +146,24 @@ describe("ledger fold", () => {
 		expect(X.nextAction(st, st.goals.get("r")!)).toContain("Next, a1: [climb a1] Every target is met, yet a1 is not closed");
 	});
 
+	test("after a drop the router stays on the part being climbed, until its drop streak blocks it", () => {
+		const goal = (id: string, parent?: string): L.Entry => ({ ts: iso(9e6, nowMs), kind: "goal", goal: id, parent, intent: id, cfg: { poke_max: 3, beat_s: 1800 } });
+		const drop = (n: number): L.Entry[] => [
+			{ ts: iso(3e6 - n, nowMs), kind: "exp", goal: "fast", id: `x${n}`, lever: `l${n}`, hypothesis: "", prediction: "", base: "a", ref: { ms: 100 } },
+			{ ts: iso(2e6 - n, nowMs), kind: "result", goal: "fast", exp: `x${n}`, head: "b", values: { ms: 100 }, verdict: "dropped", reason: "within noise" },
+		];
+		const base: L.Entry[] = [
+			goal("r"),
+			goal("good", "r"),
+			goal("fast", "r"),
+			{ ts: iso(5e6, nowMs), kind: "card", goal: "good", metrics: [metric({ baseline: 100, target: 10 })] },
+			{ ts: iso(4e6, nowMs), kind: "card", goal: "fast", metrics: [metric({ baseline: 100, target: 10 })] },
+		];
+		const next = (e: L.Entry[]) => { const st = L.fold(e); return X.nextAction(st, st.goals.get("r")!); };
+		expect(next([...base, ...drop(1)])).toContain("Next, fast:");
+		expect(next([...base, ...drop(1), ...drop(2), ...drop(3)])).toContain("Next, good:");
+	});
+
 	test("a judge's PIVOT after an experiment opened travels with every nudge to finish it", () => {
 		const exp: L.Entry = { ts: iso(3e6, nowMs), kind: "exp", goal: "g", id: "x1", lever: "c", hypothesis: "h", prediction: "", base: "a", ref: { ms: 100 } };
 		const judge = (t: number): L.Entry => ({ ts: iso(t, nowMs), kind: "judge", goal: "g", by: "judge", verdict: "pivot", diagnosis: "same idea", next: "trace one request end to end." });
