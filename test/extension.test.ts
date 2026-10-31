@@ -1671,3 +1671,40 @@ describe("resumed measurement", () => {
 		}
 	});
 });
+
+// Live: voice's answered_p50_ms read ~1.8 s or ~2.7 s run to run; its pairs measured ±55% noise against a 46% way
+// to target, so every 3-hour measurement was a coin toss, and a likely slowdown passed as "no metric regressed".
+describe("an instrument noisier than its target", () => {
+	test("pairs noisier than the whole way to the target are named at measure, and refuse the next experiment without a proof", async () => {
+		const d = fs.mkdtempSync(path.join(os.tmpdir(), "climb-deaf-"));
+		const ctr = `${d}-ctr`;
+		const run = (c: string) => exec("bash", ["-c", c], { cwd: d });
+		// Calm back to back (the A/A), then two modes far apart: 100 or 200, whatever the code.
+		const cmd = `n=$(cat ${ctr} 2>/dev/null || echo 0); echo $((n+1)) > ${ctr}; if [ $n -lt 3 ]; then echo $((100 + n)); else echo $(( n % 2 ? 100 : 200 )); fi`;
+		const clock = L.clock.ms;
+		try {
+			await run("git init -q && git config user.email t@t && git config user.name t && echo x > README.md && git add -A && git commit -qm init");
+			const z = host(d, "main", "deaf");
+			await z.load();
+			await z.cmd("faster");
+			await z.tool("climb_scorecard", { metrics: [{ name: "ms", cmd, dir: "down", target: 70, noise: 0.05, samples: 3 }] });
+			// The first measurement shows the two modes; the second, knowing the drift, is decided in pairs.
+			let out = "";
+			for (const lever of ["noop", "noop again"]) {
+				await z.tool("climb_experiment", { lever, hypothesis: "", prediction: "" });
+				await run(`echo ${lever.length} >> README.md && git commit -qam noop`);
+				out = await z.tool("climb_measure", {});
+			}
+			expect(out).toContain("paired with the base");
+			expect(out).toContain("no step on it can be told apart from luck");
+			await expect(z.tool("climb_experiment", { lever: "next", hypothesis: "", prediction: "" })).rejects.toThrow("No measurement can keep this experiment");
+			// A proof can still keep a verified fix; the gate only stops coin tosses.
+			await run("printf 'test -f fixed\\n' > check.sh && git add check.sh && git commit -qm check");
+			expect(await z.tool("climb_experiment", { lever: "fix", hypothesis: "", prediction: "", proof: "bash check.sh" })).toContain("Registered");
+		} finally {
+			L.clock.ms = clock;
+			fs.rmSync(ctr, { force: true });
+			fs.rmSync(d, { recursive: true, force: true });
+		}
+	});
+});

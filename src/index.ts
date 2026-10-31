@@ -756,6 +756,28 @@ export default async function climb(pi: ExtensionAPI) {
 		return { metrics, notes };
 	}
 
+	/** Target metrics whose last pairs on their current command were noisier than the whole way to the target:
+	 *  no step on them can be told apart from luck. Pairs measured under an earlier scorecard with the same
+	 *  command count, so re-scoring alone does not hide them. */
+	function deaf(root: string, g: L.Goal): { m: L.Metric; noise: number; way: number; n: number }[] {
+		const cmds = new Map<string, string>();
+		const last = new Map<string, [number, number][]>();
+		for (const e of L.read(root)) {
+			if (e.goal !== g.id) continue;
+			if (e.kind === "card") for (const m of e.metrics) cmds.set(m.name, m.cmd);
+			else if (e.kind === "result") for (const [k, ps] of Object.entries(e.paired ?? {})) if (ps.length && cmds.has(k)) last.set(`${k}\0${cmds.get(k)}`, ps);
+		}
+		return g.card!.metrics.flatMap(m => {
+			const ps = last.get(`${m.name}\0${m.cmd}`);
+			if (m.hold || !ps) return [];
+			const noise = X.pairedVerdict([m], { [m.name]: ps }).stats[m.name].noise;
+			const way = L.gain(m, m.baseline, m.target);
+			return noise >= way ? [{ m, noise, way, n: ps.length }] : [];
+		});
+	}
+	const STEADY =
+		"Steady the instrument, then re-baseline with climb_scorecard: average over more cases per run, fix the inputs, and look for runs that land in two clusters (a median of two-mode data flips between them; a mean or each mode's share does not).";
+
 	/** .climb/export.json: the ledger as evidence rows (benchmaxx schema), rewritten after every decision. */
 	async function writeExport(root: string, file = path.join(root, L.DIR, "export.json")): Promise<{ file: string; rows: number; findings: number }> {
 		if (!remotes.has(root)) remotes.set(root, (await git(root, "remote", "get-url", "origin")).stdout.trim().replace(/\/\/[^@/]*@/, "//") || undefined);
@@ -1390,6 +1412,13 @@ export default async function climb(pi: ExtensionAPI) {
 				throw new Error(
 					`The prediction rests on ${offCard.join(", ")}, a probe, not a scorecard metric: it cannot decide this experiment, and a real fix would be reverted if the scorecard does not move beyond noise. Pass proof (a check that fails now and passes once fixed, e.g. the probe as 'test "$(<probe cmd>)" -eq 1'), or predict scorecard movement only.`,
 				);
+			// Pairs noisier than the whole way to the target cannot keep any step: without a proof, measuring is hours of coin toss.
+			const targeted = g.card.metrics.filter(m => !m.hold);
+			const blind = p.proof ? [] : deaf(root, g);
+			if (targeted.length && blind.length === targeted.length)
+				throw new Error(
+					`No measurement can keep this experiment: ${blind.map(b => `${b.m.name}'s last ${b.n} pairs measured ±${(b.noise * 100).toFixed(1)}% noise, more than the whole way to its target (${(b.way * 100).toFixed(1)}%)`).join("; ")}. Any result would be luck. ${STEADY} Or pass proof: a verified fix is kept when nothing regressed.`,
+				);
 			const say = progressTo(ctx, root, onUpdate, `${g.id} x${g.nextExp} control`);
 			let proof: L.Proof | undefined;
 			let ignoredProof: string[] = [];
@@ -1585,7 +1614,8 @@ export default async function climb(pi: ExtensionAPI) {
 						`Measurement failed, even after retrying each failed run once; nothing was decided and ${exp.id} stays open:\n${r.errors.join("\n")}\nFlaky: call climb_measure again. Broken by your change: fix it, commit, measure again. Instrument broken: climb_measure with abandon, repair it, re-baseline with climb_scorecard.`,
 					);
 				({ values, samples } = r);
-				const v = pairs ? X.pairedVerdict(eff.metrics, pairs, { ref: exp.ref, values }) : X.verdict(eff.metrics, exp.ref, values);
+				const pv = pairs && X.pairedVerdict(eff.metrics, pairs, { ref: exp.ref, values });
+				const v = pv || X.verdict(eff.metrics, exp.ref, values);
 				// Contention is the first suspect when a result moves: say when the two sides ran under different load.
 				const traces = T.read(root);
 				const since = L.epoch(exp.ts) - 3_600_000;
@@ -1595,6 +1625,13 @@ export default async function climb(pi: ExtensionAPI) {
 				if (loadBefore !== undefined && loadAfter !== undefined && Math.max(loadBefore, loadAfter) > 1 && Math.max(loadBefore, loadAfter) > 2 * Math.min(loadBefore, loadAfter))
 					noted += ` Note: the ${loadAfter > loadBefore ? "candidate" : "control"} ran under heavier load (${loadAfter} vs ${loadBefore} load average).`;
 				if (eff.notes.length) noted += ` Note: ${eff.notes.join("; ")}.`;
+				if (pv)
+					for (const m of g.card.metrics) {
+						const s = pv.stats[m.name];
+						const way = L.gain(m, m.baseline, m.target);
+						if (!m.hold && s?.n && s.noise >= way)
+							noted += ` Note: ${m.name}'s pairs measured ±${(s.noise * 100).toFixed(1)}% noise, more than the whole way to its target (${(way * 100).toFixed(1)}%): no step on it can be told apart from luck, and experiments without a proof are refused until it is steadier. ${STEADY}`;
+					}
 				({ kept, reason } = v);
 				// A real-sized step under the noise is evidence of neither: say how many samples would resolve it
 				// (noise shrinks with the square root of the samples), or that the instrument needs steadying.

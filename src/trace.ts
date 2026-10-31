@@ -84,7 +84,7 @@ export function cap(root: string): void {
 /** Why a climb tool refused or failed, for the waste breakdown. */
 export function refusal(error: string): string {
 	const rules: [RegExp, string][] = [
-		[/as large as the whole way|could be told apart from luck/, "too noisy for its target"],
+		[/as large as the whole way|could be told apart from luck|No measurement can keep/, "too noisy for its target"],
 		[/already meets its target/, "target already met"],
 		[/Fix these metric commands|Control measurement failed|Measurement failed/, "a metric command crashed"],
 		[/guard must pass|guard failed/, "guard failed"],
